@@ -125,3 +125,9 @@ export interface BotCommandConfig {
   updatedAt?: string;
 }
 
+export interface QuizContext {
+  mode: 'part' | 'mixed';
+  subjectName?: string;
+  partIndex?: number;
+  totalParts?: number;
+}

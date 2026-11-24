@@ -12,7 +12,7 @@ import {
   ChevronDown,
   ChevronUp,
 } from 'lucide-react';
-import { Question, Subject, UserSession } from '../types';
+import { Question, Subject, UserSession, QuizContext } from '../types';
 import { toKhmerNum, khmerAlphabetSort, shuffleArray, getOptionLabel } from '../utils/khmer';
 import { exportQuestionsToPDF } from '../services/pdfExport';
 import { KhmerCornerMotif, KhmerLotusCrest, KhmerLotusDivider } from './KhmerOrnaments';
@@ -21,7 +21,7 @@ interface PlaySectionProps {
   questions: Question[];
   subjects: Subject[];
   session: UserSession;
-  onStartQuiz: (quizQuestions: Question[], title: string) => void;
+  onStartQuiz: (quizQuestions: Question[], title: string, context?: QuizContext) => void;
 }
 
 export const PlaySection: React.FC<PlaySectionProps> = ({
@@ -92,12 +92,22 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
   const handleStartPart = (subject: Subject, partIndex: number) => {
     const allSubjectQuestions = questionsBySubject[subject.name] || [];
+    const totalParts = Math.ceil(allSubjectQuestions.length / 10);
     const startIndex = partIndex * 10;
     const partQuestions = allSubjectQuestions.slice(startIndex, startIndex + 10);
     if (partQuestions.length === 0) return;
 
     setSelectedSubjectForParts(null);
-    onStartQuiz(partQuestions, `${subject.name} (ភាគ ${toKhmerNum(partIndex + 1)})`);
+    onStartQuiz(
+      shuffleArray(partQuestions),
+      `${subject.name} (ភាគ ${toKhmerNum(partIndex + 1)})`,
+      {
+        mode: 'part',
+        subjectName: subject.name,
+        partIndex,
+        totalParts,
+      }
+    );
   };
 
   const handleToggleSubjectSelect = (id: string) => {
@@ -130,7 +140,9 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
     const shuffled = shuffleArray(pool);
     const selected = shuffled.slice(0, Math.min(mixedCount, shuffled.length));
-    onStartQuiz(selected, `វិញ្ញាសាចម្រុះ (${toKhmerNum(selected.length)} សំណួរ)`);
+    onStartQuiz(selected, `វិញ្ញាសាចម្រុះ (${toKhmerNum(selected.length)} សំណួរ)`, {
+      mode: 'mixed',
+    });
   };
 
   const handleDownloadPDF = async () => {

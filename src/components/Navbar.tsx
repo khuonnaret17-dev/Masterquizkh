@@ -17,7 +17,8 @@ import {
 import { UserSession, AppThemeId } from '../types';
 import { toKhmerNum } from '../utils/khmer';
 import { APP_THEMES } from '../services/theme';
-import { KhmerLatticeBar } from './KhmerOrnaments';
+import { getTelegramMiniAppUser } from '../services/telegramWebApp';
+import { KhmerLatticeBar, KhmerLotusCrest } from './KhmerOrnaments';
 
 interface NavbarProps {
   session: UserSession;
@@ -54,6 +55,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const currentThemeConfig = APP_THEMES.find((t) => t.id === currentTheme) || APP_THEMES[0];
+  const tgUser = getTelegramMiniAppUser();
+  const displayName = tgUser?.first_name || session.username;
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -83,18 +86,18 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <nav className="sticky top-0 z-40 app-nav backdrop-blur-md border-b app-border shadow-sm tg-safe-top tg-safe-x">
-      <KhmerLatticeBar className="max-md:portrait:!h-[49px] max-md:portrait:!w-[377px] max-md:portrait:max-w-full md:!h-1.5 md:!w-full landscape:!h-1.5 landscape:!w-full" />
-      <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-[52px] sm:h-14 md:h-16 landscape-compact-bar gap-2 sm:gap-3 md:gap-4">
-          {/* Brand & Logo / Mini App Back Control */}
-          <div className="flex items-center gap-2 min-w-0">
+      <KhmerLatticeBar />
+      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="h-[52px] sm:h-14 landscape-compact-bar flex items-center justify-between gap-3">
+          {/* Left: Compact Brand Lockup (Modeled after LandingPage Header) */}
+          <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
             {canGoBack && onBack && (
               <button
                 type="button"
                 onClick={onBack}
                 title="ត្រឡប់ក្រោយ"
                 aria-label="ត្រឡប់ក្រោយ"
-                className="min-w-[40px] min-h-[40px] rounded-xl app-card flex items-center justify-center app-text-primary hover:opacity-80 transition cursor-pointer shrink-0"
+                className="min-w-[38px] min-h-[38px] rounded-xl app-card flex items-center justify-center app-text-primary hover:opacity-80 transition cursor-pointer shrink-0"
               >
                 <ArrowLeft className="w-4 h-4" />
               </button>
@@ -109,71 +112,62 @@ export const Navbar: React.FC<NavbarProps> = ({
                   src="https://i.postimg.cc/0ygmLdvR/3QCM_Ep4.png"
                   alt="Master Quiz KH Logo"
                   referrerPolicy="no-referrer"
-                  className="w-8 h-8 rounded-full object-cover"
+                  className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover"
                 />
               </div>
               <div className="min-w-0">
-                <span className="block font-moul text-xs sm:text-sm app-text-primary whitespace-nowrap truncate leading-tight">
+                <span className="block font-moul text-xs sm:text-sm md:text-base app-text-primary tracking-wide truncate leading-tight">
                   {pageTitle || 'MASTER QUIZ KH'}
                 </span>
-                {pageTitle && (
-                  <span className="block text-[11px] app-text-secondary truncate leading-tight">
-                    MASTER QUIZ KH
-                  </span>
-                )}
+                <span className="block app-text-secondary font-kantumruy text-[11px] sm:text-xs truncate leading-tight">
+                  {pageTitle ? 'MASTER QUIZ KH' : 'ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ'}
+                </span>
               </div>
             </button>
           </div>
 
-          {/* Center Mode Switch (Admin) or Subtitle */}
-          {session.role === 'admin' ? (
-            <div className="hidden md:flex items-center app-subcard p-1 rounded-xl shrink-0">
-              <button
-                type="button"
-                onClick={() => onTabChange('play')}
-                className={`flex items-center gap-1.5 px-3 lg:px-3.5 py-1.5 rounded-lg text-xs lg:text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
-                  activeTab === 'play'
-                    ? 'khmer-btn-primary shadow-sm'
-                    : 'app-text-secondary hover:opacity-80'
-                }`}
-              >
-                <Play className="w-3.5 h-3.5" />
-                <span>ធ្វើតេស្ត</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onTabChange('admin')}
-                className={`flex items-center gap-1.5 px-3 lg:px-3.5 py-1.5 rounded-lg text-xs lg:text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
-                  activeTab === 'admin'
-                    ? 'khmer-btn-crimson shadow-sm'
-                    : 'app-text-secondary hover:opacity-80'
-                }`}
-              >
-                <Settings className="w-3.5 h-3.5" />
-                <span>គ្រប់គ្រង</span>
-              </button>
-            </div>
-          ) : (
-            <div className="hidden lg:block text-sm font-medium app-text-secondary whitespace-nowrap">
-              ប្រព័ន្ធធ្វើតេស្តត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ
-            </div>
-          )}
-
-          {/* Right Area: Online Count + Unified Menu Button */}
+          {/* Right Area: Compact Admin Switch (md+) + Online Count + Menu + Lotus Crest */}
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <div className="flex items-center gap-1.5 text-xs sm:text-sm font-semibold text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
-              <Users className="w-4 h-4 shrink-0" />
+            {session.role === 'admin' && (
+              <div className="hidden md:flex items-center app-subcard p-0.5 rounded-xl shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onTabChange('play')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap cursor-pointer ${
+                    activeTab === 'play'
+                      ? 'khmer-btn-primary shadow-sm'
+                      : 'app-text-secondary hover:opacity-80'
+                  }`}
+                >
+                  <Play className="w-3.5 h-3.5 shrink-0" />
+                  <span>ធ្វើតេស្ត</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onTabChange('admin')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap cursor-pointer ${
+                    activeTab === 'admin'
+                      ? 'khmer-btn-crimson shadow-sm'
+                      : 'app-text-secondary hover:opacity-80'
+                  }`}
+                >
+                  <Settings className="w-3.5 h-3.5 shrink-0" />
+                  <span>គ្រប់គ្រង</span>
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-center gap-1 text-xs sm:text-sm font-semibold text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
+              <Users className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
               <span className="tabular-nums">{toKhmerNum(onlineCount || 1)}</span>
-              <span className={session.role === 'admin' ? 'hidden lg:inline' : 'hidden sm:inline'}>
-                កំពុងសិក្សា
-              </span>
+              <span className="hidden lg:inline">កំពុងសិក្សា</span>
             </div>
 
             <div className="relative" ref={menuRef}>
               <button
                 type="button"
                 onClick={() => setIsMenuOpen((prev) => !prev)}
-                className={`flex items-center gap-1.5 sm:gap-2 min-h-[40px] px-2.5 sm:px-3.5 py-1.5 rounded-xl border transition cursor-pointer font-semibold text-xs sm:text-sm whitespace-nowrap ${
+                className={`flex items-center gap-1.5 sm:gap-2 min-h-[38px] sm:min-h-[40px] px-2.5 sm:px-3 py-1 rounded-xl border transition cursor-pointer font-semibold text-xs sm:text-sm whitespace-nowrap ${
                   isMenuOpen
                     ? 'khmer-soft-surface border-[var(--theme-gold)]'
                     : 'app-card hover:opacity-90'
@@ -182,17 +176,24 @@ export const Navbar: React.FC<NavbarProps> = ({
                 aria-expanded={isMenuOpen}
                 aria-haspopup="true"
               >
-                {session.role === 'admin' ? (
+                {tgUser?.photo_url ? (
+                  <img
+                    src={tgUser.photo_url}
+                    alt={displayName}
+                    referrerPolicy="no-referrer"
+                    className="w-6 h-6 rounded-full object-cover border border-[var(--theme-gold)]/50 shrink-0"
+                  />
+                ) : session.role === 'admin' ? (
                   <Shield className="w-4 h-4 text-rose-700 dark:text-rose-400 shrink-0" />
                 ) : (
                   <User className="w-4 h-4 khmer-accent-text shrink-0" />
                 )}
 
-                <span className="hidden sm:inline truncate max-w-[90px] lg:max-w-[120px]">
-                  {session.username}
+                <span className="hidden sm:inline truncate max-w-[96px] lg:max-w-[130px]">
+                  {displayName}
                 </span>
 
-                <span>ម៉ឺនុយ</span>
+                <span className="sm:hidden">ម៉ឺនុយ</span>
                 {isMenuOpen ? (
                   <X className="w-4 h-4 shrink-0" />
                 ) : (
@@ -351,6 +352,8 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </div>
               )}
             </div>
+
+            <KhmerLotusCrest size={26} className="hidden sm:block shrink-0" />
           </div>
         </div>
       </div>

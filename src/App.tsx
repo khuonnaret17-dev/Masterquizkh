@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig } from './types';
+import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig, QuizContext } from './types';
 import { LandingPage } from './components/LandingPage';
 import { Navbar } from './components/Navbar';
 import { PlaySection } from './components/PlaySection';
@@ -24,7 +24,7 @@ import {
   syncTelegramMiniAppTheme,
   setTelegramBackButton,
 } from './services/telegramWebApp';
-import { getMuteState, setMuteState } from './utils/khmer';
+import { getMuteState, setMuteState, shuffleArray, toKhmerNum } from './utils/khmer';
 
 export default function App() {
   // Theme State
@@ -64,6 +64,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'play' | 'admin'>('play');
   const [activeQuizQuestions, setActiveQuizQuestions] = useState<Question[] | null>(null);
   const [activeQuizTitle, setActiveQuizTitle] = useState<string>('');
+  const [activeQuizContext, setActiveQuizContext] = useState<QuizContext | null>(null);
+  const [quizSessionKey, setQuizSessionKey] = useState<number>(0);
 
   // Audio SFX state
   const [isMuted, setIsMuted] = useState<boolean>(() => getMuteState());
@@ -130,6 +132,7 @@ export default function App() {
   const handleLogout = () => {
     setSession(null);
     setActiveQuizQuestions(null);
+    setActiveQuizContext(null);
     try {
       localStorage.removeItem('master_pro_quiz_session');
     } catch {
@@ -143,14 +146,63 @@ export default function App() {
     setMuteState(next);
   };
 
-  const handleStartQuiz = (quizQuestions: Question[], title: string) => {
+  const handleStartQuiz = (quizQuestions: Question[], title: string, context?: QuizContext) => {
     setActiveQuizQuestions(quizQuestions);
     setActiveQuizTitle(title);
+    setActiveQuizContext(context || null);
+    setQuizSessionKey((prev) => prev + 1);
   };
 
   const handleExitQuiz = () => {
     setActiveQuizQuestions(null);
     setActiveQuizTitle('');
+    setActiveQuizContext(null);
+  };
+
+  const hasNextPart =
+    activeQuizContext?.mode === 'part' &&
+    typeof activeQuizContext.partIndex === 'number' &&
+    typeof activeQuizContext.totalParts === 'number' &&
+    activeQuizContext.partIndex + 1 < activeQuizContext.totalParts &&
+    Boolean(activeQuizContext.subjectName);
+
+  const nextPartLabel = hasNextPart
+    ? `បន្តទៅភាគ ${toKhmerNum((activeQuizContext?.partIndex ?? 0) + 2)}`
+    : undefined;
+
+  const isLastPart =
+    activeQuizContext?.mode === 'part' &&
+    typeof activeQuizContext.partIndex === 'number' &&
+    typeof activeQuizContext.totalParts === 'number' &&
+    activeQuizContext.partIndex + 1 >= activeQuizContext.totalParts;
+
+  const handleStartNextPart = () => {
+    if (
+      !hasNextPart ||
+      !activeQuizContext?.subjectName ||
+      typeof activeQuizContext.partIndex !== 'number'
+    ) {
+      return;
+    }
+    const nextPartIndex = activeQuizContext.partIndex + 1;
+    const subjectQuestions = questions.filter(
+      (q) => q.isActive !== false && q.subject === activeQuizContext.subjectName
+    );
+    const totalParts = Math.ceil(subjectQuestions.length / 10);
+    const nextSlice = subjectQuestions.slice(nextPartIndex * 10, (nextPartIndex + 1) * 10);
+    if (nextSlice.length === 0) return;
+
+    handleStartQuiz(
+      shuffleArray(nextSlice),
+      `${activeQuizContext.subjectName} (ភាគ ${toKhmerNum(nextPartIndex + 1)})`,
+      {
+        mode: 'part',
+        subjectName: activeQuizContext.subjectName,
+        partIndex: nextPartIndex,
+        totalParts,
+      }
+    );
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   useEffect(() => {
@@ -159,6 +211,7 @@ export default function App() {
       return setTelegramBackButton(true, () => {
         setActiveQuizQuestions(null);
         setActiveQuizTitle('');
+        setActiveQuizContext(null);
       });
     }
     if (activeTab === 'admin' && session.role === 'admin') {
@@ -198,11 +251,15 @@ export default function App() {
       <main className="flex-1 pb-16">
         {activeQuizQuestions ? (
           <QuizGameScreen
+            key={quizSessionKey}
             questions={activeQuizQuestions}
             title={activeQuizTitle}
             isMuted={isMuted}
             onToggleMute={handleToggleMute}
             onExit={handleExitQuiz}
+            onNextPart={hasNextPart ? handleStartNextPart : undefined}
+            nextPartLabel={nextPartLabel}
+            isLastPart={isLastPart}
           />
         ) : activeTab === 'admin' && session.role === 'admin' ? (
           <AdminSection
