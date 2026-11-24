@@ -23,13 +23,17 @@ async function safeTelegramJson(res: Response): Promise<any> {
   }
 }
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use(express.json({ limit: '35mb' }));
+app.use(express.urlencoded({ extended: true, limit: '35mb' }));
+
+interface StoredShareImage {
+  buffer: Buffer;
+  mimeType: string;
+}
 
 interface StoredShareCard {
   id: string;
-  buffer: Buffer;
-  mimeType: string;
+  images: StoredShareImage[];
   title: string;
   caption: string;
   format: 'card' | 'tiktok';
@@ -37,7 +41,8 @@ interface StoredShareCard {
 }
 
 const SHARE_CARD_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const MAX_STORED_SHARE_CARDS = 150;
+const MAX_STORED_SHARE_CARDS = 120;
+const MAX_IMAGES_PER_SHARE_CARD = 10;
 const sharedCardsStore = new Map<string, StoredShareCard>();
 
 function pruneSharedCards() {
@@ -54,6 +59,16 @@ function pruneSharedCards() {
   }
 }
 
+function parseShareImageDataUrl(raw: unknown): StoredShareImage | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const matches = raw.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/);
+  if (!matches || matches.length !== 3) return null;
+  const mimeType = matches[1] === 'image/jpg' ? 'image/jpeg' : matches[1];
+  const buffer = Buffer.from(matches[2], 'base64');
+  if (buffer.length === 0 || buffer.length > 12 * 1024 * 1024) return null;
+  return { buffer, mimeType };
+}
+
 function escapeServerHtml(text: string): string {
   if (!text) return '';
   return text
@@ -62,6 +77,13 @@ function escapeServerHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function safeInlineJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
 }
 
 function getBaseOrigin(req: express.Request): string {
@@ -78,23 +100,39 @@ function getBaseOrigin(req: express.Request): string {
   return `http://localhost:${PORT}`;
 }
 
-// Endpoint: Publish temporary share card image & metadata for Facebook Open Graph & TikTok mobile handoff
+// Endpoint: Publish temporary share card image(s) & metadata for Facebook Open Graph & mobile multi-image share handoff
 app.post('/api/share-card', (req, res) => {
   try {
-    const { imageBase64, title, caption, format } = req.body || {};
-    if (!imageBase64 || typeof imageBase64 !== 'string') {
+    const { imageBase64, extraImagesBase64, imagesBase64, title, caption, format } = req.body || {};
+    const rawInputs: unknown[] = Array.isArray(imagesBase64) && imagesBase64.length > 0
+      ? imagesBase64
+      : [
+          ...(typeof imageBase64 === 'string' ? [imageBase64] : []),
+          ...(Array.isArray(extraImagesBase64) ? extraImagesBase64 : []),
+        ];
+
+    if (rawInputs.length === 0) {
       return res.status(400).json({ success: false, error: 'Missing imageBase64' });
     }
-
-    const matches = imageBase64.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/);
-    if (!matches || matches.length !== 3) {
-      return res.status(400).json({ success: false, error: 'Invalid image data URL' });
+    if (rawInputs.length > MAX_IMAGES_PER_SHARE_CARD) {
+      return res.status(400).json({
+        success: false,
+        error: `Too many images (max ${MAX_IMAGES_PER_SHARE_CARD})`,
+      });
     }
 
-    const mimeType = matches[1] === 'image/jpg' ? 'image/jpeg' : matches[1];
-    const buffer = Buffer.from(matches[2], 'base64');
-    if (buffer.length > 12 * 1024 * 1024) {
-      return res.status(413).json({ success: false, error: 'Image too large' });
+    const parsedImages: StoredShareImage[] = [];
+    let totalBytes = 0;
+    for (const rawImg of rawInputs) {
+      const parsed = parseShareImageDataUrl(rawImg);
+      if (!parsed) {
+        return res.status(400).json({ success: false, error: 'Invalid or oversized image data URL' });
+      }
+      totalBytes += parsed.buffer.length;
+      if (totalBytes > 32 * 1024 * 1024) {
+        return res.status(413).json({ success: false, error: 'Total images payload too large' });
+      }
+      parsedImages.push(parsed);
     }
 
     pruneSharedCards();
@@ -104,10 +142,9 @@ app.post('/api/share-card', (req, res) => {
 
     sharedCardsStore.set(id, {
       id,
-      buffer,
-      mimeType,
+      images: parsedImages,
       title: typeof title === 'string' && title.trim() ? title.trim().slice(0, 180) : 'Master Quiz KH',
-      caption: typeof caption === 'string' ? caption.trim().slice(0, 1800) : '',
+      caption: typeof caption === 'string' ? caption.trim().slice(0, 3600) : '',
       format: safeFormat,
       createdAt: Date.now(),
     });
@@ -115,14 +152,19 @@ app.post('/api/share-card', (req, res) => {
     const origin = getBaseOrigin(req);
     const sharePath = `/s/${id}`;
     const imagePath = `/api/share-card/${id}.png`;
+    const imagePaths = parsedImages.map((_, idx) => `/api/share-card/${id}/${idx}.png`);
+    const imageUrls = imagePaths.map((p) => `${origin}${p}`);
 
     res.json({
       success: true,
       id,
       sharePath,
       imagePath,
+      imagePaths,
       shareUrl: `${origin}${sharePath}`,
       imageUrl: `${origin}${imagePath}`,
+      imageUrls,
+      imageCount: parsedImages.length,
     });
   } catch (err: any) {
     console.error('Error storing share card:', err);
@@ -142,12 +184,12 @@ app.put('/api/share-card/:id', (req, res) => {
   }
   const { caption } = req.body || {};
   if (typeof caption === 'string') {
-    entry.caption = caption.trim().slice(0, 1800);
+    entry.caption = caption.trim().slice(0, 3600);
   }
   res.json({ success: true });
 });
 
-// Endpoint: Serve hosted PNG image for Open Graph crawlers & direct download
+// Endpoint: Serve primary PNG image for Open Graph crawlers & direct download
 app.get('/api/share-card/:id.png', (req, res) => {
   const { id } = req.params;
   if (!/^[a-zA-Z0-9_-]{4,32}$/.test(id)) {
@@ -155,15 +197,33 @@ app.get('/api/share-card/:id.png', (req, res) => {
   }
   pruneSharedCards();
   const entry = sharedCardsStore.get(id);
-  if (!entry) {
+  if (!entry || entry.images.length === 0) {
     return res.status(404).send('Share card expired or not found');
   }
-  res.setHeader('Content-Type', entry.mimeType);
+  res.setHeader('Content-Type', entry.images[0].mimeType);
   res.setHeader('Cache-Control', 'public, max-age=86400');
-  res.send(entry.buffer);
+  res.send(entry.images[0].buffer);
 });
 
-// Endpoint: Standalone Open Graph Share Page (enables Facebook link preview + top-level native mobile Share to TikTok/FB)
+// Endpoint: Serve indexed PNG image from multi-image share card
+app.get('/api/share-card/:id/:idx.png', (req, res) => {
+  const { id, idx } = req.params;
+  if (!/^[a-zA-Z0-9_-]{4,32}$/.test(id) || !/^\d{1,2}$/.test(idx)) {
+    return res.status(400).send('Invalid parameters');
+  }
+  const indexNum = Number(idx);
+  pruneSharedCards();
+  const entry = sharedCardsStore.get(id);
+  if (!entry || indexNum < 0 || indexNum >= entry.images.length) {
+    return res.status(404).send('Share image expired or not found');
+  }
+  const target = entry.images[indexNum];
+  res.setHeader('Content-Type', target.mimeType);
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.send(target.buffer);
+});
+
+// Endpoint: Standalone Open Graph Share Page (enables Facebook link preview + top-level native mobile Share to TikTok/FB with single or multiple images)
 app.get('/s/:id', (req, res) => {
   const { id } = req.params;
   if (!/^[a-zA-Z0-9_-]{4,32}$/.test(id)) {
@@ -171,7 +231,7 @@ app.get('/s/:id', (req, res) => {
   }
   pruneSharedCards();
   const entry = sharedCardsStore.get(id);
-  if (!entry) {
+  if (!entry || entry.images.length === 0) {
     return res.status(404).send(`<!DOCTYPE html>
 <html lang="km">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Master Quiz KH</title></head>
@@ -186,7 +246,9 @@ app.get('/s/:id', (req, res) => {
 
   const origin = getBaseOrigin(req);
   const shareUrl = `${origin}/s/${entry.id}`;
-  const imageUrl = `${origin}/api/share-card/${entry.id}.png`;
+  const imageUrls = entry.images.map((_, idx) => `${origin}/api/share-card/${entry.id}/${idx}.png`);
+  const primaryImageUrl = imageUrls[0];
+  const isMulti = imageUrls.length > 1;
   const safeTitle = escapeServerHtml(entry.title);
   const plainDesc = (entry.caption || 'ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា — @qiuzs_bot').replace(/\s+/g, ' ').slice(0, 260);
   const safeDesc = escapeServerHtml(plainDesc);
@@ -194,6 +256,38 @@ app.get('/s/:id', (req, res) => {
   const imgWidth = entry.format === 'tiktok' ? '1440' : '1560';
   const imgHeight = entry.format === 'tiktok' ? '2560' : '1100';
   const fbShareHref = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareUrl)}&quote=${encodeURIComponent(entry.caption || entry.title)}`;
+
+  const ogImageTags = imageUrls
+    .map(
+      (url, i) => `  <meta property="og:image" content="${escapeServerHtml(url)}" />
+  <meta property="og:image:type" content="${escapeServerHtml(entry.images[i].mimeType)}" />
+  <meta property="og:image:width" content="${imgWidth}" />
+  <meta property="og:image:height" content="${imgHeight}" />`
+    )
+    .join('\n');
+
+  const galleryHtml = isMulti
+    ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;background:#efe7d5;border-radius:14px;padding:12px;margin-bottom:18px;">
+        ${imageUrls
+          .map(
+            (url, i) => `<div style="position:relative;background:#fffdf8;border:1px solid #d5c5a3;border-radius:10px;padding:6px;text-align:center;">
+              <img src="${escapeServerHtml(url)}" alt="${safeTitle} (${i + 1})" style="width:100%;max-height:240px;object-fit:contain;border-radius:8px;display:block;margin:0 auto;" />
+              <div style="margin-top:6px;font-size:11px;font-weight:700;color:#78350f;">រូបភាពទី ${i + 1} / ${imageUrls.length}</div>
+            </div>`
+          )
+          .join('')}
+      </div>`
+    : `<div style="background:#efe7d5;border-radius:14px;padding:12px;text-align:center;margin-bottom:18px;">
+        <img src="${escapeServerHtml(primaryImageUrl)}" alt="${safeTitle}" style="max-width:100%;max-height:540px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.12);" />
+      </div>`;
+
+  const shareBtnText = isMulti
+    ? `📤 ចែករំលែកផ្ទាល់ (${imageUrls.length} រូបភាព + អត្ថបទ ទៅ TikTok / Facebook)`
+    : `📤 ចែករំលែកផ្ទាល់ (រូបភាព + អត្ថបទ ទៅ TikTok / Facebook)`;
+
+  const downloadBtnText = isMulti
+    ? `⬇️ ទាញយករូបភាពទាំង ${imageUrls.length} PNG`
+    : `⬇️ ទាញយករូបភាព PNG`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -208,30 +302,25 @@ app.get('/s/:id', (req, res) => {
   <meta property="og:url" content="${escapeServerHtml(shareUrl)}" />
   <meta property="og:title" content="${safeTitle}" />
   <meta property="og:description" content="${safeDesc}" />
-  <meta property="og:image" content="${escapeServerHtml(imageUrl)}" />
-  <meta property="og:image:type" content="${escapeServerHtml(entry.mimeType)}" />
-  <meta property="og:image:width" content="${imgWidth}" />
-  <meta property="og:image:height" content="${imgHeight}" />
+${ogImageTags}
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${safeTitle}" />
   <meta name="twitter:description" content="${safeDesc}" />
-  <meta name="twitter:image" content="${escapeServerHtml(imageUrl)}" />
+  <meta name="twitter:image" content="${escapeServerHtml(primaryImageUrl)}" />
   <link href="https://fonts.googleapis.com/css2?family=Kantumruy+Pro:wght@500;700&family=Moul&display=swap" rel="stylesheet">
 </head>
 <body style="margin:0;background:#f7f2e6;color:#1c1917;font-family:'Kantumruy Pro',sans-serif;padding:24px 16px;">
-  <main style="max-width:640px;margin:0 auto;background:#fffdf8;border:2px solid #b45309;border-radius:20px;padding:24px;box-shadow:0 12px 32px rgba(154,52,18,0.12);">
+  <main style="max-width:680px;margin:0 auto;background:#fffdf8;border:2px solid #b45309;border-radius:20px;padding:24px;box-shadow:0 12px 32px rgba(154,52,18,0.12);">
     <div style="text-align:center;margin-bottom:16px;">
       <div style="font-family:'Moul',serif;font-size:18px;color:#9a3412;">MASTER QUIZ KH</div>
       <h1 style="font-size:16px;margin:6px 0 0;color:#44403c;">${safeTitle}</h1>
     </div>
 
-    <div style="background:#efe7d5;border-radius:14px;padding:12px;text-align:center;margin-bottom:18px;">
-      <img src="${escapeServerHtml(imageUrl)}" alt="${safeTitle}" style="max-width:100%;max-height:540px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.12);" />
-    </div>
+    ${galleryHtml}
 
     <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-bottom:16px;">
       <button id="nativeShareBtn" type="button" style="padding:13px 18px;border:none;border-radius:12px;background:#9a3412;color:#fff;font-family:inherit;font-size:15px;font-weight:700;cursor:pointer;">
-        📤 ចែករំលែកផ្ទាល់ (រូបភាព + អត្ថបទ ទៅ TikTok / Facebook)
+        ${shareBtnText}
       </button>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
         <a href="${escapeServerHtml(fbShareHref)}" target="_blank" rel="noopener noreferrer" style="padding:11px 14px;border-radius:12px;background:#1877F2;color:#fff;text-decoration:none;font-size:13px;font-weight:700;text-align:center;">
@@ -242,9 +331,9 @@ app.get('/s/:id', (req, res) => {
         </a>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <a href="${escapeServerHtml(imageUrl)}" download="MasterQuiz_${escapeServerHtml(entry.id)}.png" style="padding:10px 14px;border-radius:12px;background:#efe7d5;color:#1c1917;border:1px solid #d5c5a3;text-decoration:none;font-size:13px;font-weight:700;text-align:center;">
-          ⬇️ ទាញយករូបភាព PNG
-        </a>
+        <button id="downloadAllBtn" type="button" style="padding:10px 14px;border-radius:12px;background:#efe7d5;color:#1c1917;border:1px solid #d5c5a3;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;">
+          ${downloadBtnText}
+        </button>
         <button id="copyCaptionBtn" type="button" style="padding:10px 14px;border-radius:12px;background:#efe7d5;color:#1c1917;border:1px solid #d5c5a3;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;">
           📋 ចម្លងអត្ថបទ Caption
         </button>
@@ -262,14 +351,33 @@ app.get('/s/:id', (req, res) => {
   </main>
   <script>
     (function(){
-      var imgUrl = ${JSON.stringify(imageUrl)};
-      var shareTitle = ${JSON.stringify(entry.title)};
-      var captionText = ${JSON.stringify(entry.caption || '')};
+      var imgUrls = ${safeInlineJson(imageUrls)};
+      var shareId = ${safeInlineJson(entry.id)};
+      var shareTitle = ${safeInlineJson(entry.title)};
+      var captionText = ${safeInlineJson(entry.caption || '')};
       var statusEl = document.getElementById('statusMsg');
       function showStatus(msg) {
         statusEl.textContent = msg;
         statusEl.style.display = 'block';
       }
+      function triggerDownloads() {
+        imgUrls.forEach(function(url, idx) {
+          setTimeout(function() {
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = imgUrls.length > 1
+              ? ('MasterQuiz_' + shareId + '_' + (idx + 1) + '.png')
+              : ('MasterQuiz_' + shareId + '.png');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          }, idx * 240);
+        });
+      }
+      document.getElementById('downloadAllBtn').addEventListener('click', function() {
+        triggerDownloads();
+        showStatus('កំពុងទាញយករូបភាពចំនួន ' + imgUrls.length + ' PNG...');
+      });
       document.getElementById('copyCaptionBtn').addEventListener('click', function() {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(captionText).then(function(){
@@ -281,19 +389,21 @@ app.get('/s/:id', (req, res) => {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(captionText).catch(function(){});
         }
-        var a = document.createElement('a');
-        a.href = imgUrl;
-        a.download = 'MasterQuiz_TikTok.png';
-        a.click();
+        triggerDownloads();
       });
       document.getElementById('nativeShareBtn').addEventListener('click', async function() {
         try {
-          var resp = await fetch(imgUrl);
-          var blob = await resp.blob();
-          var file = new File([blob], 'MasterQuizKH.png', { type: blob.type || 'image/png' });
-          if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({ files: [file], title: shareTitle, text: captionText });
-            showStatus('បានចែករំលែករួចរាល់!');
+          var files = await Promise.all(imgUrls.map(async function(url, idx) {
+            var resp = await fetch(url);
+            var blob = await resp.blob();
+            var name = imgUrls.length > 1
+              ? ('MasterQuizKH_' + (idx + 1) + '.png')
+              : 'MasterQuizKH.png';
+            return new File([blob], name, { type: blob.type || 'image/png' });
+          }));
+          if (navigator.share && navigator.canShare && navigator.canShare({ files: files })) {
+            await navigator.share({ files: files, title: shareTitle, text: captionText });
+            showStatus('បានចែករំលែករូបភាពចំនួន ' + files.length + ' និងអត្ថបទរួចរាល់!');
             return;
           }
         } catch (err) {

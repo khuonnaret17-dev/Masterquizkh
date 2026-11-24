@@ -17,12 +17,13 @@ import {
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { Question } from '../types';
-import { SocialShareModal } from './SocialShareModal';
+import { SocialShareModal, ShareBatchCandidate } from './SocialShareModal';
 import { KhmerCornerMotif, KhmerLotusCrest, KhmerLotusDivider } from './KhmerOrnaments';
 import { renderQuestionCardImage } from '../services/telegram';
 import {
   renderResultCardImage,
   formatQuestionSocialCaption,
+  formatMultiQuestionsSocialCaption,
   formatResultSocialCaption,
   ShareImageFormat,
 } from '../services/socialShare';
@@ -265,6 +266,59 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
     [shareModalMode, resultShareParams, currentQ, qOptionsData, currentIndex]
   );
 
+  const quizBatchCandidates = useMemo<ShareBatchCandidate[]>(() => {
+    return preparedQuestions.map((item, idx) => {
+      const q = item.original;
+      const shareQuestionObj: Question =
+        q.type === 'mcq'
+          ? {
+              ...q,
+              options: item.shuffledOptions,
+              correct: item.correctIndex,
+            }
+          : q;
+      const candId = q.id ? `${q.id}__${idx}` : `q_${idx}`;
+      return {
+        id: candId,
+        label: `សំណួរទី ${toKhmerNum(idx + 1)}`,
+        sublabel: q.question,
+        renderImage: async ({ format, showAnswer }) =>
+          renderQuestionCardImage(shareQuestionObj, idx + 1, {
+            showAnswer,
+            format,
+          }),
+      };
+    });
+  }, [preparedQuestions]);
+
+  const formatQuizBatchCaption = useCallback(
+    (selectedIds: string[]) => {
+      const picked = selectedIds
+        .map((id) => {
+          const idx = quizBatchCandidates.findIndex((c) => c.id === id);
+          if (idx === -1) return null;
+          const item = preparedQuestions[idx];
+          if (!item) return null;
+          const q = item.original;
+          const shareQ: Question =
+            q.type === 'mcq'
+              ? { ...q, options: item.shuffledOptions, correct: item.correctIndex }
+              : q;
+          return { q: shareQ, index: idx + 1 };
+        })
+        .filter((x): x is { q: Question; index: number } => Boolean(x));
+      return formatMultiQuestionsSocialCaption(picked);
+    },
+    [quizBatchCandidates, preparedQuestions]
+  );
+
+  const initialQuizBatchIds = useMemo(() => {
+    if (shareModalMode !== 'question' || quizBatchCandidates.length === 0) return undefined;
+    const currentCand = quizBatchCandidates[currentIndex];
+    const others = quizBatchCandidates.filter((_, i) => i !== currentIndex).slice(0, 3);
+    return currentCand ? [currentCand.id, ...others.map((o) => o.id)] : undefined;
+  }, [shareModalMode, quizBatchCandidates, currentIndex]);
+
   const hasCurrentUserAnswered =
     userAnswers[currentIndex] !== undefined ||
     Boolean(revealedShortAnswers[currentIndex]) ||
@@ -299,6 +353,9 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
       renderImage={renderShareImage}
       allowShowAnswerToggle={shareModalMode === 'question'}
       defaultShowAnswer={hasCurrentUserAnswered}
+      batchCandidates={shareModalMode === 'question' ? quizBatchCandidates : undefined}
+      initialSelectedBatchIds={shareModalMode === 'question' ? initialQuizBatchIds : undefined}
+      formatBatchCaption={shareModalMode === 'question' ? formatQuizBatchCaption : undefined}
     />
   );
 

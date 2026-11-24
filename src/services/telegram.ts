@@ -1,6 +1,11 @@
 import html2canvas from 'html2canvas-pro';
 import { Question } from '../types';
 import { toKhmerNum, getOptionLabel } from '../utils/khmer';
+import khmerAppBannerUrl from '../assets/images/khmer_app_banner_1795538031567.jpg';
+
+function stripTgOptionPrefix(opt: string): string {
+  return (opt || '').replace(/^\s*(?:\([ក-ឃA-Da-d]\)|[ក-ឃA-Da-d][.):])\s*/u, '').trim();
+}
 
 /**
  * Escapes characters for Telegram HTML parse mode
@@ -526,7 +531,7 @@ export async function renderQuestionCardImage(
         .map((opt, oIdx) => {
           const isCorrect = showAnswer && oIdx === q.correct;
           const label = getOptionLabel(oIdx, q.subject);
-          const cleanOpt = opt.replace(/^[ក-ឃA-D]\.\s*/, '');
+          const cleanOpt = stripTgOptionPrefix(opt);
           const boxBg = isCorrect ? '#ecfdf5' : '#f7f2e6';
           const boxBorder = isCorrect ? '#059669' : '#d5c5a3';
           const badgeBg = isCorrect ? '#059669' : '#9a3412';
@@ -690,26 +695,132 @@ export async function renderQuestionCardImage(
   }
 }
 
+async function preloadImageSafe(src: string): Promise<boolean> {
+  if (typeof Image === 'undefined') return false;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(true);
+    img.onerror = () => resolve(false);
+    img.src = src;
+  });
+}
+
 /**
- * Format Telegram Photo caption matching the exact requested structure:
- * - Type heading (e.g. សំណួរពហុចម្លើយជ្រើសរើស)
- * - Question text
- * - Choices (ក. / ខ. / គ. / ឃ. or A. / B. / C. / D.)
- * - Hidden correct answer: ចម្លើយត្រឹមត្រូវ ៖ <tg-spoiler>ក</tg-spoiler>
- * (Button 📱Master Quiz KH Web -> @qiuzs_bot is attached via inline_keyboard)
+ * Render a designed Master Quiz KH App Promotional Banner PNG for Text+Image Telegram posts
+ */
+export async function renderAppBannerImage(subject?: string, index?: number): Promise<string> {
+  if (typeof document !== 'undefined' && document.fonts?.ready) {
+    try {
+      await document.fonts.ready;
+    } catch {
+      // Ignore
+    }
+  }
+
+  const bannerLoaded = await preloadImageSafe(khmerAppBannerUrl);
+
+  const bannerWidth = 960;
+  const bannerHeight = 504;
+
+  const host = document.createElement('div');
+  host.style.position = 'fixed';
+  host.style.left = '-12000px';
+  host.style.top = '0';
+  host.style.width = `${bannerWidth}px`;
+  host.style.height = `${bannerHeight}px`;
+  host.style.zIndex = '-1';
+  host.style.pointerEvents = 'none';
+  document.body.appendChild(host);
+
+  try {
+    const safeSubject = (subject || 'វិញ្ញាសាត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ').trim();
+    const indexLabel = typeof index === 'number' && index > 0 ? `សំណួរទី ${toKhmerNum(index)}` : '';
+
+    const card = document.createElement('div');
+    card.style.width = `${bannerWidth}px`;
+    card.style.height = `${bannerHeight}px`;
+    card.style.boxSizing = 'border-box';
+    card.style.position = 'relative';
+    card.style.overflow = 'hidden';
+    card.style.background = 'linear-gradient(135deg, #0b1120 0%, #1e293b 50%, #451a03 100%)';
+    card.style.padding = '20px';
+
+    card.innerHTML = `
+      <div style="position:relative; width:100%; height:100%; border-radius:20px; overflow:hidden; border:2.5px solid #f59e0b; box-shadow: inset 0 0 0 4px rgba(245,158,11,0.22); background:linear-gradient(135deg, #0b1120 0%, #172554 55%, #451a03 100%);">
+        ${
+          bannerLoaded
+            ? `<img src="${khmerAppBannerUrl}" alt="Master Quiz KH Banner" style="position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:center;" />`
+            : ''
+        }
+        <div style="position:absolute; inset:0; background:linear-gradient(95deg, rgba(11,17,32,0.92) 0%, rgba(11,17,32,0.78) 54%, rgba(11,17,32,0.45) 100%);"></div>
+
+        ${buildKhmerCardCornerSvg('tl')}
+        ${buildKhmerCardCornerSvg('tr')}
+        ${buildKhmerCardCornerSvg('bl')}
+        ${buildKhmerCardCornerSvg('br')}
+
+        <div style="position:relative; z-index:2; height:100%; box-sizing:border-box; padding:38px 46px; display:flex; flex-direction:column; justify-content:space-between;">
+          <div>
+            <div style="font-family:'Kantumruy Pro', sans-serif; font-size:15px; font-weight:700; color:#fbbf24; letter-spacing:0.02em; margin-bottom:10px;">
+              ព្រះរាជាណាចក្រកម្ពុជា · ជាតិ សាសនា ព្រះមហាក្សត្រ
+            </div>
+            <div style="font-family:'Moul', serif; font-size:34px; color:#ffffff; line-height:1.55; text-shadow:0 3px 14px rgba(0,0,0,0.65);">
+              MASTER QUIZ KH
+            </div>
+            <div style="font-family:'Kantumruy Pro', sans-serif; font-size:20px; font-weight:700; color:#fde68a; margin-top:4px; line-height:1.5;">
+              ប្រព័ន្ធធ្វើតេស្តត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា
+            </div>
+          </div>
+
+          <div style="max-width:660px; padding:16px 20px; border-radius:14px; background:rgba(15,23,42,0.72); border:1px solid rgba(245,158,11,0.5);">
+            <div style="font-family:'Kantumruy Pro', sans-serif; font-size:18px; font-weight:700; color:#ffffff; line-height:1.6;">
+              ${escapeCardHtml(safeSubject)}${indexLabel ? ` · <span style="color:#fbbf24;">${escapeCardHtml(indexLabel)}</span>` : ''}
+            </div>
+            <div style="font-family:'Kantumruy Pro', sans-serif; font-size:14px; font-weight:600; color:#e2e8f0; margin-top:6px;">
+              វិញ្ញាសា QCM · សំណួរ-ចម្លើយ (Q&amp;A) · ពន្យល់ពាក្យរដ្ឋបាល · ឯកសារ PDF
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; justify-content:space-between; border-top:1px solid rgba(245,158,11,0.38); padding-top:14px; font-family:'Kantumruy Pro', sans-serif; font-size:15px;">
+            <span style="font-weight:700; color:#fbbf24;">🤖 Telegram Bot: @qiuzs_bot</span>
+            <span style="font-weight:600; color:#f8fafc;">💬 ក្រុមសិក្សា: @qcm_and_q_a</span>
+          </div>
+        </div>
+      </div>
+    `;
+
+    host.appendChild(card);
+
+    const canvas = await html2canvas(card, {
+      scale: 2,
+      backgroundColor: '#0b1120',
+      useCORS: true,
+      logging: false,
+    });
+
+    return canvas.toDataURL('image/png');
+  } finally {
+    if (host.parentNode) {
+      host.parentNode.removeChild(host);
+    }
+  }
+}
+
+/**
+ * Format Telegram caption/text matching the exact requested structure:
+ * សំណួរ ៖ ...
+ * ក. ...
+ * ខ. ...
+ * គ. ...
+ * ឃ. ...
+ * ចម្លើយត្រឹមត្រូវ ៖ <tg-spoiler>គ</tg-spoiler>
  */
 export function formatPhotoCaption(
   q: Question,
   _index?: number,
   _showAnswerInImage?: boolean
 ): string {
-  const typeTitle =
-    q.type === 'mcq'
-      ? 'សំណួរពហុចម្លើយជ្រើសរើស'
-      : q.type === 'explanation'
-      ? 'ពន្យល់ពាក្យ'
-      : 'សំណួរ-ចម្លើយខ្លី';
-
+  const qPrefix = 'សំណួរ ៖ ';
   const ansPrefix = 'ចម្លើយត្រឹមត្រូវ ៖ ';
 
   const rawQuestion = (q.question || '').trim();
@@ -717,7 +828,7 @@ export function formatPhotoCaption(
     q.type === 'mcq' && q.options && q.options.length > 0
       ? q.options.map((opt, oIdx) => ({
           label: getOptionLabel(oIdx, q.subject),
-          text: opt.replace(/^[ក-ឃA-D]\.\s*/, '').trim(),
+          text: stripTgOptionPrefix(opt),
         }))
       : [];
 
@@ -740,8 +851,7 @@ export function formatPhotoCaption(
       0
     );
     return (
-      typeTitle.length +
-      1 +
+      qPrefix.length +
       safeQuestion.length +
       1 +
       optsLen +
@@ -772,8 +882,7 @@ export function formatPhotoCaption(
     safeAnswer = safeAnswer.slice(0, Math.max(50, safeAnswer.length - excess - 3)) + '...';
   }
 
-  let caption = `<b>${escapeTgHtml(typeTitle)}</b>\n`;
-  caption += `${escapeTgHtml(safeQuestion)}\n`;
+  let caption = `<b>${escapeTgHtml(qPrefix)}</b>${escapeTgHtml(safeQuestion)}\n`;
 
   if (safeOptions.length > 0) {
     for (const o of safeOptions) {
@@ -781,58 +890,72 @@ export function formatPhotoCaption(
     }
   }
 
-  caption += `${escapeTgHtml(ansPrefix)}<tg-spoiler>${escapeTgHtml(safeAnswer)}</tg-spoiler>`;
+  caption += `<b>${escapeTgHtml(ansPrefix)}</b><tg-spoiler>${escapeTgHtml(safeAnswer)}</tg-spoiler>`;
 
   return caption;
 }
 
 /**
- * Format a single question as a rich HTML card for Telegram (safely under 4096 chars)
+ * Send designed App Banner image together with the formatted Q&A (hidden answer via <tg-spoiler>)
+ * for the "Send as Text" workflow.
  */
-export function formatQuestionCard(q: Question, index: number): string {
-  const numKh = toKhmerNum(index);
-  const typeLabel =
-    q.type === 'mcq'
-      ? 'ពហុជ្រើសរើស (QCM)'
-      : q.type === 'explanation'
-      ? 'ពន្យល់ពាក្យ'
-      : 'សំណួរ-ចម្លើយខ្លី';
+export async function sendTelegramQuestionTextWithBanner(
+  botToken: string,
+  chatId: string,
+  q: Question,
+  index: number
+): Promise<any> {
+  const bannerBase64 = await renderAppBannerImage(q.subject, index);
+  const caption = formatPhotoCaption(q, index, false);
+  const result = await sendTelegramPhoto(botToken, chatId, bannerBase64, caption, 'HTML');
 
-  let header = `<b>📝 សំណួរទី ${numKh}</b> [${escapeTgHtml(typeLabel)}]\n`;
-  header += `<b>មុខវិជ្ជា៖</b> ${escapeTgHtml(q.subject || 'ទូទៅ')}\n\n`;
-  header += `❓ <b>សំណួរ៖</b> ${escapeTgHtml(q.question)}\n\n`;
-
-  if (q.type === 'mcq' && q.options && q.options.length > 0) {
-    header += `<b>ជម្រើសចម្លើយ៖</b>\n`;
-    const labels = ['ក', 'ខ', 'គ', 'ឃ', 'ង', 'ច'];
-    q.options.forEach((opt, idx) => {
-      const isCorrect = idx === q.correct;
-      const clean = opt.replace(/^[ក-ឃA-D]\.\s*/, '');
-      header += `${isCorrect ? '✅' : '⚪'} <b>${labels[idx] || idx + 1}.</b> ${escapeTgHtml(clean)}\n`;
-    });
-    header += `\n`;
+  // If non-MCQ answer was very long and truncated in caption, send the full hidden answer cleanly
+  const rawAnswer = (q.answer || '').trim();
+  if (q.type !== 'mcq' && rawAnswer.length > 520) {
+    const fullSpoiler = `<b>ចម្លើយត្រឹមត្រូវ (ពេញ) ៖</b> <tg-spoiler>${escapeTgHtml(
+      rawAnswer.slice(0, 3800)
+    )}</tg-spoiler>`;
+    await sendTelegramMessage(botToken, chatId, fullSpoiler, 'HTML');
   }
 
-  let footer = '';
-  if (q.type === 'mcq' && typeof q.correct === 'number' && q.options && q.options[q.correct]) {
-    const labels = ['ក', 'ខ', 'គ', 'ឃ', 'ង', 'ច'];
-    footer += `(ជម្រើសត្រឹមត្រូវគឺ៖ <b>${labels[q.correct]}</b>)\n`;
-  }
-  footer += `\n<i>━━━━━━━━━━━━━━━━━━━━\n📚 <a href="https://t.me/qiuzs_bot">Master Quiz KH</a> — វិញ្ញាសាត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ</i>`;
-
-  const answerTitle = `🎯 <b>ចម្លើយត្រឹមត្រូវ៖</b>\n`;
-  const maxAnswerChars = Math.max(200, 3900 - header.length - footer.length - answerTitle.length);
-  const rawAnswer = q.answer || 'គ្មានចម្លើយជាក់លាក់';
-  const safeAnswer =
-    rawAnswer.length > maxAnswerChars
-      ? escapeTgHtml(rawAnswer.slice(0, maxAnswerChars - 3) + '...')
-      : escapeTgHtml(rawAnswer);
-
-  return `${header}${answerTitle}${safeAnswer}\n${footer}`;
+  return result;
 }
 
 /**
- * Format questions of a subject into multiple chunks (messages) so they stay under 3800 chars
+ * Format a single question as HTML text matching the requested Q&A + hidden <tg-spoiler> answer format
+ */
+export function formatQuestionCard(q: Question, _index: number): string {
+  const qPrefix = 'សំណួរ ៖ ';
+  const ansPrefix = 'ចម្លើយត្រឹមត្រូវ ៖ ';
+
+  let body = `<b>${escapeTgHtml(qPrefix)}</b>${escapeTgHtml((q.question || '').trim())}\n`;
+
+  if (q.type === 'mcq' && q.options && q.options.length > 0) {
+    q.options.forEach((opt, idx) => {
+      const label = getOptionLabel(idx, q.subject);
+      const clean = stripTgOptionPrefix(opt);
+      body += `${escapeTgHtml(label)}. ${escapeTgHtml(clean)}\n`;
+    });
+  }
+
+  let answerContent = '';
+  if (q.type === 'mcq' && typeof q.correct === 'number' && q.options?.[q.correct]) {
+    answerContent = getOptionLabel(q.correct, q.subject);
+  } else {
+    answerContent = (q.answer || 'គ្មានចម្លើយ').trim();
+  }
+
+  const maxAnswerChars = Math.max(200, 3950 - body.length - ansPrefix.length);
+  const safeAnswer =
+    answerContent.length > maxAnswerChars
+      ? escapeTgHtml(answerContent.slice(0, maxAnswerChars - 3) + '...')
+      : escapeTgHtml(answerContent);
+
+  return `${body}<b>${escapeTgHtml(ansPrefix)}</b><tg-spoiler>${safeAnswer}</tg-spoiler>`;
+}
+
+/**
+ * Format questions of a subject into multiple chunks (messages) with hidden <tg-spoiler> answers
  */
 export function formatSubjectDigestMessages(
   subjectName: string,
@@ -849,18 +972,22 @@ export function formatSubjectDigestMessages(
 
   questions.forEach((q, idx) => {
     const numKh = toKhmerNum(idx + 1);
-    let itemText = `<b>📍 សំណួរទី ${numKh}៖</b> ${escapeTgHtml(q.question)}\n`;
+    let itemText = `<b>${numKh}. សំណួរ ៖</b> ${escapeTgHtml((q.question || '').trim())}\n`;
 
     if (q.type === 'mcq' && q.options && q.options.length > 0) {
-      const labels = ['ក', 'ខ', 'គ', 'ឃ'];
       q.options.forEach((opt, optIdx) => {
-        const clean = opt.replace(/^[ក-ឃA-D]\.\s*/, '');
-        const isCorrect = optIdx === q.correct;
-        itemText += `   ${isCorrect ? '✅' : '•'} ${labels[optIdx] || optIdx + 1}. ${escapeTgHtml(clean)}\n`;
+        const label = getOptionLabel(optIdx, q.subject);
+        const clean = stripTgOptionPrefix(opt);
+        itemText += `${escapeTgHtml(label)}. ${escapeTgHtml(clean)}\n`;
       });
     }
 
-    itemText += `👉 <b>ចម្លើយ៖</b> ${escapeTgHtml(q.answer || '')}\n\n`;
+    const ansValue =
+      q.type === 'mcq' && typeof q.correct === 'number' && q.options?.[q.correct]
+        ? getOptionLabel(q.correct, q.subject)
+        : (q.answer || 'គ្មានចម្លើយ').trim();
+
+    itemText += `<b>ចម្លើយត្រឹមត្រូវ ៖</b> <tg-spoiler>${escapeTgHtml(ansValue)}</tg-spoiler>\n\n`;
 
     // Telegram hard limit is 4096 characters. Keep safe boundary at 3600 characters
     if (currentMsg.length + itemText.length > 3600) {

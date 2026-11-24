@@ -38,8 +38,12 @@ import {
 import { Question, Subject, LoginRecord, PresenceRecord, Feedback, QuestionType, AppNotification, BotCommandConfig, BotActionButton } from '../types';
 import { toKhmerNum, getOptionLabel, shuffleArray } from '../utils/khmer';
 import { KhmerCornerMotif } from './KhmerOrnaments';
-import { SocialShareModal } from './SocialShareModal';
-import { formatQuestionSocialCaption, ShareImageFormat } from '../services/socialShare';
+import { SocialShareModal, ShareBatchCandidate } from './SocialShareModal';
+import {
+  formatQuestionSocialCaption,
+  formatMultiQuestionsSocialCaption,
+  ShareImageFormat,
+} from '../services/socialShare';
 import { DEFAULT_BOT_COMMANDS, getMergedBotCommands, KHQR_IMAGE_PATH } from '../utils/botCommands';
 import {
   addQuestion,
@@ -64,9 +68,11 @@ import {
   sendTelegramPoll,
   sendTelegramPhoto,
   renderQuestionCardImage,
+  renderAppBannerImage,
   formatPhotoCaption,
-  formatQuestionCard,
+  sendTelegramQuestionTextWithBanner,
   formatSubjectDigestMessages,
+  escapeTgHtml,
   sleep,
   registerTelegramCommands,
   startTelegramCommandBot,
@@ -281,6 +287,49 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [tgPhotoShowAnswer, setTgPhotoShowAnswer] = useState<boolean>(false);
   const [tgSelectedQuestionId, setTgSelectedQuestionId] = useState<string>('');
   const [socialShareTarget, setSocialShareTarget] = useState<{ q: Question; index: number } | null>(null);
+  const [socialShareDefaultMulti, setSocialShareDefaultMulti] = useState<boolean>(false);
+
+  const adminSharePool = useMemo(
+    () => (tgSubject === '__ALL__' ? questions : questions.filter((q) => q.subject === tgSubject)),
+    [questions, tgSubject]
+  );
+
+  const adminBatchCandidates = useMemo<ShareBatchCandidate[]>(() => {
+    return adminSharePool.map((q, idx) => {
+      const candId = q.id ? `${q.id}__${idx}` : `adm_${idx}`;
+      return {
+        id: candId,
+        label: `សំណួរទី ${toKhmerNum(idx + 1)}`,
+        sublabel: q.question,
+        renderImage: async ({ format, showAnswer }) =>
+          renderQuestionCardImage(q, idx + 1, { showAnswer, format }),
+      };
+    });
+  }, [adminSharePool]);
+
+  const formatAdminBatchCaption = useCallback(
+    (selectedIds: string[]) => {
+      const picked = selectedIds
+        .map((id) => {
+          const idx = adminBatchCandidates.findIndex((c) => c.id === id);
+          if (idx === -1) return null;
+          const q = adminSharePool[idx];
+          if (!q) return null;
+          return { q, index: idx + 1 };
+        })
+        .filter((x): x is { q: Question; index: number } => Boolean(x));
+      return formatMultiQuestionsSocialCaption(picked);
+    },
+    [adminBatchCandidates, adminSharePool]
+  );
+
+  const initialAdminBatchIds = useMemo(() => {
+    if (!socialShareTarget || adminBatchCandidates.length === 0) return undefined;
+    const targetIdx = Math.max(0, socialShareTarget.index - 1);
+    const firstCand = adminBatchCandidates[targetIdx];
+    const others = adminBatchCandidates.filter((_, i) => i !== targetIdx).slice(0, 3);
+    return firstCand ? [firstCand.id, ...others.map((o) => o.id)] : undefined;
+  }, [socialShareTarget, adminBatchCandidates]);
   const [tgSentIds, setTgSentIds] = useState<string[]>([]);
   const [isSendingTelegram, setIsSendingTelegram] = useState(false);
   const [isTestingBot, setIsTestingBot] = useState(false);
@@ -1057,18 +1106,30 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
     try {
       if (tgSendMode === 'batch_cards' && tgTextStyle === 'digest') {
-        // Mode 1B: Combined Q&A Text digest messages (chunked under 3800 chars)
-        const chunks = formatSubjectDigestMessages(
-          targetSubject === '__ALL__' ? 'គ្រប់មុខវិជ្ជាទាំងអស់' : targetSubject,
-          subjectQuestions
-        );
+        // Mode 1B: App Banner Cover + Combined Q&A Text digest messages with hidden Spoiler answers
+        const subjectDisplay = targetSubject === '__ALL__' ? 'គ្រប់មុខវិជ្ជាទាំងអស់' : targetSubject;
+        const chunks = formatSubjectDigestMessages(subjectDisplay, subjectQuestions);
 
         setTgProgress({
           current: 0,
           total: chunks.length,
           isRunning: true,
-          message: `កំពុងរៀបចំផ្ញើកម្រងវិញ្ញាសាជាអក្សរចំនួន ${toKhmerNum(chunks.length)} សារ...`,
+          message: `កំពុងរៀបចំផ្ញើរូបភាពកម្មវិធី & កម្រងវិញ្ញាសាចំនួន ${toKhmerNum(chunks.length)} សារ...`,
         });
+
+        try {
+          const coverBanner = await renderAppBannerImage(subjectDisplay);
+          await sendTelegramPhoto(
+            tgBotToken.trim(),
+            tgChatId.trim(),
+            coverBanner,
+            `🏛️ <b>កម្រងវិញ្ញាសា៖ ${escapeTgHtml(subjectDisplay)}</b> (${toKhmerNum(subjectQuestions.length)} សំណួរ)\n👉 <i>ចម្លើយត្រឹមត្រូវត្រូវបានលាក់ (ចុចដើម្បីមើល)</i>`,
+            'HTML'
+          );
+          await sleep(1200);
+        } catch {
+          // Proceed with digest text messages even if cover image send fails
+        }
 
         let sentChunks = 0;
         for (let i = 0; i < chunks.length; i++) {
@@ -1195,12 +1256,12 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           success: successCount > 0,
         });
       } else if (tgSendMode === 'batch_cards') {
-        // Mode 1A (Default Text): Send Every Question & Answer One by One
+        // Mode 1A (Default Text): Send Designed App Banner Image + Q&A Text with Hidden Spoiler Answer
         setTgProgress({
           current: 0,
           total: subjectQuestions.length,
           isRunning: true,
-          message: `កំពុងចាប់ផ្តើមផ្ញើសំណួរ & ចម្លើយជា Text ម្ដងមួយៗ ចំនួន ${toKhmerNum(subjectQuestions.length)} សារ...`,
+          message: `កំពុងចាប់ផ្តើមផ្ញើរូបភាពកម្មវិធី + សំណួរ & ចម្លើយលាក់ ម្ដងមួយៗ ចំនួន ${toKhmerNum(subjectQuestions.length)} សំណួរ...`,
         });
 
         let successCount = 0;
@@ -1215,12 +1276,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
             current: i + 1,
             total: subjectQuestions.length,
             isRunning: true,
-            message: `កំពុងផ្ញើសំណួរទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(subjectQuestions.length)}...`,
+            message: `កំពុងផ្ញើរូបភាពកម្មវិធី + សំណួរទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(subjectQuestions.length)}...`,
           });
 
-          const cardHtml = formatQuestionCard(q, i + 1);
           try {
-            await sendTelegramMessage(tgBotToken.trim(), tgChatId.trim(), cardHtml, 'HTML');
+            await sendTelegramQuestionTextWithBanner(tgBotToken.trim(), tgChatId.trim(), q, i + 1);
             successCount++;
             addLog(`សំណួរទី ${toKhmerNum(i + 1)} (${q.type}): ${q.question.slice(0, 35)}...`, true);
           } catch (itemErr: any) {
@@ -1228,7 +1288,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           }
 
           if (i < subjectQuestions.length - 1) {
-            await sleep(1500);
+            await sleep(1800);
           }
         }
 
@@ -1289,8 +1349,12 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         const caption = formatPhotoCaption(targetQ, targetIndex + 1, tgPhotoShowAnswer);
         await sendTelegramPhoto(tgBotToken.trim(), tgChatId.trim(), photoBase64, caption, 'HTML');
       } else {
-        const cardHtml = formatQuestionCard(targetQ, targetIndex + 1);
-        await sendTelegramMessage(tgBotToken.trim(), tgChatId.trim(), cardHtml, 'HTML');
+        await sendTelegramQuestionTextWithBanner(
+          tgBotToken.trim(),
+          tgChatId.trim(),
+          targetQ,
+          targetIndex + 1
+        );
       }
 
       if (targetQ.id) {
@@ -3983,7 +4047,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                         )}
                       </div>
                       <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
-                        ផ្ញើសំណួរ ជម្រើស និងចម្លើយជាសារអក្សរ HTML ច្បាស់ៗម្ដងមួយសំណួរ ឬរួមជាកញ្ចប់។
+                        ភ្ជាប់រូបភាពកម្មវិធី Master Quiz KH ជាមួយអត្ថបទសំណួរ ជម្រើស ក-ឃ និងលាក់ចម្លើយត្រឹមត្រូវ (Spoiler)។
                       </p>
                     </div>
                   </div>
@@ -4037,7 +4101,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                         )}
                       </div>
                       <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
-                        បង្កើតកាតរូបភាពខ្មែរ PNG ភ្ជាប់ជាមួយ Text សំណួរ ជម្រើស និងចម្លើយត្រឹមត្រូវបិទបាំង (Spoiler) នៅខាងក្រោម។
+                        បង្កើតកាតរូបភាពសំណួរខ្មែរ PNG ភ្ជាប់ជាមួយអត្ថបទសំណួរ ជម្រើស ក-ឃ និងលាក់ចម្លើយត្រឹមត្រូវ (Spoiler)។
                       </p>
                     </div>
                   </div>
@@ -4133,7 +4197,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </div>
               )}
 
-              <div>
+              <div className="space-y-2.5">
                 <button
                   type="button"
                   onClick={handleSendTelegramBatchBySubject}
@@ -4159,6 +4223,23 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                       : `ផ្ញើជា Text ម្ដងមួយៗ (${tgSubject === '__ALL__' ? 'គ្រប់មុខវិជ្ជា' : tgSubject})`}
                   </span>
                 </button>
+
+                {adminSharePool.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={isSendingTelegram}
+                    onClick={() => {
+                      setSocialShareDefaultMulti(adminSharePool.length > 1);
+                      setSocialShareTarget({ q: adminSharePool[0], index: 1 });
+                    }}
+                    className="w-full py-2.5 px-4 rounded-xl app-subcard app-text-primary hover:opacity-85 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Share2 className="w-4 h-4 khmer-accent-text shrink-0" />
+                    <span>
+                      ចែករំលែករូបភាពច្រើនសន្លឹកក្នុងពេលតែមួយទៅ App (FB / TikTok · {toKhmerNum(adminSharePool.length)} សំណួរ)
+                    </span>
+                  </button>
+                )}
               </div>
 
               {tgLogs.length > 0 && (
@@ -4336,6 +4417,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                         type="button"
                         onClick={() => {
                           const idx = singlePool.findIndex((item) => item.id === selectedSingleQ.id);
+                          setSocialShareDefaultMulti(false);
                           setSocialShareTarget({
                             q: selectedSingleQ,
                             index: idx !== -1 ? idx + 1 : 1,
@@ -4344,7 +4426,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                         className="w-full py-2.5 px-4 rounded-xl app-subcard app-text-primary hover:opacity-85 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition cursor-pointer"
                       >
                         <Share2 className="w-4 h-4 khmer-accent-text" />
-                        <span>ចែករំលែករូបភាពនេះទៅ Facebook / TikTok (9:16 ឬ កាត)</span>
+                        <span>ចែករំលែករូបភាពនេះ ឬច្រើនសន្លឹកទៅ App (FB / TikTok)</span>
                       </button>
                     </div>
                   )}
@@ -5264,7 +5346,10 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       )}
       <SocialShareModal
         isOpen={socialShareTarget !== null}
-        onClose={() => setSocialShareTarget(null)}
+        onClose={() => {
+          setSocialShareTarget(null);
+          setSocialShareDefaultMulti(false);
+        }}
         title={
           socialShareTarget
             ? `សំណួរទី ${toKhmerNum(socialShareTarget.index)} · ${socialShareTarget.q.subject || 'វិញ្ញាសាទូទៅ'}`
@@ -5290,6 +5375,10 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         )}
         allowShowAnswerToggle={true}
         defaultShowAnswer={tgPhotoShowAnswer}
+        batchCandidates={adminBatchCandidates}
+        initialSelectedBatchIds={initialAdminBatchIds}
+        defaultMultiMode={socialShareDefaultMulti}
+        formatBatchCaption={formatAdminBatchCaption}
       />
     </div>
   );

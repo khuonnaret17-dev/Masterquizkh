@@ -213,6 +213,39 @@ export function formatQuestionSocialCaption(q: Question, index?: number): string
 }
 
 /**
+ * Format clean Khmer social caption for multiple Question cards shared together
+ */
+export function formatMultiQuestionsSocialCaption(
+  items: Array<{ q: Question; index: number }>
+): string {
+  if (items.length === 0) return '';
+  if (items.length === 1) {
+    return formatQuestionSocialCaption(items[0].q, items[0].index);
+  }
+
+  const subjects = Array.from(
+    new Set(items.map((item) => item.q.subject || 'ចំណេះដឹងទូទៅ'))
+  );
+  const subjectHeader = subjects.length === 1 ? subjects[0] : 'វិញ្ញាសាចម្រុះ';
+
+  const lines: string[] = [
+    `📚 កម្រងសំណួរត្រៀមប្រឡង (${toKhmerNum(items.length)} សំណួរ) · ${subjectHeader}`,
+    '',
+  ];
+
+  items.forEach(({ q, index }, idx) => {
+    lines.push(`${toKhmerNum(idx + 1)}. សំណួរទី ${toKhmerNum(index)}៖ ${q.question.trim()}`);
+  });
+
+  lines.push('');
+  lines.push('👇 សូមទស្សនារូបភាពទាំងអស់ និងខមិនចម្លើយដែលអ្នកគិតថាត្រឹមត្រូវ!');
+  lines.push('🤖 ហ្វឹកហាត់សំណួរបន្ថែមលើ Telegram: @qiuzs_bot');
+  lines.push('#MasterQuizKH #ប្រឡងក្របខ័ណ្ឌរដ្ឋ #ចំណេះដឹងទូទៅ');
+
+  return lines.join('\n');
+}
+
+/**
  * Format clean Khmer social caption for a Quiz Result card
  */
 export function formatResultSocialCaption(params: ResultCardParams): string {
@@ -233,19 +266,29 @@ export async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
 
 export async function dataUrlToFile(dataUrl: string, filename: string): Promise<File> {
   const blob = await dataUrlToBlob(dataUrl);
-  return new File([blob], filename, { type: 'image/png' });
+  return new File([blob], filename, { type: blob.type || 'image/png' });
 }
 
-export function canNativeShareFile(file: File): boolean {
-  if (typeof navigator === 'undefined') return false;
+export interface ShareBatchImageItem {
+  dataUrl: string;
+  filename: string;
+  label?: string;
+}
+
+export function canNativeShareFiles(files: File[]): boolean {
+  if (typeof navigator === 'undefined' || files.length === 0) return false;
   if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
     return false;
   }
   try {
-    return navigator.canShare({ files: [file] });
+    return navigator.canShare({ files });
   } catch {
     return false;
   }
+}
+
+export function canNativeShareFile(file: File): boolean {
+  return canNativeShareFiles([file]);
 }
 
 export async function shareImageNative(
@@ -254,15 +297,26 @@ export async function shareImageNative(
   title: string,
   text: string
 ): Promise<'shared' | 'cancelled' | 'unsupported'> {
+  return shareMultipleImagesNative([{ dataUrl, filename }], title, text);
+}
+
+export async function shareMultipleImagesNative(
+  items: ShareBatchImageItem[],
+  title: string,
+  text: string
+): Promise<'shared' | 'cancelled' | 'unsupported'> {
+  if (items.length === 0) return 'unsupported';
   try {
-    const file = await dataUrlToFile(dataUrl, filename);
-    if (!canNativeShareFile(file)) {
+    const files = await Promise.all(
+      items.map((item) => dataUrlToFile(item.dataUrl, item.filename))
+    );
+    if (!canNativeShareFiles(files)) {
       return 'unsupported';
     }
     await navigator.share({
       title,
       text,
-      files: [file],
+      files,
     });
     return 'shared';
   } catch (err: any) {
@@ -324,14 +378,28 @@ export function downloadImageDataUrl(dataUrl: string, filename: string): void {
   link.click();
 }
 
+export async function downloadMultipleImagesDataUrls(
+  items: ShareBatchImageItem[]
+): Promise<void> {
+  for (let i = 0; i < items.length; i++) {
+    downloadImageDataUrl(items[i].dataUrl, items[i].filename);
+    if (i < items.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 220));
+    }
+  }
+}
+
 export interface HostedShareInfo {
   id: string;
   shareUrl: string;
   imageUrl: string;
+  imageUrls?: string[];
+  imageCount?: number;
 }
 
 export async function publishShareCard(params: {
   imageDataUrl: string;
+  extraImagesDataUrls?: string[];
   title: string;
   caption: string;
   format: ShareImageFormat;
@@ -342,6 +410,7 @@ export async function publishShareCard(params: {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         imageBase64: params.imageDataUrl,
+        extraImagesBase64: params.extraImagesDataUrls,
         title: params.title,
         caption: params.caption,
         format: params.format,
@@ -354,6 +423,8 @@ export async function publishShareCard(params: {
       id: data.id,
       shareUrl: data.shareUrl,
       imageUrl: data.imageUrl,
+      imageUrls: Array.isArray(data.imageUrls) ? data.imageUrls : [data.imageUrl],
+      imageCount: typeof data.imageCount === 'number' ? data.imageCount : 1,
     };
   } catch {
     return null;
