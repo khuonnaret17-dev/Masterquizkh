@@ -409,22 +409,30 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       }
       await registerTelegramCommands(cleanToken);
       let st = await getTelegramCommandBotStatus();
+      let botStarted = Boolean(st?.isRunning);
       if ((!st || !st.isRunning) && localStorage.getItem('master_quiz_bot_paused') !== '1') {
-        const started = await startTelegramCommandBot(cleanToken);
-        st = {
-          isRunning: started.isRunning,
-          botUsername: started.botUsername,
-          hasServerToken: true,
-          commandsRegistered: true,
-          handledCount: started.handledCount || 0,
-          lastCommandAt: started.lastCommandAt || null,
-          lastCommandText: started.lastCommandText || null,
-          lastError: null,
-        };
+        try {
+          const started = await startTelegramCommandBot(cleanToken);
+          botStarted = Boolean(started.isRunning);
+          st = {
+            isRunning: started.isRunning,
+            botUsername: started.botUsername,
+            hasServerToken: true,
+            commandsRegistered: true,
+            handledCount: started.handledCount || 0,
+            lastCommandAt: started.lastCommandAt || null,
+            lastCommandText: started.lastCommandText || null,
+            lastError: null,
+          };
+        } catch {
+          // Commands are already registered directly with Telegram even without backend worker
+        }
       }
       if (st) setCommandBotStatus(st);
       setTelegramStatus({
-        text: 'បានចុះឈ្មោះបញ្ជី Command (/start, /register, /passcode, /payment, /contact, /help) និងបើកដំណើរការ Bot ជោគជ័យ!',
+        text: botStarted
+          ? 'បានចុះឈ្មោះបញ្ជី Command (/start, /register, /passcode, /payment, /contact, /help) និងបើកដំណើរការ Bot ជោគជ័យ!'
+          : 'បានចុះឈ្មោះបញ្ជី Command (/start, /register, /passcode, /payment, /contact, /help) ទៅកាន់ Telegram ជោគជ័យ!',
         success: true,
       });
     } catch (err: any) {

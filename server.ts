@@ -11,7 +11,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+async function safeTelegramJson(res: Response): Promise<any> {
+  const raw = await res.text();
+  if (!raw) return { ok: false, description: `Empty response (HTTP ${res.status})` };
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { ok: false, description: `HTTP ${res.status}: ${raw.slice(0, 140)}` };
+  }
+}
 
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
@@ -342,7 +352,7 @@ app.post('/api/telegram/send-poll', async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-    const data = await tgRes.json();
+    const data = await safeTelegramJson(tgRes);
     if (!tgRes.ok || !data.ok) {
       // Fallback: if HTML explanation fails parsing or exceeds 200 chars, strip HTML tags & truncate cleanly
       if (
@@ -364,7 +374,7 @@ app.post('/api/telegram/send-poll', async (req, res) => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(fallbackPayload),
         });
-        const retryData = await retryRes.json();
+        const retryData = await safeTelegramJson(retryRes);
         if (retryRes.ok && retryData.ok) {
           return res.json({ success: true, result: retryData.result });
         }
@@ -408,7 +418,7 @@ app.post('/api/telegram/send-message', async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-    const data = await tgRes.json();
+    const data = await safeTelegramJson(tgRes);
     if (!tgRes.ok || !data.ok) {
       // If HTML parsing failed, attempt plain text fallback
       if (payload.parse_mode && data.description && data.description.includes('can\'t parse entities')) {
@@ -418,7 +428,7 @@ app.post('/api/telegram/send-message', async (req, res) => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        const retryData = await retryRes.json();
+        const retryData = await safeTelegramJson(retryRes);
         if (retryRes.ok && retryData.ok) {
           return res.json({ success: true, result: retryData.result });
         }
@@ -493,7 +503,7 @@ app.post('/api/telegram/send-photo', async (req, res) => {
       body: firstBody.totalBuffer,
     });
 
-    const data = await tgRes.json();
+    const data = await safeTelegramJson(tgRes);
     if (!tgRes.ok || !data.ok) {
       if (parse_mode && data.description && data.description.includes("can't parse entities") && caption) {
         const plainCaption = caption.replace(/<[^>]+>/g, '');
@@ -505,7 +515,7 @@ app.post('/api/telegram/send-photo', async (req, res) => {
           },
           body: fallbackBody.totalBuffer,
         });
-        const retryData = await retryRes.json();
+        const retryData = await safeTelegramJson(retryRes);
         if (retryRes.ok && retryData.ok) {
           return res.json({ success: true, result: retryData.result });
         }
@@ -887,7 +897,7 @@ async function registerCommandsWithTelegram(botToken: string): Promise<boolean> 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ commands: effectiveCommands }),
   });
-  const data = await res.json();
+  const data = await safeTelegramJson(res);
   if (!res.ok || !data.ok) {
     throw new Error(data.description || 'Failed to register Bot Commands');
   }
@@ -1034,7 +1044,7 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
 
 async function startCommandBotWorker(cleanToken: string, origin: string) {
   const meRes = await fetch(`https://api.telegram.org/bot${cleanToken}/getMe`);
-  const meData = await meRes.json();
+  const meData = await safeTelegramJson(meRes);
   if (!meRes.ok || !meData.ok) {
     throw new Error(meData.description || 'មិនអាចតភ្ជាប់ទៅ Telegram Bot Token នេះបានទេ');
   }
@@ -1082,7 +1092,7 @@ async function runTelegramPollingLoop(botToken: string, appUrl: string) {
         )}`,
         { signal: controller.signal }
       );
-      const data = await res.json();
+      const data = await safeTelegramJson(res);
       if (!res.ok || !data.ok) {
         botWorker.lastError = data.description || 'Polling error';
         await new Promise((r) => setTimeout(r, 3000));
@@ -1115,7 +1125,7 @@ app.post('/api/telegram/bot/test', async (req, res) => {
       return res.status(400).json({ success: false, error: 'សូមបញ្ចូល Telegram Bot Token ជាមុនសិន!' });
     }
     const meRes = await fetch(`https://api.telegram.org/bot${cleanToken}/getMe`);
-    const meData = await meRes.json();
+    const meData = await safeTelegramJson(meRes);
     if (!meRes.ok || !meData.ok) {
       return res.status(400).json({
         success: false,

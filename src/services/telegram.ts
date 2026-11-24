@@ -13,24 +13,130 @@ export function escapeTgHtml(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
-/**
- * Test Telegram bot connection and get bot info (uses provided token or server-configured token)
- */
-export async function testTelegramBot(botToken: string) {
-  const res = await fetch('/api/telegram/bot/test', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ botToken: (botToken || '').trim() }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'មិនអាចតភ្ជាប់ទៅកាន់ Telegram Bot បានទេ');
+interface BackendApiResult<T = any> {
+  backendAvailable: boolean;
+  ok: boolean;
+  status: number;
+  data: T | null;
+}
+
+async function callBackendApi<T = any>(
+  url: string,
+  init?: RequestInit
+): Promise<BackendApiResult<T>> {
+  try {
+    const res = await fetch(url, init);
+    const rawText = await res.text();
+    let parsed: any = null;
+    if (rawText) {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+    }
+
+    const isUnavailableStatus =
+      res.status === 404 ||
+      res.status === 405 ||
+      res.status === 501 ||
+      res.status === 502 ||
+      res.status === 503;
+
+    if (isUnavailableStatus || !parsed || typeof parsed !== 'object') {
+      return { backendAvailable: false, ok: false, status: res.status, data: null };
+    }
+
+    return {
+      backendAvailable: true,
+      ok: res.ok,
+      status: res.status,
+      data: parsed as T,
+    };
+  } catch {
+    return { backendAvailable: false, ok: false, status: 0, data: null };
   }
-  return data.result;
+}
+
+async function parseTelegramDirectJson(res: Response): Promise<{
+  ok: boolean;
+  result?: any;
+  description?: string;
+  parameters?: { retry_after?: number };
+}> {
+  const rawText = await res.text();
+  if (rawText) {
+    try {
+      const parsed = JSON.parse(rawText);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch {
+      // Non-JSON body
+    }
+  }
+  return {
+    ok: false,
+    description: `Telegram HTTP ${res.status || 0}${rawText ? `: ${rawText.slice(0, 120)}` : ''}`,
+  };
+}
+
+function dataUrlToBlob(dataUrl: string): { blob: Blob; ext: string } {
+  const matches = dataUrl.match(/^data:([A-Za-z0-9.+/-]+);base64,(.+)$/);
+  if (!matches || matches.length !== 3) {
+    throw new Error('ទម្រង់រូបភាព Base64 មិនត្រឹមត្រូវទេ');
+  }
+  const mimeType = matches[1] || 'image/png';
+  const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
+  const binary = atob(matches[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return { blob: new Blob([bytes], { type: mimeType }), ext };
+}
+
+function requireClientBotToken(botToken: string): string {
+  const clean = (botToken || '').trim();
+  if (!clean) {
+    throw new Error('សូមបញ្ចូល Telegram Bot Token ជាមុនសិន!');
+  }
+  return clean;
 }
 
 /**
- * Send a single formatted HTML message to Telegram (with automatic flood-wait retry)
+ * Test Telegram bot connection and get bot info (uses server route with direct CORS-safe fallback)
+ */
+export async function testTelegramBot(botToken: string) {
+  const cleanToken = (botToken || '').trim();
+  const apiRes = await callBackendApi<{ success?: boolean; result?: any; error?: string }>(
+    '/api/telegram/bot/test',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ botToken: cleanToken }),
+    }
+  );
+
+  if (apiRes.backendAvailable && apiRes.data) {
+    if (!apiRes.ok || !apiRes.data.success) {
+      throw new Error(apiRes.data.error || 'មិនអាចតភ្ជាប់ទៅកាន់ Telegram Bot បានទេ');
+    }
+    return apiRes.data.result;
+  }
+
+  // Fallback for static/Internet deployments without /api/telegram/* backend
+  const token = requireClientBotToken(cleanToken);
+  const tgRes = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+  const tgData = await parseTelegramDirectJson(tgRes);
+  if (!tgRes.ok || !tgData.ok) {
+    throw new Error(tgData.description || 'មិនអាចតភ្ជាប់ទៅកាន់ Telegram Bot បានទេ');
+  }
+  return tgData.result;
+}
+
+/**
+ * Send a single formatted HTML message to Telegram (with backend proxy + direct CORS-safe fallback & flood-wait retry)
  */
 export async function sendTelegramMessage(
   botToken: string,
@@ -39,26 +145,71 @@ export async function sendTelegramMessage(
   parseMode: 'HTML' | '' = 'HTML',
   attempt = 0
 ): Promise<any> {
-  const res = await fetch('/api/telegram/send-message', {
+  const cleanToken = (botToken || '').trim();
+  const cleanChatId = (chatId || '').trim();
+
+  const apiRes = await callBackendApi<{
+    success?: boolean;
+    result?: any;
+    error?: string;
+    retry_after?: number;
+  }>('/api/telegram/send-message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      botToken: botToken.trim(),
-      chatId: chatId.trim(),
+      botToken: cleanToken,
+      chatId: cleanChatId,
       text,
       parse_mode: parseMode,
     }),
   });
 
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    if (data.retry_after && attempt < 2) {
-      await sleep((Number(data.retry_after) + 1) * 1000);
-      return sendTelegramMessage(botToken, chatId, text, parseMode, attempt + 1);
+  if (apiRes.backendAvailable && apiRes.data) {
+    if (!apiRes.ok || !apiRes.data.success) {
+      if (apiRes.data.retry_after && attempt < 2) {
+        await sleep((Number(apiRes.data.retry_after) + 1) * 1000);
+        return sendTelegramMessage(cleanToken, cleanChatId, text, parseMode, attempt + 1);
+      }
+      throw new Error(apiRes.data.error || 'បរាជ័យក្នុងការផ្ញើសារទៅកាន់ Telegram');
     }
-    throw new Error(data.error || 'បរាជ័យក្នុងការផ្ញើសារទៅកាន់ Telegram');
+    return apiRes.data.result;
   }
-  return data.result;
+
+  // Direct CORS-simple Telegram API fallback (URLSearchParams avoids preflight OPTIONS)
+  const token = requireClientBotToken(cleanToken);
+  if (!cleanChatId || !text) {
+    throw new Error('សូមបញ្ចូល Telegram Chat ID និងខ្លឹមសារសារជាមុនសិន!');
+  }
+
+  const sendDirect = async (mode?: 'HTML' | '') => {
+    const params = new URLSearchParams();
+    params.set('chat_id', cleanChatId);
+    params.set('text', text);
+    params.set('disable_web_page_preview', 'true');
+    if (mode) params.set('parse_mode', mode);
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      body: params,
+    });
+    const d = await parseTelegramDirectJson(r);
+    return { r, d };
+  };
+
+  const { r: tgRes, d: tgData } = await sendDirect(parseMode);
+  if (!tgRes.ok || !tgData.ok) {
+    if (parseMode && tgData.description && tgData.description.includes("can't parse entities")) {
+      const retry = await sendDirect('');
+      if (retry.r.ok && retry.d.ok) {
+        return retry.d.result;
+      }
+    }
+    if (tgData.parameters?.retry_after && attempt < 2) {
+      await sleep((Number(tgData.parameters.retry_after) + 1) * 1000);
+      return sendTelegramMessage(cleanToken, cleanChatId, text, parseMode, attempt + 1);
+    }
+    throw new Error(tgData.description || 'បរាជ័យក្នុងការផ្ញើសារទៅកាន់ Telegram');
+  }
+  return tgData.result;
 }
 
 /**
@@ -111,12 +262,20 @@ export async function sendTelegramPoll(
     htmlExplanation += `\n${escapeTgHtml(safeRef)}`;
   }
 
-  const res = await fetch('/api/telegram/send-poll', {
+  const cleanToken = (botToken || '').trim();
+  const cleanChatId = (chatId || '').trim();
+
+  const apiRes = await callBackendApi<{
+    success?: boolean;
+    result?: any;
+    error?: string;
+    retry_after?: number;
+  }>('/api/telegram/send-poll', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      botToken: botToken.trim(),
-      chatId: chatId.trim(),
+      botToken: cleanToken,
+      chatId: cleanChatId,
       question: q.question,
       options: labeledOptions,
       correct_option_id: typeof q.correct === 'number' ? q.correct : 0,
@@ -126,15 +285,71 @@ export async function sendTelegramPoll(
     }),
   });
 
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    if (data.retry_after && attempt < 2) {
-      await sleep((Number(data.retry_after) + 1) * 1000);
-      return sendTelegramPoll(botToken, chatId, q, attempt + 1, examTitle);
+  if (apiRes.backendAvailable && apiRes.data) {
+    if (!apiRes.ok || !apiRes.data.success) {
+      if (apiRes.data.retry_after && attempt < 2) {
+        await sleep((Number(apiRes.data.retry_after) + 1) * 1000);
+        return sendTelegramPoll(cleanToken, cleanChatId, q, attempt + 1, examTitle);
+      }
+      throw new Error(apiRes.data.error || 'បរាជ័យក្នុងការបាញ់ Quiz Poll ទៅកាន់ Telegram');
     }
-    throw new Error(data.error || 'បរាជ័យក្នុងការបាញ់ Quiz Poll ទៅកាន់ Telegram');
+    return apiRes.data.result;
   }
-  return data.result;
+
+  // Direct CORS-simple Telegram API fallback
+  const token = requireClientBotToken(cleanToken);
+  if (!cleanChatId) {
+    throw new Error('សូមបញ្ចូល Telegram Chat ID / Channel ជាមុនសិន!');
+  }
+
+  const pollQuestion = q.question.length > 300 ? q.question.slice(0, 297) + '...' : q.question;
+  const pollOptions = labeledOptions
+    .slice(0, 10)
+    .map((opt) => (opt.length > 100 ? opt.slice(0, 97) + '...' : opt));
+  const correctId = typeof q.correct === 'number' ? q.correct : 0;
+
+  const sendDirectPoll = async (exp?: string, expMode?: string) => {
+    const params = new URLSearchParams();
+    params.set('chat_id', cleanChatId);
+    params.set('question', pollQuestion);
+    params.set('options', JSON.stringify(pollOptions));
+    params.set('type', 'quiz');
+    params.set('correct_option_id', String(correctId));
+    params.set('is_anonymous', 'true');
+    if (exp) {
+      params.set('explanation', exp);
+      if (expMode) params.set('explanation_parse_mode', expMode);
+    }
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendPoll`, {
+      method: 'POST',
+      body: params,
+    });
+    const d = await parseTelegramDirectJson(r);
+    return { r, d };
+  };
+
+  const { r: tgRes, d: tgData } = await sendDirectPoll(htmlExplanation, 'HTML');
+  if (!tgRes.ok || !tgData.ok) {
+    if (
+      tgData.description &&
+      (tgData.description.includes("can't parse entities") ||
+        tgData.description.includes('EXPLANATION') ||
+        tgData.description.includes('too long'))
+    ) {
+      const plainExp = htmlExplanation.replace(/<[^>]+>/g, '');
+      const trimmedExp = plainExp.length > 200 ? plainExp.slice(0, 197) + '...' : plainExp;
+      const retry = await sendDirectPoll(trimmedExp, undefined);
+      if (retry.r.ok && retry.d.ok) {
+        return retry.d.result;
+      }
+    }
+    if (tgData.parameters?.retry_after && attempt < 2) {
+      await sleep((Number(tgData.parameters.retry_after) + 1) * 1000);
+      return sendTelegramPoll(cleanToken, cleanChatId, q, attempt + 1, examTitle);
+    }
+    throw new Error(tgData.description || 'បរាជ័យក្នុងការបាញ់ Quiz Poll ទៅកាន់ Telegram');
+  }
+  return tgData.result;
 }
 
 export const DEFAULT_TG_WEB_BUTTON_REPLY_MARKUP = {
@@ -149,7 +364,7 @@ export const DEFAULT_TG_WEB_BUTTON_REPLY_MARKUP = {
 };
 
 /**
- * Send a rendered Question Card image to Telegram (with automatic flood-wait retry & inline bot button)
+ * Send a rendered Question Card image to Telegram (with backend proxy + direct CORS-safe fallback & flood-wait retry)
  */
 export async function sendTelegramPhoto(
   botToken: string,
@@ -159,12 +374,20 @@ export async function sendTelegramPhoto(
   parseMode: 'HTML' | '' = 'HTML',
   attempt = 0
 ): Promise<any> {
-  const res = await fetch('/api/telegram/send-photo', {
+  const cleanToken = (botToken || '').trim();
+  const cleanChatId = (chatId || '').trim();
+
+  const apiRes = await callBackendApi<{
+    success?: boolean;
+    result?: any;
+    error?: string;
+    retry_after?: number;
+  }>('/api/telegram/send-photo', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      botToken: botToken.trim(),
-      chatId: chatId.trim(),
+      botToken: cleanToken,
+      chatId: cleanChatId,
       photoBase64,
       caption,
       parse_mode: caption ? parseMode : undefined,
@@ -172,15 +395,60 @@ export async function sendTelegramPhoto(
     }),
   });
 
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    if (data.retry_after && attempt < 2) {
-      await sleep((Number(data.retry_after) + 1) * 1000);
-      return sendTelegramPhoto(botToken, chatId, photoBase64, caption, parseMode, attempt + 1);
+  if (apiRes.backendAvailable && apiRes.data) {
+    if (!apiRes.ok || !apiRes.data.success) {
+      if (apiRes.data.retry_after && attempt < 2) {
+        await sleep((Number(apiRes.data.retry_after) + 1) * 1000);
+        return sendTelegramPhoto(cleanToken, cleanChatId, photoBase64, caption, parseMode, attempt + 1);
+      }
+      throw new Error(apiRes.data.error || 'បរាជ័យក្នុងការផ្ញើរូបភាពទៅកាន់ Telegram');
     }
-    throw new Error(data.error || 'បរាជ័យក្នុងការផ្ញើរូបភាពទៅកាន់ Telegram');
+    return apiRes.data.result;
   }
-  return data.result;
+
+  // Direct CORS-simple FormData fallback
+  const token = requireClientBotToken(cleanToken);
+  if (!cleanChatId || !photoBase64) {
+    throw new Error('សូមបញ្ចូល Telegram Chat ID និងរូបភាពជាមុនសិន!');
+  }
+
+  const { blob, ext } = dataUrlToBlob(photoBase64);
+
+  const sendDirectPhoto = async (cap?: string, mode?: 'HTML' | '') => {
+    const form = new FormData();
+    form.append('chat_id', cleanChatId);
+    form.append('photo', blob, `quiz_card.${ext}`);
+    if (cap) {
+      const finalCap = !mode && cap.length > 1024 ? cap.slice(0, 1020) + '...' : cap;
+      form.append('caption', finalCap);
+      if (mode) form.append('parse_mode', mode);
+    }
+    form.append('reply_markup', JSON.stringify(DEFAULT_TG_WEB_BUTTON_REPLY_MARKUP));
+
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      method: 'POST',
+      body: form,
+    });
+    const d = await parseTelegramDirectJson(r);
+    return { r, d };
+  };
+
+  const { r: tgRes, d: tgData } = await sendDirectPhoto(caption, caption ? parseMode : undefined);
+  if (!tgRes.ok || !tgData.ok) {
+    if (parseMode && caption && tgData.description && tgData.description.includes("can't parse entities")) {
+      const plainCaption = caption.replace(/<[^>]+>/g, '');
+      const retry = await sendDirectPhoto(plainCaption, '');
+      if (retry.r.ok && retry.d.ok) {
+        return retry.d.result;
+      }
+    }
+    if (tgData.parameters?.retry_after && attempt < 2) {
+      await sleep((Number(tgData.parameters.retry_after) + 1) * 1000);
+      return sendTelegramPhoto(cleanToken, cleanChatId, photoBase64, caption, parseMode, attempt + 1);
+    }
+    throw new Error(tgData.description || 'បរាជ័យក្នុងការផ្ញើរូបភាពទៅកាន់ Telegram');
+  }
+  return tgData.result;
 }
 
 function escapeCardHtml(text: string): string {
@@ -626,60 +894,121 @@ export interface CommandBotStatus {
   lastError: string | null;
 }
 
+const FALLBACK_TELEGRAM_BOT_COMMANDS = [
+  { command: 'start', description: 'ចាប់ផ្ដើម និងបើកមឺនុយណែនាំប្រើប្រាស់កម្មវិធី' },
+  { command: 'register', description: 'ណែនាំជំហានចុះឈ្មោះប្រើប្រាស់ Master Quiz KH' },
+  { command: 'passcode', description: 'របៀបស្នើសុំលេខសម្ងាត់សមាជិកពី Admin' },
+  { command: 'payment', description: 'ណែនាំការបង់ប្រាក់ KHQR ប្រើប្រាស់ពេញមួយជីវិត' },
+  { command: 'contact', description: 'ទំនាក់ទំនង Admin និងចូលក្រុម Telegram' },
+  { command: 'help', description: 'បង្ហាញបញ្ជី Command ទាំងអស់របស់ Bot' },
+];
+
 export async function registerTelegramCommands(botToken: string): Promise<any> {
-  const res = await fetch('/api/telegram/bot/set-commands', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ botToken: botToken.trim() }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'មិនអាចចុះឈ្មោះ Command Bot បានទេ');
+  const cleanToken = (botToken || '').trim();
+  const apiRes = await callBackendApi<{ success?: boolean; commands?: any[]; error?: string }>(
+    '/api/telegram/bot/set-commands',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ botToken: cleanToken }),
+    }
+  );
+
+  if (apiRes.backendAvailable && apiRes.data) {
+    if (!apiRes.ok || !apiRes.data.success) {
+      throw new Error(apiRes.data.error || 'មិនអាចចុះឈ្មោះ Command Bot បានទេ');
+    }
+    return apiRes.data;
   }
-  return data;
+
+  // Direct CORS-simple fallback
+  const token = requireClientBotToken(cleanToken);
+  const cmdParams = new URLSearchParams();
+  cmdParams.set('commands', JSON.stringify(FALLBACK_TELEGRAM_BOT_COMMANDS));
+  const res = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+    method: 'POST',
+    body: cmdParams,
+  });
+  const data = await parseTelegramDirectJson(res);
+  if (!res.ok || !data.ok) {
+    throw new Error(data.description || 'មិនអាចចុះឈ្មោះ Command Bot បានទេ');
+  }
+
+  const descParams = new URLSearchParams();
+  descParams.set(
+    'description',
+    'សូមស្វាគមន៍មកកាន់ Master Quiz KH Bot!\n\n' +
+      'ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា (QCM, Q&A, ពន្យល់ពាក្យ និង Export PDF)។\n' +
+      'ចុច Start ឬវាយ /register ដើម្បីទទួលការណែនាំអំពីការចុះឈ្មោះប្រើប្រាស់កម្មវិធីភ្លាមៗ!'
+  );
+  await fetch(`https://api.telegram.org/bot${token}/setMyDescription`, {
+    method: 'POST',
+    body: descParams,
+  }).catch(() => {});
+
+  const shortParams = new URLSearchParams();
+  shortParams.set(
+    'short_description',
+    'ជំនួយការស្វ័យប្រវត្តិ Master Quiz KH · ណែនាំចុះឈ្មោះ ការប្រើប្រាស់ និង KHQR'
+  );
+  await fetch(`https://api.telegram.org/bot${token}/setMyShortDescription`, {
+    method: 'POST',
+    body: shortParams,
+  }).catch(() => {});
+
+  const menuParams = new URLSearchParams();
+  menuParams.set('menu_button', JSON.stringify({ type: 'commands' }));
+  await fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+    method: 'POST',
+    body: menuParams,
+  }).catch(() => {});
+
+  return { success: true, commands: FALLBACK_TELEGRAM_BOT_COMMANDS };
 }
 
 export async function startTelegramCommandBot(
   botToken: string,
   appUrl?: string
 ): Promise<CommandBotStatus & { success: boolean }> {
-  const res = await fetch('/api/telegram/bot/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      botToken: botToken.trim(),
-      appUrl: appUrl || (typeof window !== 'undefined' ? window.location.origin : ''),
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'មិនអាចបើកដំណើរការ Command Bot បានទេ');
+  const apiRes = await callBackendApi<CommandBotStatus & { success: boolean; error?: string }>(
+    '/api/telegram/bot/start',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        botToken: (botToken || '').trim(),
+        appUrl: appUrl || (typeof window !== 'undefined' ? window.location.origin : ''),
+      }),
+    }
+  );
+
+  if (!apiRes.backendAvailable || !apiRes.data) {
+    throw new Error(
+      'ម៉ាស៊ីនមេ Command Bot មិនដំណើរការលើ Host នេះទេ — ប៉ុន្តែមុខងារផ្ញើសារ Poll និងរូបភាពទៅ Telegram ដំណើរការពេញលេញ!'
+    );
   }
-  return data;
+  if (!apiRes.ok || !apiRes.data.success) {
+    throw new Error(apiRes.data.error || 'មិនអាចបើកដំណើរការ Command Bot បានទេ');
+  }
+  return apiRes.data;
 }
 
 export async function stopTelegramCommandBot(): Promise<void> {
-  await fetch('/api/telegram/bot/stop', { method: 'POST' });
+  await callBackendApi('/api/telegram/bot/stop', { method: 'POST' });
 }
 
 export async function getTelegramCommandBotStatus(): Promise<CommandBotStatus | null> {
-  try {
-    const res = await fetch('/api/telegram/bot/status');
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
+  const apiRes = await callBackendApi<CommandBotStatus>('/api/telegram/bot/status');
+  if (!apiRes.backendAvailable || !apiRes.ok || !apiRes.data) {
     return null;
   }
+  return apiRes.data;
 }
 
 export async function syncTelegramBotTemplates(templates: Record<string, any>): Promise<void> {
-  try {
-    await fetch('/api/telegram/bot/templates', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ templates }),
-    });
-  } catch {
-    // Ignore transient network errors
-  }
+  await callBackendApi('/api/telegram/bot/templates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ templates }),
+  });
 }
