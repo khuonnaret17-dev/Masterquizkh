@@ -266,7 +266,7 @@ export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = (
       )}
 
       {isOpen && (
-        <div className="w-[calc(100vw-2rem)] sm:w-[410px] max-w-md rounded-2xl khmer-ornate-card shadow-2xl overflow-hidden flex flex-col max-h-[84vh] sm:max-h-[560px]">
+        <div className="w-[calc(100vw-2rem)] sm:w-[410px] max-w-md rounded-2xl khmer-ornate-card shadow-2xl overflow-hidden flex flex-col max-h-[calc(100dvh-2rem)] sm:max-h-[min(85dvh,560px)]">
           {/* Header */}
           <div className="p-4 khmer-btn-primary border-b-2 border-[var(--theme-gold)]/70 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">

@@ -664,7 +664,8 @@ const KHQR_PHOTO_PATH = path.resolve(__dirname, 'public/assets/aistudio/image_13
 
 function buildTelegramBotReply(
   rawCmd: string,
-  appUrl: string
+  appUrl: string,
+  isPrivateChat = true
 ): { text: string; reply_markup: any; photoPath?: string } {
   const cleaned = (rawCmd || '').trim();
   const cmdToken = cleaned.split(/\s+/)[0].toLowerCase().replace(/@[a-z0-9_]+$/i, '');
@@ -689,8 +690,13 @@ function buildTelegramBotReply(
     ? envAppUrl.trim()
     : 'https://ais-pre-465pdvc3s6xpdxzfakguy4-895267791362.asia-southeast1.run.app';
 
+  const createOpenAppButton = (label: string) =>
+    isPrivateChat
+      ? { text: label, web_app: { url: candidateUrl } }
+      : { text: label, url: candidateUrl };
+
   const openAppRow = isValidTelegramHttpsUrl(candidateUrl)
-    ? [{ text: '📱 បើកកម្មវិធី Master Quiz KH', url: candidateUrl }]
+    ? [createOpenAppButton('📱 បើកកម្មវិធី Master Quiz KH')]
     : [];
 
   const customTemplates = loadCustomBotTemplates();
@@ -708,7 +714,7 @@ function buildTelegramBotReply(
         }
       } else if (act.type === 'open_member_login') {
         if (isValidTelegramHttpsUrl(candidateUrl)) {
-          customButtons.push({ text: act.label.slice(0, 64), url: candidateUrl });
+          customButtons.push(createOpenAppButton(act.label.slice(0, 64)));
         }
       }
     }
@@ -717,7 +723,7 @@ function buildTelegramBotReply(
     for (const btn of customButtons) {
       inlineRows.push([btn]);
     }
-    if (openAppRow.length > 0 && !customButtons.some((b) => b.url === candidateUrl)) {
+    if (openAppRow.length > 0 && !customButtons.some((b) => b.url === candidateUrl || b.web_app?.url === candidateUrl)) {
       inlineRows.push(openAppRow);
     }
 
@@ -922,10 +928,11 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
 
   let chatId: number | string | null = null;
   let commandInput = '';
+  let isPrivateChat = true;
 
   if (update.message && update.message.chat && typeof update.message.text === 'string') {
     const text = update.message.text.trim();
-    const isPrivateChat = update.message.chat.type === 'private';
+    isPrivateChat = update.message.chat.type === 'private';
     if (text.startsWith('/') || isPrivateChat) {
       chatId = update.message.chat.id;
       commandInput = text;
@@ -934,6 +941,7 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
     const cq = update.callback_query;
     if (String(cq.data).startsWith('cmd:')) {
       chatId = cq.message?.chat?.id ?? cq.from?.id ?? null;
+      isPrivateChat = cq.message?.chat?.type ? cq.message.chat.type === 'private' : true;
       commandInput = String(cq.data);
       await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
         method: 'POST',
@@ -945,7 +953,7 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
 
   if (!chatId || !commandInput) return;
 
-  const reply = buildTelegramBotReply(commandInput, appUrl);
+  const reply = buildTelegramBotReply(commandInput, appUrl, isPrivateChat);
 
   // If reply includes a local photo card (e.g. KHQR payment QR), send via sendPhoto first
   if (reply.photoPath) {

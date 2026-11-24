@@ -12,6 +12,7 @@ import {
   Menu,
   X,
   Bell,
+  ArrowLeft,
 } from 'lucide-react';
 import { UserSession, AppThemeId } from '../types';
 import { toKhmerNum } from '../utils/khmer';
@@ -29,6 +30,9 @@ interface NavbarProps {
   currentTheme: AppThemeId;
   onOpenThemeModal: () => void;
   notificationsCount?: number;
+  canGoBack?: boolean;
+  onBack?: () => void;
+  pageTitle?: string;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -42,6 +46,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   currentTheme,
   onOpenThemeModal,
   notificationsCount = 0,
+  canGoBack = false,
+  onBack,
+  pageTitle,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -75,27 +82,48 @@ export const Navbar: React.FC<NavbarProps> = ({
   };
 
   return (
-    <nav className="sticky top-0 z-40 app-nav backdrop-blur-md border-b shadow-sm">
-      <KhmerLatticeBar />
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16 gap-4">
-          {/* Brand & Logo */}
-          <button
-            type="button"
-            onClick={() => onTabChange('play')}
-            className="flex items-center gap-3 cursor-pointer shrink-0 text-left focus-visible:outline-none"
-          >
-            <div className="p-0.5 rounded-full border border-[var(--theme-gold)]/75 bg-[var(--theme-bg-surface)]">
-              <img
-                src="https://i.postimg.cc/0ygmLdvR/3QCM_Ep4.png"
-                alt="Master Quiz KH Logo"
-                className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover"
-              />
-            </div>
-            <span className="font-moul text-sm sm:text-base app-text-primary whitespace-nowrap">
-              MASTER QUIZ KH
-            </span>
-          </button>
+    <nav className="sticky top-0 z-40 app-nav backdrop-blur-md border-b app-border shadow-sm tg-safe-top tg-safe-x">
+      <KhmerLatticeBar className="max-md:portrait:!h-[49px] max-md:portrait:!w-[377px] max-md:portrait:max-w-full md:!h-1.5 md:!w-full landscape:!h-1.5 landscape:!w-full" />
+      <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-[52px] sm:h-14 md:h-16 landscape-compact-bar gap-2 sm:gap-3 md:gap-4">
+          {/* Brand & Logo / Mini App Back Control */}
+          <div className="flex items-center gap-2 min-w-0">
+            {canGoBack && onBack && (
+              <button
+                type="button"
+                onClick={onBack}
+                title="ត្រឡប់ក្រោយ"
+                aria-label="ត្រឡប់ក្រោយ"
+                className="min-w-[40px] min-h-[40px] rounded-xl app-card flex items-center justify-center app-text-primary hover:opacity-80 transition cursor-pointer shrink-0"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => onTabChange('play')}
+              className="flex items-center gap-2.5 cursor-pointer min-w-0 text-left focus-visible:outline-none"
+            >
+              <div className="p-0.5 rounded-full border border-[var(--theme-gold)]/75 bg-[var(--theme-bg-surface)] shrink-0">
+                <img
+                  src="https://i.postimg.cc/0ygmLdvR/3QCM_Ep4.png"
+                  alt="Master Quiz KH Logo"
+                  referrerPolicy="no-referrer"
+                  className="w-8 h-8 rounded-full object-cover"
+                />
+              </div>
+              <div className="min-w-0">
+                <span className="block font-moul text-xs sm:text-sm app-text-primary whitespace-nowrap truncate leading-tight">
+                  {pageTitle || 'MASTER QUIZ KH'}
+                </span>
+                {pageTitle && (
+                  <span className="block text-[11px] app-text-secondary truncate leading-tight">
+                    MASTER QUIZ KH
+                  </span>
+                )}
+              </div>
+            </button>
+          </div>
 
           {/* Center Mode Switch (Admin) or Subtitle */}
           {session.role === 'admin' ? (
@@ -103,7 +131,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <button
                 type="button"
                 onClick={() => onTabChange('play')}
-                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 lg:px-3.5 py-1.5 rounded-lg text-xs lg:text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
                   activeTab === 'play'
                     ? 'khmer-btn-primary shadow-sm'
                     : 'app-text-secondary hover:opacity-80'
@@ -115,7 +143,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <button
                 type="button"
                 onClick={() => onTabChange('admin')}
-                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 lg:px-3.5 py-1.5 rounded-lg text-xs lg:text-sm font-semibold transition whitespace-nowrap cursor-pointer ${
                   activeTab === 'admin'
                     ? 'khmer-btn-crimson shadow-sm'
                     : 'app-text-secondary hover:opacity-80'
@@ -132,18 +160,20 @@ export const Navbar: React.FC<NavbarProps> = ({
           )}
 
           {/* Right Area: Online Count + Unified Menu Button */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             <div className="flex items-center gap-1.5 text-xs sm:text-sm font-semibold text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
-              <Users className="w-4 h-4" />
+              <Users className="w-4 h-4 shrink-0" />
               <span className="tabular-nums">{toKhmerNum(onlineCount || 1)}</span>
-              <span className="hidden sm:inline">កំពុងសិក្សា</span>
+              <span className={session.role === 'admin' ? 'hidden lg:inline' : 'hidden sm:inline'}>
+                កំពុងសិក្សា
+              </span>
             </div>
 
             <div className="relative" ref={menuRef}>
               <button
                 type="button"
                 onClick={() => setIsMenuOpen((prev) => !prev)}
-                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl border transition cursor-pointer font-semibold text-sm ${
+                className={`flex items-center gap-1.5 sm:gap-2 min-h-[40px] px-2.5 sm:px-3.5 py-1.5 rounded-xl border transition cursor-pointer font-semibold text-xs sm:text-sm whitespace-nowrap ${
                   isMenuOpen
                     ? 'khmer-soft-surface border-[var(--theme-gold)]'
                     : 'app-card hover:opacity-90'
@@ -158,11 +188,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <User className="w-4 h-4 khmer-accent-text shrink-0" />
                 )}
 
-                <span className="hidden sm:inline truncate max-w-[110px]">
+                <span className="hidden sm:inline truncate max-w-[90px] lg:max-w-[120px]">
                   {session.username}
                 </span>
 
-                <span className="text-sm">ម៉ឺនុយ</span>
+                <span>ម៉ឺនុយ</span>
                 {isMenuOpen ? (
                   <X className="w-4 h-4 shrink-0" />
                 ) : (
@@ -172,7 +202,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
               {/* DROPDOWN MENU FLYOUT */}
               {isMenuOpen && (
-                <div className="absolute right-0 mt-2 w-72 sm:w-80 rounded-2xl khmer-frame-card shadow-xl p-3 z-50">
+                <div className="absolute right-0 mt-2 w-72 sm:w-80 max-w-[calc(100vw-1.5rem)] max-h-[calc(100dvh-4.5rem)] overflow-y-auto rounded-2xl khmer-frame-card shadow-xl p-3 z-50">
                   {/* Profile Header */}
                   <div className="p-3 mb-2 rounded-xl app-subcard flex items-center gap-3">
                     <div className="w-10 h-10 rounded-xl khmer-btn-primary flex items-center justify-center font-bold text-base shrink-0">

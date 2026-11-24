@@ -238,8 +238,8 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
   // Result Summary Screen
   if (isCompleted && !isReviewMode) {
     return (
-      <div className="max-w-2xl mx-auto px-4 py-12">
-        <div className="relative khmer-ornate-card rounded-2xl p-7 sm:p-10 text-center">
+      <div className="max-w-2xl mx-auto px-4 sm:px-6 py-4 sm:py-10 tg-safe-x">
+        <div className="relative khmer-ornate-card rounded-2xl p-5 sm:p-9 text-center">
           <KhmerCornerMotif position="tl" size={34} />
           <KhmerCornerMotif position="tr" size={34} />
           <KhmerCornerMotif position="bl" size={34} />
@@ -327,22 +327,22 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
   }
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-6">
+    <div className="max-w-4xl mx-auto px-4 sm:px-6 py-3 sm:py-6 tg-safe-x">
       {/* Top Bar */}
-      <div className="flex items-center justify-between mb-4 gap-3">
+      <div className="flex items-center justify-between mb-4 gap-2.5">
         <button
           type="button"
           onClick={onExit}
-          className="flex items-center gap-1.5 text-sm font-semibold app-card px-3.5 py-2 rounded-xl hover:opacity-80 transition cursor-pointer shrink-0"
+          className="flex items-center gap-1.5 min-h-[40px] text-xs sm:text-sm font-semibold app-card px-3.5 py-1.5 rounded-xl hover:opacity-80 transition cursor-pointer shrink-0 whitespace-nowrap"
         >
           <ArrowLeft className="w-4 h-4" />
           <span>ចាកចេញ</span>
         </button>
 
-        <div className="text-center truncate px-2">
-          <p className="font-moul text-sm sm:text-base app-text-primary truncate">{title}</p>
+        <div className="text-center min-w-0 px-2">
+          <p className="font-moul text-xs sm:text-base app-text-primary truncate">{title}</p>
           {isReviewMode && (
-            <span className="text-xs khmer-accent-text font-semibold">
+            <span className="text-[11px] sm:text-xs khmer-accent-text font-semibold block truncate">
               កំពុងពិនិត្យចម្លើយឡើងវិញ
             </span>
           )}
@@ -353,7 +353,8 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
             type="button"
             onClick={onToggleMute}
             title="បិទ/បើកសំឡេង"
-            className="p-2 rounded-xl app-card hover:opacity-80 transition cursor-pointer"
+            aria-label="បិទ/បើកសំឡេង"
+            className="min-w-[40px] min-h-[40px] p-2 rounded-xl app-card hover:opacity-80 transition cursor-pointer flex items-center justify-center"
           >
             {isMuted ? (
               <VolumeX className="w-4 h-4 text-red-600 dark:text-red-400" />
@@ -361,7 +362,7 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
               <Volume2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
             )}
           </button>
-          <div className="px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-400 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 font-bold text-xs sm:text-sm tabular-nums">
+          <div className="min-h-[40px] flex items-center px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-400 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 font-bold text-xs sm:text-sm tabular-nums whitespace-nowrap">
             ត្រូវ {toKhmerNum(correctCount)}
           </div>
         </div>
@@ -379,7 +380,7 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
       </div>
 
       {/* Main Question Card */}
-      <div className="relative khmer-ornate-card rounded-2xl p-7 sm:p-9">
+      <div className="relative khmer-ornate-card rounded-2xl p-5 sm:p-8">
         <KhmerCornerMotif position="tl" size={30} />
         <KhmerCornerMotif position="tr" size={30} />
         <KhmerCornerMotif position="bl" size={30} />

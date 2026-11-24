@@ -169,40 +169,40 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
   };
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8">
       {/* Khmer Cultural Hero Banner */}
-      <div className="relative khmer-ornate-card rounded-2xl p-7 sm:p-9 mb-8">
-        <KhmerCornerMotif position="tl" size={34} />
-        <KhmerCornerMotif position="tr" size={34} />
-        <KhmerCornerMotif position="bl" size={34} />
-        <KhmerCornerMotif position="br" size={34} />
+      <div className="relative khmer-ornate-card rounded-2xl p-5 sm:p-7 mb-5 sm:mb-7">
+        <KhmerCornerMotif position="tl" size={30} />
+        <KhmerCornerMotif position="tr" size={30} />
+        <KhmerCornerMotif position="bl" size={30} />
+        <KhmerCornerMotif position="br" size={30} />
 
-        <div className="flex flex-col md:flex-row items-center justify-between gap-6">
-          <div className="text-center md:text-left">
-            <div className="flex items-center justify-center md:justify-start gap-2.5 mb-1">
-              <KhmerLotusCrest size={38} />
+        <div className="flex flex-col md:flex-row items-center justify-between gap-4 sm:gap-6">
+          <div className="text-center md:text-left min-w-0 flex-1">
+            <div className="flex items-center justify-center md:justify-start gap-2 mb-1">
+              <KhmerLotusCrest size={32} className="shrink-0" />
               <p className="text-xs sm:text-sm font-bold khmer-gold-text">
                 ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ
               </p>
             </div>
-            <h1 className="leading-[69px] font-moul text-xl sm:text-3xl app-text-primary mb-2">
+            <h1 className="leading-snug sm:leading-normal font-moul text-lg sm:text-2xl app-text-primary mb-1.5">
               កម្មវិធីត្រៀមប្រឡងក្របខ័ណ្ឌ
             </h1>
-            <p className="app-text-secondary text-sm sm:text-base max-w-xl font-kantumruy leading-relaxed">
+            <p className="app-text-secondary text-xs sm:text-sm max-w-xl mx-auto md:mx-0 font-kantumruy leading-relaxed">
               ជ្រើសរើសមុខវិជ្ជាដើម្បីហ្វឹកហាត់តាមភាគ (១ភាគ = ១០សំណួរ) ឬសាកល្បងសមត្ថភាពជាមួយការប្រឡងចម្រុះគ្រប់មុខវិជ្ជា។
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center justify-center gap-3 shrink-0">
-            <div className="text-center px-5 py-3 rounded-xl khmer-frame-card min-w-[112px]">
-              <span className="block text-xl sm:text-2xl font-bold khmer-accent-text font-moul tabular-nums">
+          <div className="flex items-center justify-center gap-3 shrink-0">
+            <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
+              <span className="block text-lg sm:text-2xl font-bold khmer-accent-text font-moul tabular-nums">
                 {toKhmerNum(questions.length)}
               </span>
               <span className="text-xs app-text-secondary font-semibold">សំណួរសរុប</span>
             </div>
 
-            <div className="text-center px-5 py-3 rounded-xl khmer-frame-card min-w-[112px]">
-              <span className="block text-xl sm:text-2xl font-bold khmer-gold-text font-moul tabular-nums">
+            <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
+              <span className="block text-lg sm:text-2xl font-bold khmer-gold-text font-moul tabular-nums">
                 {toKhmerNum(activeSubjects.length)}
               </span>
               <span className="text-xs app-text-secondary font-semibold">មុខវិជ្ជា</span>
@@ -212,44 +212,44 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
       </div>
 
       {/* Main Mode Navigation Tabs */}
-      <div className="flex flex-wrap gap-1.5 mb-8 app-subcard p-1.5 rounded-2xl max-w-xl mx-auto">
+      <div className="grid grid-cols-3 gap-1.5 mb-6 sm:mb-8 app-subcard p-1.5 rounded-2xl max-w-xl mx-auto">
         <button
           type="button"
           onClick={() => setActiveTab('subject')}
-          className={`flex-1 min-w-[120px] py-2.5 px-3 rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 cursor-pointer ${
+          className={`min-h-[42px] py-2 px-2 sm:px-3 rounded-xl text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer whitespace-nowrap ${
             activeTab === 'subject'
               ? 'khmer-btn-primary shadow-sm'
               : 'app-text-secondary hover:opacity-80'
           }`}
         >
-          <BookOpen className="w-4 h-4" />
-          <span>តាមមុខវិជ្ជា</span>
+          <BookOpen className="w-4 h-4 shrink-0" />
+          <span className="truncate">តាមមុខវិជ្ជា</span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('mixed')}
-          className={`flex-1 min-w-[120px] py-2.5 px-3 rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 cursor-pointer ${
+          className={`min-h-[42px] py-2 px-2 sm:px-3 rounded-xl text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer whitespace-nowrap ${
             activeTab === 'mixed'
               ? 'khmer-btn-primary shadow-sm'
               : 'app-text-secondary hover:opacity-80'
           }`}
         >
-          <Shuffle className="w-4 h-4" />
-          <span>តេស្តចម្រុះ</span>
+          <Shuffle className="w-4 h-4 shrink-0" />
+          <span className="truncate">តេស្តចម្រុះ</span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('dictionary')}
-          className={`flex-1 min-w-[120px] py-2.5 px-3 rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 cursor-pointer ${
+          className={`min-h-[42px] py-2 px-2 sm:px-3 rounded-xl text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer whitespace-nowrap ${
             activeTab === 'dictionary'
               ? 'khmer-btn-primary shadow-sm'
               : 'app-text-secondary hover:opacity-80'
           }`}
         >
-          <Layers className="w-4 h-4" />
-          <span>ពន្យល់ពាក្យ</span>
+          <Layers className="w-4 h-4 shrink-0" />
+          <span className="truncate">ពន្យល់ពាក្យ</span>
         </button>
       </div>
 
@@ -281,7 +281,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
           </div>
 
           {/* Subjects Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
             {activeSubjects
               .filter((sub) => typeFilter === 'all' || sub.type === typeFilter)
               .map((sub) => {
@@ -322,7 +322,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                         type="button"
                         onClick={() => handleOpenPartsModal(sub)}
                         disabled={count === 0}
-                        className="flex-1 py-2.5 px-4 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                        className="flex-1 min-h-[44px] py-2.5 px-4 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                       >
                         <Play className="w-4 h-4 fill-current" />
                         <span>ចូលធ្វើតេស្ត</span>
@@ -333,7 +333,8 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                         onClick={() => setViewingSubject(sub)}
                         disabled={count === 0}
                         title="មើលវិញ្ញាសាទាំងមូល"
-                        className="p-2.5 rounded-xl app-subcard app-text-primary hover:opacity-80 transition disabled:opacity-50 cursor-pointer"
+                        aria-label="មើលវិញ្ញាសាទាំងមូល"
+                        className="min-w-[44px] min-h-[44px] p-2.5 rounded-xl app-subcard app-text-primary hover:opacity-80 transition disabled:opacity-50 flex items-center justify-center cursor-pointer"
                       >
                         <Eye className="w-5 h-5" />
                       </button>
@@ -566,8 +567,8 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
       {/* MODAL: SELECT PART (១ភាគ = ១០សំណួរ) */}
       {selectedSubjectForParts && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-lg rounded-2xl p-6 sm:p-8 shadow-2xl relative">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-sm">
+          <div className="khmer-ornate-card w-full max-w-lg max-h-[90dvh] overflow-y-auto rounded-2xl p-5 sm:p-8 shadow-2xl relative">
             <KhmerCornerMotif position="tl" size={28} />
             <button
               type="button"
@@ -623,18 +624,18 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
       {/* MODAL: VIEW FULL PAPER */}
       {viewingSubject && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-4xl max-h-[90vh] rounded-2xl flex flex-col shadow-2xl relative overflow-hidden">
-            <div className="p-5 sm:p-6 border-b app-border flex items-center justify-between app-subcard">
-              <div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-sm">
+          <div className="khmer-ornate-card w-full max-w-4xl max-h-[90dvh] rounded-2xl flex flex-col shadow-2xl relative overflow-hidden">
+            <div className="p-4 sm:p-6 border-b app-border flex flex-col md:flex-row md:items-center justify-between gap-3 app-subcard">
+              <div className="min-w-0">
                 <span className="text-xs font-bold khmer-gold-text">
                   កម្រងវិញ្ញាសាពេញលេញ
                 </span>
-                <h3 className="font-moul text-base sm:text-xl app-text-primary mt-0.5">
+                <h3 className="font-moul text-base sm:text-xl app-text-primary mt-0.5 break-words">
                   {viewingSubject.name}
                 </h3>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
                 {session.role === 'admin' && (() => {
                   const totalAvail = (questionsBySubject[viewingSubject.name] || []).length;
                   const resolvedLimit =
@@ -729,7 +730,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                   </div>
 
                   {q.type === 'mcq' && q.options && (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 mt-3 pl-6">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 mt-3 pl-0 sm:pl-6">
                       {q.options.map((opt, oIdx) => {
                         const isCorrect = oIdx === q.correct;
                         return (
@@ -752,7 +753,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                   )}
 
                   {(q.type === 'short' || q.type === 'explanation') && q.answer && (
-                    <div className="mt-3 pl-6">
+                    <div className="mt-3 pl-0 sm:pl-6">
                       <div className="p-3.5 rounded-xl app-answer-box text-sm sm:text-base font-siemreap leading-relaxed whitespace-pre-line">
                         {q.answer}
                       </div>

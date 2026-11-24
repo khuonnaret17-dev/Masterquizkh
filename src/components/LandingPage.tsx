@@ -3,6 +3,7 @@ import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette
 import { recordLogin, subscribeBotCommands } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
+import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
 import { ThemeSelectorModal } from './ThemeSelectorModal';
 import { FloatingMessengerWidget } from './FloatingMessengerWidget';
 import {
@@ -22,6 +23,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
 
+  const tgUser = getTelegramMiniAppUser();
+
   useEffect(() => {
     const handleThemeChange = (e: any) => {
       if (e.detail) setCurrentTheme(e.detail);
@@ -35,10 +38,18 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
     return () => unsub();
   }, []);
 
+  useEffect(() => {
+    const hasOpenOverlay = activeModal !== null || isThemeModalOpen;
+    return setTelegramBackButton(hasOpenOverlay, () => {
+      setActiveModal(null);
+      setIsThemeModalOpen(false);
+    });
+  }, [activeModal, isThemeModalOpen]);
+
   const currentThemeConfig = APP_THEMES.find((t) => t.id === currentTheme) || APP_THEMES[0];
 
   // Member form state
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(() => tgUser?.first_name || tgUser?.username || '');
   const [password, setPassword] = useState('');
   const [memberError, setMemberError] = useState('');
 
@@ -100,70 +111,87 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
   };
 
   return (
-    <div className="min-h-screen flex flex-col justify-between app-canvas">
-      <div>
+    <div className="min-h-miniapp flex flex-col justify-between app-canvas">
+      {/* Compact Sticky Mini App Header */}
+      <header className="sticky top-0 z-30 app-nav backdrop-blur-md border-b app-border shadow-sm tg-safe-top tg-safe-x">
         <KhmerLatticeBar />
-
-        {/* Header Section */}
-        <header className="w-full max-w-4xl mx-auto pt-6 pb-4 px-4 text-center">
-          <div className="space-y-1 mb-4">
-            <KhmerLotusCrest size={56} className="mx-auto mb-1.5" />
-            <p className="font-moul khmer-gold-text text-lg sm:text-xl">
-              ព្រះរាជាណាចក្រកម្ពុជា
-            </p>
-            <p className="font-siemreap app-text-secondary text-sm sm:text-base font-semibold tracking-wider">
-              ជាតិ · សាសនា · ព្រះមហាក្សត្រ
-            </p>
-            <KhmerLotusDivider width={220} className="mx-auto pt-1" />
-          </div>
-
-          <div className="flex justify-center mb-4">
-            <div className="p-1.5 rounded-full border-2 border-[var(--theme-gold)]/70 bg-[var(--theme-bg-surface)] shadow-md">
+        <div className="w-full max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-[52px] sm:h-14 landscape-compact-bar flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="p-0.5 rounded-full border border-[var(--theme-gold)]/75 bg-[var(--theme-bg-surface)] shrink-0">
               <img
                 src="https://i.postimg.cc/0ygmLdvR/3QCM_Ep4.png"
                 alt="Master Quiz KH Logo"
                 referrerPolicy="no-referrer"
-                className="w-24 h-24 sm:w-28 sm:h-28 rounded-full object-cover"
+                className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover"
               />
+            </div>
+            <div className="min-w-0">
+              <h1 className="font-moul text-xs sm:text-sm md:text-base app-text-primary tracking-wide truncate leading-tight">
+                MASTER QUIZ KH
+              </h1>
+              <p className="app-text-secondary font-kantumruy text-[11px] sm:text-xs truncate leading-tight">
+                ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ
+              </p>
             </div>
           </div>
 
-          <h1 className="font-moul text-2xl sm:text-4xl app-text-primary tracking-wide mb-2.5">
-            MASTER QUIZ KH
-          </h1>
-          <p className="app-text-secondary font-kantumruy text-sm sm:text-base max-w-2xl mx-auto leading-relaxed">
-            ប្រព័ន្ធគ្រប់គ្រង និងធ្វើតេស្តសមត្ថភាពត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ (QCM, Q&A, ពន្យល់ពាក្យ)
-          </p>
-        </header>
-      </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {tgUser ? (
+              <div className="flex items-center gap-2 min-w-0">
+                {tgUser.photo_url && (
+                  <img
+                    src={tgUser.photo_url}
+                    alt={tgUser.first_name}
+                    referrerPolicy="no-referrer"
+                    className="w-7 h-7 rounded-full object-cover border border-[var(--theme-gold)]/50 shrink-0"
+                  />
+                )}
+                <span className="text-xs sm:text-sm font-semibold app-text-primary truncate max-w-[120px] sm:max-w-[180px]">
+                  {tgUser.first_name}
+                </span>
+              </div>
+            ) : (
+              <span className="hidden sm:inline font-moul text-xs khmer-gold-text whitespace-nowrap">
+                ព្រះរាជាណាចក្រកម្ពុជា
+              </span>
+            )}
+            <KhmerLotusCrest size={26} className="shrink-0" />
+          </div>
+        </div>
+      </header>
 
       {/* Main Role Selection */}
-      <main className="w-full max-w-3xl mx-auto px-4 py-6 flex-1 flex flex-col items-center justify-center">
-        <p className="app-text-secondary text-sm sm:text-base font-semibold mb-6 text-center">
-          សូមជ្រើសរើសតួនាទីដើម្បីចូលប្រព័ន្ធ
-        </p>
+      <main className="w-full max-w-4xl lg:max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 md:py-10 landscape-tight-y tg-safe-x flex-1 flex flex-col items-center justify-center">
+        <div className="text-center mb-4 sm:mb-7 md:mb-8">
+          <p className="font-moul khmer-gold-text text-xs sm:text-sm md:text-base mb-0.5 sm:mb-1">
+            ព្រះរាជាណាចក្រកម្ពុជា · ជាតិ សាសនា ព្រះមហាក្សត្រ
+          </p>
+          <p className="app-text-secondary text-xs sm:text-sm md:text-base font-semibold">
+            សូមជ្រើសរើសតួនាទីដើម្បីចូលប្រព័ន្ធ
+          </p>
+        </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 lg:gap-8 w-full">
           {/* Member Card */}
           <div
             onClick={() => setActiveModal('member')}
-            className="relative khmer-ornate-card rounded-2xl p-7 sm:p-8 flex flex-col items-center text-center cursor-pointer hover:border-[var(--theme-accent)] transition hover:shadow-lg"
+            className="relative khmer-ornate-card rounded-2xl p-5 sm:p-6 md:p-8 flex flex-col items-center text-center cursor-pointer hover:border-[var(--theme-accent)] transition hover:shadow-lg"
           >
-            <KhmerCornerMotif position="tl" size={34} />
-            <KhmerCornerMotif position="tr" size={34} />
+            <KhmerCornerMotif position="tl" size={28} />
+            <KhmerCornerMotif position="tr" size={28} />
 
-            <div className="w-14 h-14 rounded-2xl khmer-btn-primary flex items-center justify-center mb-4 shadow-sm">
-              <UserCheck className="w-7 h-7" />
+            <div className="w-11 h-11 sm:w-12 sm:h-12 md:w-14 md:h-14 rounded-2xl khmer-btn-primary flex items-center justify-center mb-3 sm:mb-4 shadow-sm">
+              <UserCheck className="w-5 h-5 sm:w-6 sm:h-6" />
             </div>
-            <h2 className="font-moul text-lg sm:text-xl app-text-primary mb-2">
+            <h2 className="font-moul text-base sm:text-lg md:text-xl app-text-primary mb-1.5 sm:mb-2">
               សមាជិក (Member)
             </h2>
-            <p className="app-text-secondary text-sm leading-relaxed mb-6 flex-1">
+            <p className="app-text-secondary text-xs sm:text-sm leading-relaxed mb-4 sm:mb-6 flex-1">
               សម្រាប់បេក្ខជនធ្វើតេស្តសមត្ថភាព ហ្វឹកហាត់វិញ្ញាសា QCM, Q&A និងស្វែងយល់វាក្យសព្ទរដ្ឋបាល
             </p>
             <button
               type="button"
-              className="w-full py-3 px-4 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 px-4 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
             >
               <span>ចូលធ្វើតេស្ត</span>
               <ArrowRight className="w-4 h-4" />
@@ -173,23 +201,23 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
           {/* Admin Card */}
           <div
             onClick={() => setActiveModal('admin')}
-            className="relative khmer-ornate-card rounded-2xl p-7 sm:p-8 flex flex-col items-center text-center cursor-pointer hover:border-rose-700 transition hover:shadow-lg"
+            className="relative khmer-ornate-card rounded-2xl p-5 sm:p-6 md:p-8 flex flex-col items-center text-center cursor-pointer hover:border-rose-700 transition hover:shadow-lg"
           >
-            <KhmerCornerMotif position="tl" size={34} />
-            <KhmerCornerMotif position="tr" size={34} />
+            <KhmerCornerMotif position="tl" size={28} />
+            <KhmerCornerMotif position="tr" size={28} />
 
-            <div className="w-14 h-14 rounded-2xl khmer-btn-crimson flex items-center justify-center mb-4 shadow-sm">
-              <ShieldCheck className="w-7 h-7" />
+            <div className="w-11 h-11 sm:w-12 sm:h-12 md:w-14 md:h-14 rounded-2xl khmer-btn-crimson flex items-center justify-center mb-3 sm:mb-4 shadow-sm">
+              <ShieldCheck className="w-5 h-5 sm:w-6 sm:h-6" />
             </div>
-            <h2 className="font-moul text-lg sm:text-xl app-text-primary mb-2">
+            <h2 className="font-moul text-base sm:text-lg md:text-xl app-text-primary mb-1.5 sm:mb-2">
               អ្នកគ្រប់គ្រង (Admin)
             </h2>
-            <p className="app-text-secondary text-sm leading-relaxed mb-6 flex-1">
+            <p className="app-text-secondary text-xs sm:text-sm leading-relaxed mb-4 sm:mb-6 flex-1">
               សម្រាប់អ្នកគ្រប់គ្រង បញ្ចូលវិញ្ញាសាថ្មី បញ្ចូលសំណួរជាដុំ បាញ់ Telegram និង Export PDF
             </p>
             <button
               type="button"
-              className="w-full py-3 px-4 rounded-xl khmer-btn-crimson font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 px-4 rounded-xl khmer-btn-crimson font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
             >
               <span>ចូលផ្ទាំងគ្រប់គ្រង</span>
               <Lock className="w-4 h-4" />
@@ -199,14 +227,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
       </main>
 
       {/* Footer Action Links */}
-      <footer className="w-full py-6 px-4 text-center border-t app-border app-card">
-        <div className="w-full max-w-4xl mx-auto">
-          <KhmerLotusDivider width={180} className="mx-auto mb-3" />
-          <p className="text-xs sm:text-sm app-text-secondary mb-4 font-medium">
+      <footer className="w-full py-4 sm:py-5 landscape-tight-y px-4 sm:px-6 lg:px-8 text-center border-t app-border app-card tg-safe-bottom tg-safe-x">
+        <div className="w-full max-w-6xl mx-auto">
+          <KhmerLotusDivider width={180} className="mx-auto mb-2.5 landscape-hide-ornament" />
+          <p className="text-xs sm:text-sm app-text-secondary mb-3 sm:mb-4 font-medium landscape-hide-ornament">
             Master Quiz KH · ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា
           </p>
 
-          <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center justify-center gap-2.5 sm:gap-3">
+          <div className="grid grid-cols-2 md:flex md:flex-wrap items-center justify-center gap-2.5 sm:gap-3">
             <button
               type="button"
               onClick={() =>
@@ -214,7 +242,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
                   new CustomEvent('open-command-bot', { detail: { command: '/register' } })
                 )
               }
-              className="min-h-[42px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+              className="min-h-[44px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
             >
               <Bot className="w-4 h-4 shrink-0" />
               <span>ចុះឈ្មោះ</span>
@@ -227,7 +255,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
                   new CustomEvent('open-command-bot', { detail: { command: '/payment' } })
                 )
               }
-              className="min-h-[42px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-gold-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+              className="min-h-[44px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-gold-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
             >
               <QrCode className="w-4 h-4 shrink-0" />
               <span>បង់ KHQR</span>
@@ -237,7 +265,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
               href="https://t.me/qcm_and_q_a"
               target="_blank"
               rel="noopener noreferrer"
-              className="min-h-[42px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap"
+              className="min-h-[44px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap"
             >
               <Send className="w-4 h-4 shrink-0" />
               <span>@qcm_and_q_a</span>
@@ -247,7 +275,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
               href="https://t.me/qiuzs_bot"
               target="_blank"
               rel="noopener noreferrer"
-              className="min-h-[42px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-gold-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap"
+              className="min-h-[44px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold khmer-gold-text hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap"
             >
               <Send className="w-4 h-4 shrink-0" />
               <span>@qiuzs_bot</span>
@@ -256,7 +284,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
             <button
               type="button"
               onClick={() => setIsThemeModalOpen(true)}
-              className="col-span-2 sm:col-span-1 min-h-[42px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold app-text-primary hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+              className="col-span-2 md:col-span-1 min-h-[44px] px-3.5 py-2 rounded-xl khmer-frame-card text-xs sm:text-sm font-semibold app-text-primary hover:opacity-90 transition flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
               title={`ប្តូររចនាប័ទ្ម (${currentThemeConfig.nameKhmer})`}
             >
               <Palette className="w-4 h-4 khmer-gold-text shrink-0" />

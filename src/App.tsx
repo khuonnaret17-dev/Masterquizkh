@@ -19,6 +19,11 @@ import {
   updatePresenceHeartbeat,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
+import {
+  initTelegramMiniApp,
+  syncTelegramMiniAppTheme,
+  setTelegramBackButton,
+} from './services/telegramWebApp';
 import { getMuteState, setMuteState } from './utils/khmer';
 
 export default function App() {
@@ -27,12 +32,23 @@ export default function App() {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
 
   useEffect(() => {
+    const cleanupMiniApp = initTelegramMiniApp();
     const handleThemeChange = (e: any) => {
-      if (e.detail) setCurrentTheme(e.detail);
+      if (e.detail) {
+        setCurrentTheme(e.detail);
+        setTimeout(() => syncTelegramMiniAppTheme(), 0);
+      }
     };
     window.addEventListener('appthemechange', handleThemeChange);
-    return () => window.removeEventListener('appthemechange', handleThemeChange);
+    return () => {
+      cleanupMiniApp();
+      window.removeEventListener('appthemechange', handleThemeChange);
+    };
   }, []);
+
+  useEffect(() => {
+    syncTelegramMiniAppTheme();
+  }, [currentTheme]);
 
   // Session State
   const [session, setSession] = useState<UserSession | null>(() => {
@@ -137,13 +153,27 @@ export default function App() {
     setActiveQuizTitle('');
   };
 
-  // If not authenticated, show royal landing page with video background & role selection
+  useEffect(() => {
+    if (!session) return;
+    if (activeQuizQuestions) {
+      return setTelegramBackButton(true, () => {
+        setActiveQuizQuestions(null);
+        setActiveQuizTitle('');
+      });
+    }
+    if (activeTab === 'admin' && session.role === 'admin') {
+      return setTelegramBackButton(true, () => setActiveTab('play'));
+    }
+    return setTelegramBackButton(false);
+  }, [session, activeQuizQuestions, activeTab]);
+
+  // If not authenticated, show royal landing page with compact Mini App header & role selection
   if (!session) {
     return <LandingPage onLoginSuccess={handleLoginSuccess} />;
   }
 
   return (
-    <div className="min-h-screen app-canvas flex flex-col font-kantumruy selection:bg-[var(--theme-accent)] selection:text-white">
+    <div className="min-h-miniapp app-canvas flex flex-col font-kantumruy selection:bg-[var(--theme-accent)] selection:text-white">
       {/* Top Navbar */}
       <Navbar
         session={session}
@@ -159,6 +189,9 @@ export default function App() {
         currentTheme={currentTheme}
         onOpenThemeModal={() => setIsThemeModalOpen(true)}
         notificationsCount={notifications.length}
+        canGoBack={Boolean(activeQuizQuestions)}
+        onBack={activeQuizQuestions ? handleExitQuiz : undefined}
+        pageTitle={activeQuizQuestions ? activeQuizTitle : undefined}
       />
 
       {/* Main Content Area */}

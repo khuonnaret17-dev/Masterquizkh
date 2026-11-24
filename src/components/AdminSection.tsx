@@ -1482,33 +1482,33 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   };
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8 tg-safe-x">
       {/* Admin Title */}
-      <div className="relative flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8 khmer-ornate-card p-6 sm:p-7 rounded-2xl">
+      <div className="relative flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-5 sm:mb-7 khmer-ornate-card p-5 sm:p-6 rounded-2xl">
         <KhmerCornerMotif position="tl" size={30} />
         <KhmerCornerMotif position="tr" size={30} />
 
-        <div className="flex items-center gap-3.5">
-          <div className="w-12 h-12 rounded-xl khmer-btn-crimson flex items-center justify-center shrink-0 shadow-sm">
-            <Settings className="w-6 h-6" />
+        <div className="flex items-center gap-3.5 min-w-0">
+          <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl khmer-btn-crimson flex items-center justify-center shrink-0 shadow-sm">
+            <Settings className="w-5 h-5 sm:w-6 sm:h-6" />
           </div>
-          <div>
-            <h1 className="leading-[69px] font-moul text-lg sm:text-2xl app-text-primary">
+          <div className="min-w-0">
+            <h1 className="leading-snug sm:leading-normal font-moul text-base sm:text-xl md:text-2xl app-text-primary">
               ផ្ទាំងគ្រប់គ្រង (Admin Control Center)
             </h1>
-            <p className="text-sm app-text-secondary">
+            <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
               ប្រព័ន្ធគ្រប់គ្រងវិញ្ញាសា បញ្ចូលសំណួរជាដុំ បាញ់ Telegram និងតាមដានសកម្មភាពសមាជិក
             </p>
           </div>
         </div>
 
-        <div className="text-sm font-bold khmer-gold-text shrink-0">
+        <div className="text-xs sm:text-sm font-bold khmer-gold-text shrink-0">
           សិទ្ធិគ្រប់គ្រង (Admin)
         </div>
       </div>
 
       {/* Admin Tabs */}
-      <div className="flex flex-wrap gap-1.5 mb-8 app-subcard p-1.5 rounded-2xl">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 mb-6 sm:mb-8 app-subcard p-1.5 rounded-2xl">
         {[
           { id: 'single', label: 'បញ្ចូលសំណួរទោល', icon: PlusCircle },
           { id: 'bulk_ai', label: 'បញ្ចូលសំណួរជាដុំ', icon: FileSpreadsheet },
@@ -1523,14 +1523,14 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               type="button"
               key={tab.id}
               onClick={() => setActiveSubTab(tab.id as any)}
-              className={`flex-1 min-w-[130px] py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              className={`min-h-[42px] py-2 px-2.5 rounded-xl text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
                 activeSubTab === tab.id
                   ? 'khmer-btn-crimson shadow-sm'
                   : 'app-text-secondary hover:opacity-80'
               }`}
             >
               <Icon className="w-4 h-4 shrink-0" />
-              <span className="whitespace-nowrap">{tab.label}</span>
+              <span className="truncate">{tab.label}</span>
             </button>
           );
         })}
@@ -2095,15 +2095,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                             {toKhmerNum(idx + 1)}
                           </td>
                           <td className="py-3 px-3 font-semibold app-text-primary">{sub.name}</td>
-                          <td className="py-3 px-3 text-xs font-bold app-text-secondary">
+                          <td className="py-3 px-3 text-xs font-bold app-text-secondary whitespace-nowrap">
                             {sub.type === 'mcq' ? 'QCM' : sub.type === 'short' ? 'Q & A' : 'ពន្យល់ពាក្យ'}
                           </td>
-                          <td className="py-3 px-3 tabular-nums app-text-primary">{toKhmerNum(count)} សំណួរ</td>
-                          <td className="py-3 px-3">
+                          <td className="py-3 px-3 tabular-nums app-text-primary whitespace-nowrap">{toKhmerNum(count)} សំណួរ</td>
+                          <td className="py-3 px-3 whitespace-nowrap">
                             <button
                               type="button"
                               onClick={() => updateSubject(sub.id, { isActive: !sub.isActive })}
-                              className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                              className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer whitespace-nowrap ${
                                 sub.isActive !== false
                                   ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-200 border border-emerald-400 dark:border-emerald-700'
                                   : 'app-subcard app-text-muted'
@@ -2112,23 +2112,25 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                               {sub.isActive !== false ? 'បើកដំណើរការ' : 'បានបិទ'}
                             </button>
                           </td>
-                          <td className="py-3 px-3 text-right space-x-1.5">
-                            <button
-                              type="button"
-                              onClick={() => handleOpenEditSubjectModal(sub)}
-                              className="p-2 rounded-lg app-subcard app-text-primary hover:opacity-80 cursor-pointer"
-                              title="កែប្រែមេរៀន/មុខវិជ្ជា"
-                            >
-                              <Edit2 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteSubjectClick(sub)}
-                              className="p-2 rounded-lg bg-red-50 dark:bg-red-950/60 hover:opacity-80 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-800 transition cursor-pointer"
-                              title="លុបមុខវិជ្ជា និងសំណួរទាំងអស់"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                          <td className="py-3 px-3 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditSubjectModal(sub)}
+                                className="p-2 rounded-lg app-subcard app-text-primary hover:opacity-80 cursor-pointer"
+                                title="កែប្រែមេរៀន/មុខវិជ្ជា"
+                              >
+                                <Edit2 className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteSubjectClick(sub)}
+                                className="p-2 rounded-lg bg-red-50 dark:bg-red-950/60 hover:opacity-80 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-800 transition cursor-pointer"
+                                title="លុបមុខវិជ្ជា និងសំណួរទាំងអស់"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -2262,7 +2264,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                           </p>
                         )}
                         {q.answer && (
-                          <p className="text-xs sm:text-sm app-text-secondary pl-5 truncate max-w-2xl mt-0.5">
+                          <p className="text-xs sm:text-sm app-text-secondary pl-5 truncate max-w-full mt-0.5">
                             {q.answer}
                           </p>
                         )}
@@ -4479,9 +4481,9 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               អ្នកកំពុង Online ក្នុងរង្វង់ ៥នាទីចុងក្រោយ ({toKhmerNum(presence.length)})
             </h2>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
               {presence.length === 0 ? (
-                <p className="text-sm app-text-secondary col-span-4">មិនទាន់មានទិន្នន័យវត្តមាន</p>
+                <p className="text-sm app-text-secondary col-span-full">មិនទាន់មានទិន្នន័យវត្តមាន</p>
               ) : (
                 presence.map((p) => (
                   <div
@@ -4582,17 +4584,17 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                       const memberCount = logins.filter((x) => x.username === l.username).length;
                       return (
                         <tr key={l.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
-                          <td className="py-2.5 px-3 font-semibold app-text-primary font-sans">
+                          <td className="py-2.5 px-3 font-semibold app-text-primary font-sans whitespace-nowrap">
                             {l.username}
                           </td>
-                          <td className="py-2.5 px-3 text-blue-700 dark:text-amber-300 font-bold">
+                          <td className="py-2.5 px-3 text-blue-700 dark:text-amber-300 font-bold whitespace-nowrap">
                             {l.passwordUsed}
                           </td>
-                          <td className="py-2.5 px-3 uppercase text-xs app-text-secondary">{l.role}</td>
-                          <td className="py-2.5 px-3 text-xs app-text-secondary">
+                          <td className="py-2.5 px-3 uppercase text-xs app-text-secondary whitespace-nowrap">{l.role}</td>
+                          <td className="py-2.5 px-3 text-xs app-text-secondary whitespace-nowrap">
                             {new Date(l.timestamp).toLocaleString('km-KH')}
                           </td>
-                          <td className="py-2.5 px-3 text-right font-sans">
+                          <td className="py-2.5 px-3 text-right font-sans whitespace-nowrap">
                             <div className="inline-flex items-center gap-1.5">
                               <button
                                 type="button"
