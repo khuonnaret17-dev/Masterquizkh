@@ -13,11 +13,13 @@ import {
   X,
   Bell,
   ArrowLeft,
+  RefreshCw,
 } from 'lucide-react';
 import { UserSession, AppThemeId } from '../types';
 import { toKhmerNum } from '../utils/khmer';
 import { APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser } from '../services/telegramWebApp';
+import { refreshCoreData, fetchOnlineCount } from '../services/firebase';
 import { KhmerLatticeBar, KhmerLotusCrest } from './KhmerOrnaments';
 
 interface NavbarProps {
@@ -52,6 +54,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   pageTitle,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncDone, setSyncDone] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const currentThemeConfig = APP_THEMES.find((t) => t.id === currentTheme) || APP_THEMES[0];
@@ -82,6 +86,19 @@ export const Navbar: React.FC<NavbarProps> = ({
   const handleOpenMessenger = () => {
     window.dispatchEvent(new CustomEvent('open-messenger-widget'));
     setIsMenuOpen(false);
+  };
+
+  const handleManualSync = async () => {
+    if (isSyncing) return;
+    setIsSyncing(true);
+    setSyncDone(false);
+    try {
+      await Promise.all([refreshCoreData(), fetchOnlineCount(true)]);
+      setSyncDone(true);
+      setTimeout(() => setSyncDone(false), 2500);
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   return (
@@ -318,7 +335,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                     </button>
                   </div>
 
-                  {/* Section 3: Communication */}
+                  {/* Section 3: Communication & Sync */}
                   <div className="space-y-1 mb-2 pb-2 border-b app-border">
                     <button
                       type="button"
@@ -334,6 +351,21 @@ export const Navbar: React.FC<NavbarProps> = ({
                           {toKhmerNum(notificationsCount)}
                         </span>
                       )}
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isSyncing}
+                      onClick={handleManualSync}
+                      className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium app-text-primary hover:bg-[var(--theme-bg-hover)] disabled:opacity-60 transition cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2.5">
+                        <RefreshCw className={`w-4 h-4 text-blue-600 dark:text-amber-400 ${isSyncing ? 'animate-spin' : ''}`} />
+                        <span>ធ្វើបច្ចុប្បន្នភាពសំណួរថ្មី</span>
+                      </span>
+                      <span className="text-xs font-semibold app-text-secondary">
+                        {isSyncing ? 'កំពុងទាញ...' : syncDone ? 'រួចរាល់ ✓' : 'Sync'}
+                      </span>
                     </button>
                   </div>
 

@@ -69,6 +69,8 @@ import {
   saveBotCommandConfig,
   resetBotCommandConfig,
   resetAllBotCommands,
+  refreshCoreData,
+  refreshAdminMonitoringData,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
@@ -2025,6 +2027,33 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     });
   };
 
+  const [isSyncingAdminData, setIsSyncingAdminData] = useState(false);
+  const [adminSyncDone, setAdminSyncDone] = useState(false);
+  const [isSyncingMonitoring, setIsSyncingMonitoring] = useState(false);
+
+  const handleAdminSyncAll = async () => {
+    if (isSyncingAdminData) return;
+    setIsSyncingAdminData(true);
+    setAdminSyncDone(false);
+    try {
+      await Promise.all([refreshCoreData(), refreshAdminMonitoringData()]);
+      setAdminSyncDone(true);
+      setTimeout(() => setAdminSyncDone(false), 2500);
+    } finally {
+      setIsSyncingAdminData(false);
+    }
+  };
+
+  const handleRefreshMonitoringOnly = async () => {
+    if (isSyncingMonitoring) return;
+    setIsSyncingMonitoring(true);
+    try {
+      await refreshAdminMonitoringData();
+    } finally {
+      setIsSyncingMonitoring(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8 tg-safe-x">
       {/* Admin Title */}
@@ -2046,8 +2075,26 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           </div>
         </div>
 
-        <div className="text-xs sm:text-sm font-bold khmer-gold-text shrink-0">
-          សិទ្ធិគ្រប់គ្រង (Admin)
+        <div className="flex flex-wrap items-center gap-3 shrink-0">
+          <button
+            type="button"
+            disabled={isSyncingAdminData}
+            onClick={handleAdminSyncAll}
+            className="px-3.5 py-2 rounded-xl app-subcard hover:opacity-85 disabled:opacity-60 app-text-primary border app-border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+            title="ទាញយកទិន្នន័យចុងក្រោយពី Database"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isSyncingAdminData ? 'animate-spin' : ''}`} />
+            <span>
+              {isSyncingAdminData
+                ? 'កំពុង Sync...'
+                : adminSyncDone
+                  ? 'បានធ្វើបច្ចុប្បន្នភាព ✓'
+                  : 'ទាញយកទិន្នន័យថ្មី'}
+            </span>
+          </button>
+          <div className="text-xs sm:text-sm font-bold khmer-gold-text shrink-0">
+            សិទ្ធិគ្រប់គ្រង (Admin)
+          </div>
         </div>
       </div>
 
@@ -5479,9 +5526,20 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
           {/* Active Online Presence */}
           <div className="app-card rounded-2xl p-6 shadow-sm">
-            <h2 className="font-moul text-base app-text-primary mb-4">
-              អ្នកកំពុង Online ក្នុងរង្វង់ ៥នាទីចុងក្រោយ ({toKhmerNum(presence.length)})
-            </h2>
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <h2 className="font-moul text-base app-text-primary">
+                អ្នកកំពុង Online ក្នុងរង្វង់ ៥នាទីចុងក្រោយ ({toKhmerNum(presence.length)})
+              </h2>
+              <button
+                type="button"
+                disabled={isSyncingMonitoring}
+                onClick={handleRefreshMonitoringOnly}
+                className="px-3 py-1.5 rounded-xl app-subcard hover:opacity-85 disabled:opacity-60 app-text-primary border app-border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncingMonitoring ? 'animate-spin' : ''}`} />
+                <span>{isSyncingMonitoring ? 'កំពុងទាញ...' : 'ធ្វើបច្ចុប្បន្នភាពវត្តមាន/Login/មតិ'}</span>
+              </button>
+            </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
               {presence.length === 0 ? (

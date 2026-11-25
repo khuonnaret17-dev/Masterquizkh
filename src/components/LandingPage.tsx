@@ -34,7 +34,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLoginSuccess }) => {
   }, []);
 
   useEffect(() => {
-    const unsub = subscribeBotCommands(setBotCommands);
+    const unsub = subscribeBotCommands(setBotCommands, { cacheOnly: true });
     return () => unsub();
   }, []);
 

@@ -1,23 +1,62 @@
 import { initializeApp } from 'firebase/app';
 import {
   getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   doc,
+  getDoc,
   getDocFromServer,
+  getDocs,
+  getDocsFromCache,
+  getCountFromServer,
   collection,
-  onSnapshot,
+  query,
+  where,
+  orderBy,
+  limit,
   setDoc,
   deleteDoc,
   updateDoc,
   writeBatch,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { Question, Subject, Feedback, AppNotification, LoginRecord, PresenceRecord, PaidUser, BotCommandConfig } from '../types';
-import { INITIAL_QUESTIONS, INITIAL_SUBJECTS, INITIAL_NOTIFICATIONS } from './initialData';
+import {
+  Question,
+  Subject,
+  Feedback,
+  AppNotification,
+  LoginRecord,
+  PresenceRecord,
+  PaidUser,
+  BotCommandConfig,
+} from '../types';
+import { INITIAL_NOTIFICATIONS } from './initialData';
 import { syncTelegramBotTemplates } from './telegram';
+import {
+  hydrateCacheFromIdb,
+  getCachedValue,
+  hasCachedValue,
+  setCachedValue,
+} from './localCacheDb';
 
-// Initialize Firebase App & Firestore
+// Initialize Firebase App & Firestore with persistent IndexedDB local cache
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const db = (() => {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+})();
 
 enum OperationType {
   CREATE = 'create',
@@ -49,9 +88,14 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   console.warn('Firestore Operation Info: ', JSON.stringify(errInfo));
 }
 
-// Test initial connection per skill mandate
+// Test initial connection once every 24 hours per device (avoids extra server reads on every Mini App launch)
 async function testConnection() {
   try {
+    const lastTested = Number(localStorage.getItem('mpq_conn_tested_at_v2') || '0');
+    if (lastTested && Date.now() - lastTested < 24 * 60 * 60 * 1000) {
+      return;
+    }
+    localStorage.setItem('mpq_conn_tested_at_v2', String(Date.now()));
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
@@ -59,9 +103,9 @@ async function testConnection() {
     }
   }
 }
-testConnection();
+void testConnection();
 
-// Initial Local Storage Keys for fast, instantaneous offline loading & resilience
+// Local Cache Keys & Long TTLs to prevent hitting Firestore Read Quota
 const STORAGE_KEYS = {
   QUESTIONS: 'mpq_cached_questions',
   SUBJECTS: 'mpq_cached_subjects',
@@ -72,34 +116,290 @@ const STORAGE_KEYS = {
   PRESENCE: 'mpq_cached_presence',
   PAID_USERS: 'mpq_cached_paid_users',
   BOT_COMMANDS: 'mpq_cached_bot_commands',
+  SYNC_META: 'mpq_sync_meta_v2',
+  CORE_SERVER_VERSION: 'mpq_core_server_version_v1',
+  ONLINE_COUNT: 'mpq_cached_online_count_v1',
+  LAST_PRESENCE_PING: 'mpq_last_presence_ping_v1',
 };
 
+const SYNC_TTLS_MS = {
+  QUESTIONS: 6 * 60 * 60 * 1000, // 6 hours client cache (server RAM shares across all users)
+  SUBJECTS: 6 * 60 * 60 * 1000, // 6 hours
+  BOT_COMMANDS: 6 * 60 * 60 * 1000, // 6 hours
+  NOTIFICATIONS: 30 * 60 * 1000, // 30 minutes
+  PAID_USERS: 15 * 60 * 1000, // 15 minutes
+  LOGINS: 5 * 60 * 1000, // 5 minutes (Admin only)
+  FEEDBACKS: 5 * 60 * 1000, // 5 minutes (Admin only)
+  PRESENCE: 2 * 60 * 1000, // 2 minutes (Admin only)
+  ONLINE_COUNT: 5 * 60 * 1000, // 5 minutes (1 shared server aggregation read)
+  CORE_CHECK: 5 * 60 * 1000, // Only check /api/cache/core version every 5 minutes
+};
+
+type SyncKey = keyof typeof SYNC_TTLS_MS;
+
 function getLocal<T>(key: string, fallback: T): T {
-  try {
-    const data = localStorage.getItem(key);
-    return data ? JSON.parse(data) : fallback;
-  } catch {
-    return fallback;
-  }
+  return getCachedValue<T>(key, fallback);
 }
 
 function setLocal<T>(key: string, data: T) {
-  try {
-    localStorage.setItem(key, JSON.stringify(data));
-  } catch {
-    // Ignore storage quota
+  setCachedValue<T>(key, data);
+}
+
+function getSyncTimestamp(key: SyncKey): number {
+  const meta = getLocal<Partial<Record<SyncKey, number>>>(STORAGE_KEYS.SYNC_META, {});
+  return typeof meta[key] === 'number' ? meta[key]! : 0;
+}
+
+function setSyncTimestamp(key: SyncKey, timestamp = Date.now()) {
+  const meta = getLocal<Partial<Record<SyncKey, number>>>(STORAGE_KEYS.SYNC_META, {});
+  meta[key] = timestamp;
+  setLocal(STORAGE_KEYS.SYNC_META, meta);
+}
+
+function isCacheFresh(key: SyncKey, storageKey?: string): boolean {
+  const lastSync = getSyncTimestamp(key);
+  if (!lastSync) return false;
+  if (storageKey && !hasCachedValue(storageKey)) return false;
+  return Date.now() - lastSync < SYNC_TTLS_MS[key];
+}
+
+// Deduplicate concurrent network fetches across components / StrictMode mounts
+const inFlightFetches = new Map<string, Promise<unknown>>();
+let clientQuotaCooldownUntil = 0;
+
+function isQuotaCooldownActive(force = false): boolean {
+  return !force && Date.now() < clientQuotaCooldownUntil;
+}
+
+function markClientQuotaCooldownIfNeeded(err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  if (msg.includes('resource-exhausted') || msg.includes('Quota') || msg.includes('429')) {
+    clientQuotaCooldownUntil = Date.now() + 5 * 60 * 1000;
   }
 }
 
-/**
- * Real-time Questions Listener (Pure Firestore Sync)
- */
-export function subscribeQuestions(callback: (questions: Question[]) => void) {
-  const sortQuestions = (list: Question[]) =>
-    [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+function runDeduplicated<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const existing = inFlightFetches.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
 
+  const promise = task().finally(() => {
+    inFlightFetches.delete(key);
+  });
+  inFlightFetches.set(key, promise);
+  return promise;
+}
+
+const sortQuestions = (list: Question[]) =>
+  [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+const sortSubjects = (list: Subject[]) =>
+  [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+function syncMutationToServerCache(
+  scope: 'questions' | 'subjects' | 'notifications' | 'bot_commands',
+  replace: unknown
+) {
+  if (typeof fetch === 'undefined') return;
+  void fetch('/api/cache/mutate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ scope, replace }),
+  })
+    .then(async (res) => {
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (typeof data?.version === 'number') {
+          setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, data.version);
+          setSyncTimestamp('CORE_CHECK');
+        }
+      }
+    })
+    .catch(() => {
+      // Ignore when running purely offline
+    });
+}
+
+function resolveNotificationsWithDismissed(rawNotifs: AppNotification[]): AppNotification[] {
+  const dismissed = new Set<string>(getLocal<string[]>(STORAGE_KEYS.DISMISSED_NOTIFS, []));
+  if (rawNotifs.length > 0) {
+    const filtered = rawNotifs.filter((n) => !dismissed.has(n.id));
+    filtered.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return filtered;
+  }
+  const hasStored = hasCachedValue(STORAGE_KEYS.NOTIFICATIONS);
+  if (dismissed.has('__ALL__') || hasStored) {
+    return [];
+  }
+  return INITIAL_NOTIFICATIONS.filter((n) => !dismissed.has(n.id));
+}
+
+/**
+ * Shared Server Cache Sync:
+ * Fetches questions, subjects, notifications, and bot_commands from Node server RAM cache first
+ * (0 Firestore reads for 99.9% of users), with IndexedDB + Firestore fallback.
+ */
+async function syncCoreFromServer(force = false): Promise<boolean> {
+  await hydrateCacheFromIdb();
+
+  if (
+    !force &&
+    (isQuotaCooldownActive(false) ||
+      (isCacheFresh('CORE_CHECK') &&
+        hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
+        hasCachedValue(STORAGE_KEYS.SUBJECTS)))
+  ) {
+    return true;
+  }
+
+  return runDeduplicated(`core_server:${force ? 'force' : 'ttl'}`, async () => {
+    if (
+      !force &&
+      (isQuotaCooldownActive(false) ||
+        (isCacheFresh('CORE_CHECK') &&
+          hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
+          hasCachedValue(STORAGE_KEYS.SUBJECTS)))
+    ) {
+      return true;
+    }
+
+    try {
+      const hasAllLocal =
+        hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
+        hasCachedValue(STORAGE_KEYS.SUBJECTS) &&
+        hasCachedValue(STORAGE_KEYS.BOT_COMMANDS);
+      const savedVersion = hasAllLocal
+        ? getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0)
+        : 0;
+
+      const params = new URLSearchParams();
+      if (force) params.set('force', '1');
+      if (!force && savedVersion > 0) params.set('since', String(savedVersion));
+
+      const res = await fetch(`/api/cache/core?${params.toString()}`, {
+        cache: 'no-store',
+      });
+      const payload = await res.json().catch(() => null);
+
+      if (payload?.quotaLimited) {
+        clientQuotaCooldownUntil = Date.now() + 5 * 60 * 1000;
+        setSyncTimestamp('CORE_CHECK');
+      }
+
+      if (!res.ok || !payload) {
+        return Boolean(payload?.quotaLimited);
+      }
+
+      setSyncTimestamp('CORE_CHECK');
+
+      if (payload?.unchanged) {
+        setSyncTimestamp('QUESTIONS');
+        setSyncTimestamp('SUBJECTS');
+        setSyncTimestamp('NOTIFICATIONS');
+        setSyncTimestamp('BOT_COMMANDS');
+        return true;
+      }
+
+      if (Array.isArray(payload?.questions)) {
+        const sortedQ = sortQuestions(payload.questions);
+        setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
+        setSyncTimestamp('QUESTIONS');
+        window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
+      }
+
+      if (Array.isArray(payload?.subjects)) {
+        const sortedSub = sortSubjects(payload.subjects);
+        setLocal(STORAGE_KEYS.SUBJECTS, sortedSub);
+        setSyncTimestamp('SUBJECTS');
+        window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedSub }));
+      }
+
+      if (Array.isArray(payload?.notifications)) {
+        const notifs = resolveNotificationsWithDismissed(payload.notifications);
+        setLocal(STORAGE_KEYS.NOTIFICATIONS, notifs);
+        setSyncTimestamp('NOTIFICATIONS');
+        window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: notifs }));
+      }
+
+      if (payload?.botCommands && typeof payload.botCommands === 'object') {
+        setLocal(STORAGE_KEYS.BOT_COMMANDS, payload.botCommands);
+        setSyncTimestamp('BOT_COMMANDS');
+        window.dispatchEvent(
+          new CustomEvent('mpq-bot-commands-changed', { detail: payload.botCommands })
+        );
+      }
+
+      if (typeof payload?.version === 'number') {
+        setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, payload.version);
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+// ---------------- Cached Fetchers & Event-Synced Subscriptions ----------------
+
+export async function fetchQuestionsCached(force = false): Promise<Question[]> {
+  await hydrateCacheFromIdb();
+
+  if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS)) {
+    return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  }
+
+  const syncedFromServer = await syncCoreFromServer(force);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.QUESTIONS)) {
+    return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  }
+
+  return runDeduplicated(`questions:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS)) {
+      return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+    }
+    try {
+      if (!force) {
+        const cachedSnap = await getDocsFromCache(collection(db, 'questions')).catch(() => null);
+        if (cachedSnap && !cachedSnap.empty) {
+          const cachedList: Question[] = [];
+          cachedSnap.forEach((d) => {
+            cachedList.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
+          });
+          const sorted = sortQuestions(cachedList);
+          setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+          setSyncTimestamp('QUESTIONS');
+          window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
+          return sorted;
+        }
+      }
+
+      if (isQuotaCooldownActive(force)) {
+        return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+      }
+
+      const snapshot = await getDocs(collection(db, 'questions'));
+      const questions: Question[] = [];
+      snapshot.forEach((d) => {
+        questions.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
+      });
+      const sorted = sortQuestions(questions);
+      setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+      setSyncTimestamp('QUESTIONS');
+      window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
+      return sorted;
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.GET, 'questions');
+      return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+    }
+  });
+}
+
+export function subscribeQuestions(callback: (questions: Question[]) => void) {
   const cached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
-  callback(cached);
+  if (cached.length > 0) {
+    callback(cached);
+  }
 
   const handleLocalChange = (e: Event) => {
     const customEvent = e as CustomEvent<Question[]>;
@@ -109,43 +409,83 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
   };
   window.addEventListener('mpq-questions-changed', handleLocalChange);
 
-  const unsub = onSnapshot(
-    collection(db, 'questions'),
-    (snapshot) => {
-      if (snapshot.empty) {
-        setLocal(STORAGE_KEYS.QUESTIONS, []);
-        callback([]);
-      } else {
-        const questions: Question[] = [];
-        snapshot.forEach((d) => {
-          questions.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
-        });
-        const sorted = sortQuestions(questions);
-        setLocal(STORAGE_KEYS.QUESTIONS, sorted);
-        callback(sorted);
-      }
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'questions');
-      callback(sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, cached)));
+  let active = true;
+  void hydrateCacheFromIdb().then(() => {
+    if (!active) return;
+    const idbCached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+    if (idbCached.length > 0 || hasCachedValue(STORAGE_KEYS.QUESTIONS)) {
+      callback(idbCached);
     }
-  );
+    void fetchQuestionsCached(false).then((fresh) => {
+      if (active) callback(fresh);
+    });
+  });
 
   return () => {
+    active = false;
     window.removeEventListener('mpq-questions-changed', handleLocalChange);
-    unsub();
   };
 }
 
-/**
- * Real-time Subjects Listener (Pure Firestore Sync)
- */
-export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
-  const sortSubjects = (list: Subject[]) =>
-    [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
+  await hydrateCacheFromIdb();
 
+  if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS)) {
+    return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  }
+
+  const syncedFromServer = await syncCoreFromServer(force);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.SUBJECTS)) {
+    return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  }
+
+  return runDeduplicated(`subjects:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS)) {
+      return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+    }
+    try {
+      if (!force) {
+        const cachedSnap = await getDocsFromCache(collection(db, 'subjects')).catch(() => null);
+        if (cachedSnap && !cachedSnap.empty) {
+          const cachedSubs: Subject[] = [];
+          cachedSnap.forEach((d) => {
+            cachedSubs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
+          });
+          const sorted = sortSubjects(cachedSubs);
+          setLocal(STORAGE_KEYS.SUBJECTS, sorted);
+          setSyncTimestamp('SUBJECTS');
+          window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
+          return sorted;
+        }
+      }
+
+      if (isQuotaCooldownActive(force)) {
+        return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+      }
+
+      const snapshot = await getDocs(collection(db, 'subjects'));
+      const subs: Subject[] = [];
+      snapshot.forEach((d) => {
+        subs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
+      });
+      const sorted = sortSubjects(subs);
+      setLocal(STORAGE_KEYS.SUBJECTS, sorted);
+      setSyncTimestamp('SUBJECTS');
+      window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
+      return sorted;
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.GET, 'subjects');
+      return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+    }
+  });
+}
+
+export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
   const cached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
-  callback(cached);
+  if (cached.length > 0) {
+    callback(cached);
+  }
 
   const handleLocalChange = (e: Event) => {
     const customEvent = e as CustomEvent<Subject[]>;
@@ -155,47 +495,87 @@ export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
   };
   window.addEventListener('mpq-subjects-changed', handleLocalChange);
 
-  const unsub = onSnapshot(
-    collection(db, 'subjects'),
-    (snapshot) => {
-      if (snapshot.empty) {
-        setLocal(STORAGE_KEYS.SUBJECTS, []);
-        callback([]);
-      } else {
-        const subs: Subject[] = [];
-        snapshot.forEach((d) => {
-          subs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
-        });
-        const sorted = sortSubjects(subs);
-        setLocal(STORAGE_KEYS.SUBJECTS, sorted);
-        callback(sorted);
-      }
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'subjects');
-      callback(sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, cached)));
+  let active = true;
+  void hydrateCacheFromIdb().then(() => {
+    if (!active) return;
+    const idbCached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+    if (idbCached.length > 0 || hasCachedValue(STORAGE_KEYS.SUBJECTS)) {
+      callback(idbCached);
     }
-  );
+    void fetchSubjectsCached(false).then((fresh) => {
+      if (active) callback(fresh);
+    });
+  });
 
   return () => {
+    active = false;
     window.removeEventListener('mpq-subjects-changed', handleLocalChange);
-    unsub();
   };
 }
 
+export async function fetchNotificationsCached(force = false): Promise<AppNotification[]> {
+  await hydrateCacheFromIdb();
 
-/**
- * Real-time Notifications Listener
- */
+  const dismissed = new Set<string>(getLocal<string[]>(STORAGE_KEYS.DISMISSED_NOTIFS, []));
+  const fallbackDefaults = dismissed.has('__ALL__')
+    ? []
+    : INITIAL_NOTIFICATIONS.filter((n) => !dismissed.has(n.id));
+
+  if (!force && isCacheFresh('NOTIFICATIONS', STORAGE_KEYS.NOTIFICATIONS)) {
+    return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
+  }
+
+  const syncedFromServer = await syncCoreFromServer(force);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.NOTIFICATIONS)) {
+    return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
+  }
+
+  return runDeduplicated(`notifications:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('NOTIFICATIONS', STORAGE_KEYS.NOTIFICATIONS)) {
+      return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
+    }
+    try {
+      const notifQuery = query(collection(db, 'notifications'), orderBy('timestamp', 'desc'), limit(50));
+      if (!force) {
+        const cachedSnap = await getDocsFromCache(notifQuery).catch(() => null);
+        if (cachedSnap && !cachedSnap.empty) {
+          const cachedNotifs: AppNotification[] = [];
+          cachedSnap.forEach((d) => {
+            cachedNotifs.push({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) });
+          });
+          const next = resolveNotificationsWithDismissed(cachedNotifs);
+          setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
+          setSyncTimestamp('NOTIFICATIONS');
+          window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
+          return next;
+        }
+      }
+
+      if (isQuotaCooldownActive(force)) {
+        return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
+      }
+
+      const snapshot = await getDocs(notifQuery);
+      const serverNotifs: AppNotification[] = [];
+      snapshot.forEach((d) => {
+        serverNotifs.push({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) });
+      });
+      const next = resolveNotificationsWithDismissed(serverNotifs);
+      setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
+      setSyncTimestamp('NOTIFICATIONS');
+      window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
+      return next;
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.GET, 'notifications');
+      return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
+    }
+  });
+}
+
 export function subscribeNotifications(callback: (notifications: AppNotification[]) => void) {
   const dismissedInitial = new Set<string>(getLocal<string[]>(STORAGE_KEYS.DISMISSED_NOTIFS, []));
-  const hasStoredCache = (() => {
-    try {
-      return localStorage.getItem(STORAGE_KEYS.NOTIFICATIONS) !== null;
-    } catch {
-      return false;
-    }
-  })();
+  const hasStoredCache = hasCachedValue(STORAGE_KEYS.NOTIFICATIONS);
   const initialFallback = dismissedInitial.has('__ALL__')
     ? []
     : INITIAL_NOTIFICATIONS.filter((n) => !dismissedInitial.has(n.id));
@@ -212,81 +592,105 @@ export function subscribeNotifications(callback: (notifications: AppNotification
   };
   window.addEventListener('mpq-notifications-changed', handleLocalChange);
 
-  let hasEverReceivedServerDocs = false;
-
-  const unsub = onSnapshot(
-    collection(db, 'notifications'),
-    (snapshot) => {
-      const dismissed = new Set<string>(getLocal<string[]>(STORAGE_KEYS.DISMISSED_NOTIFS, []));
-      if (!snapshot.empty) {
-        hasEverReceivedServerDocs = true;
-        const notifs: AppNotification[] = [];
-        snapshot.forEach((d) => {
-          notifs.push({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) });
-        });
-        notifs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-        setLocal(STORAGE_KEYS.NOTIFICATIONS, notifs);
-        callback(notifs);
-      } else {
-        const storedNow = (() => {
-          try {
-            return localStorage.getItem(STORAGE_KEYS.NOTIFICATIONS) !== null;
-          } catch {
-            return false;
-          }
-        })();
-        if (hasEverReceivedServerDocs || dismissed.has('__ALL__') || storedNow) {
-          setLocal(STORAGE_KEYS.NOTIFICATIONS, []);
-          callback([]);
-        } else {
-          const remainingDefaults = INITIAL_NOTIFICATIONS.filter((n) => !dismissed.has(n.id));
-          setLocal(STORAGE_KEYS.NOTIFICATIONS, remainingDefaults);
-          callback(remainingDefaults);
-        }
-      }
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'notifications');
-      callback(getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, initialFallback));
-    }
-  );
+  let active = true;
+  void hydrateCacheFromIdb().then(() => {
+    if (!active) return;
+    void fetchNotificationsCached(false).then((fresh) => {
+      if (active) callback(fresh);
+    });
+  });
 
   return () => {
+    active = false;
     window.removeEventListener('mpq-notifications-changed', handleLocalChange);
-    unsub();
   };
 }
 
-/**
- * Real-time Feedback Listener
- */
-export function subscribeFeedbacks(callback: (feedbacks: Feedback[]) => void) {
-  const cached = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
-  callback(cached);
+export async function fetchFeedbacksCached(force = false): Promise<Feedback[]> {
+  await hydrateCacheFromIdb();
 
-  const unsub = onSnapshot(
-    collection(db, 'feedbacks'),
-    (snapshot) => {
+  if (!force && isCacheFresh('FEEDBACKS', STORAGE_KEYS.FEEDBACKS)) {
+    return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+  }
+
+  return runDeduplicated(`feedbacks:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('FEEDBACKS', STORAGE_KEYS.FEEDBACKS)) {
+      return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+    }
+    try {
+      const snapshot = await getDocs(
+        query(collection(db, 'feedbacks'), orderBy('createdAt', 'desc'), limit(100))
+      );
       const items: Feedback[] = [];
       snapshot.forEach((d) => {
         items.push({ id: d.id, ...(d.data() as Omit<Feedback, 'id'>) });
       });
       items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       setLocal(STORAGE_KEYS.FEEDBACKS, items);
-      callback(items);
-    },
-    (err) => {
+      setSyncTimestamp('FEEDBACKS');
+      window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: items }));
+      return items;
+    } catch (err) {
       handleFirestoreError(err, OperationType.GET, 'feedbacks');
-      callback(cached);
+      return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
     }
-  );
-
-  return unsub;
+  });
 }
 
-/**
- * Real-time Logins Listener (for Admin view)
- */
+export function subscribeFeedbacks(callback: (feedbacks: Feedback[]) => void) {
+  const cached = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+  callback(cached);
+
+  const handleLocalChange = (e: Event) => {
+    const customEvent = e as CustomEvent<Feedback[]>;
+    if (Array.isArray(customEvent.detail)) {
+      callback(customEvent.detail);
+    }
+  };
+  window.addEventListener('mpq-feedbacks-changed', handleLocalChange);
+
+  let active = true;
+  void fetchFeedbacksCached(false).then((fresh) => {
+    if (active) callback(fresh);
+  });
+
+  return () => {
+    active = false;
+    window.removeEventListener('mpq-feedbacks-changed', handleLocalChange);
+  };
+}
+
+export async function fetchLoginsCached(force = false): Promise<LoginRecord[]> {
+  await hydrateCacheFromIdb();
+
+  if (!force && isCacheFresh('LOGINS', STORAGE_KEYS.LOGINS)) {
+    return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+  }
+
+  return runDeduplicated(`logins:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('LOGINS', STORAGE_KEYS.LOGINS)) {
+      return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+    }
+    try {
+      const snapshot = await getDocs(
+        query(collection(db, 'logins'), orderBy('timestamp', 'desc'), limit(100))
+      );
+      const items: LoginRecord[] = [];
+      snapshot.forEach((d) => {
+        items.push({ id: d.id, ...(d.data() as Omit<LoginRecord, 'id'>) });
+      });
+      items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      setLocal(STORAGE_KEYS.LOGINS, items);
+      setSyncTimestamp('LOGINS');
+      window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: items }));
+      return items;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, 'logins');
+      return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+    }
+  });
+}
+
 export function subscribeLogins(callback: (logins: LoginRecord[]) => void) {
   const cached = getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
   callback(cached);
@@ -299,58 +703,139 @@ export function subscribeLogins(callback: (logins: LoginRecord[]) => void) {
   };
   window.addEventListener('mpq-logins-changed', handleLocalChange);
 
-  const unsub = onSnapshot(
-    collection(db, 'logins'),
-    (snapshot) => {
-      const items: LoginRecord[] = [];
-      snapshot.forEach((d) => {
-        items.push({ id: d.id, ...(d.data() as Omit<LoginRecord, 'id'>) });
-      });
-      items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      setLocal(STORAGE_KEYS.LOGINS, items);
-      callback(items);
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'logins');
-      callback(getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, cached));
-    }
-  );
+  let active = true;
+  void fetchLoginsCached(false).then((fresh) => {
+    if (active) callback(fresh);
+  });
 
   return () => {
+    active = false;
     window.removeEventListener('mpq-logins-changed', handleLocalChange);
-    unsub();
   };
 }
 
-/**
- * Real-time Presence Listener (for Online active count)
- */
+export async function fetchPresenceCached(force = false): Promise<PresenceRecord[]> {
+  await hydrateCacheFromIdb();
+
+  const filterActive = (list: PresenceRecord[]) => {
+    const now = Date.now();
+    return list.filter((item) => now - new Date(item.lastSeen).getTime() < 300000);
+  };
+
+  if (!force && isCacheFresh('PRESENCE', STORAGE_KEYS.PRESENCE)) {
+    return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
+  }
+
+  return runDeduplicated(`presence:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('PRESENCE', STORAGE_KEYS.PRESENCE)) {
+      return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
+    }
+    try {
+      const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
+      const snapshot = await getDocs(
+        query(collection(db, 'presence'), where('lastSeen', '>=', fiveMinsAgoIso), limit(100))
+      );
+      const items: PresenceRecord[] = [];
+      snapshot.forEach((d) => {
+        items.push({ id: d.id, ...(d.data() as Omit<PresenceRecord, 'id'>) });
+      });
+      const activeItems = filterActive(items);
+      setLocal(STORAGE_KEYS.PRESENCE, activeItems);
+      setSyncTimestamp('PRESENCE');
+      setLocal(STORAGE_KEYS.ONLINE_COUNT, Math.max(1, activeItems.length));
+      setSyncTimestamp('ONLINE_COUNT');
+      window.dispatchEvent(new CustomEvent('mpq-presence-changed', { detail: activeItems }));
+      return activeItems;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, 'presence');
+      return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
+    }
+  });
+}
+
 export function subscribePresence(callback: (presence: PresenceRecord[]) => void) {
   const cached = getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []);
   callback(cached);
 
-  const unsub = onSnapshot(
-    collection(db, 'presence'),
-    (snapshot) => {
-      const items: PresenceRecord[] = [];
-      const now = Date.now();
-      snapshot.forEach((d) => {
-        const item = { id: d.id, ...(d.data() as Omit<PresenceRecord, 'id'>) };
-        // Filter users active in last 5 minutes (300,000 ms)
-        if (now - new Date(item.lastSeen).getTime() < 300000) {
-          items.push(item);
-        }
-      });
-      setLocal(STORAGE_KEYS.PRESENCE, items);
-      callback(items);
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'presence');
-      callback(cached);
+  const handleLocalChange = (e: Event) => {
+    const customEvent = e as CustomEvent<PresenceRecord[]>;
+    if (Array.isArray(customEvent.detail)) {
+      callback(customEvent.detail);
     }
-  );
+  };
+  window.addEventListener('mpq-presence-changed', handleLocalChange);
 
-  return unsub;
+  let active = true;
+  void fetchPresenceCached(false).then((fresh) => {
+    if (active) callback(fresh);
+  });
+
+  return () => {
+    active = false;
+    window.removeEventListener('mpq-presence-changed', handleLocalChange);
+  };
+}
+
+/**
+ * Lightweight Online Count aggregation (uses shared server RAM cache first -> 0 client Firestore reads)
+ */
+export async function fetchOnlineCount(force = false): Promise<number> {
+  if (!force && isCacheFresh('ONLINE_COUNT', STORAGE_KEYS.ONLINE_COUNT)) {
+    return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
+  }
+
+  return runDeduplicated(`online_count:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('ONLINE_COUNT', STORAGE_KEYS.ONLINE_COUNT)) {
+      return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
+    }
+    try {
+      const serverRes = await fetch(`/api/cache/online-count${force ? '?force=1' : ''}`, {
+        cache: 'no-store',
+      }).catch(() => null);
+      if (serverRes && serverRes.ok) {
+        const data = await serverRes.json();
+        const count = Math.max(1, Number(data?.count || 1));
+        setLocal(STORAGE_KEYS.ONLINE_COUNT, count);
+        setSyncTimestamp('ONLINE_COUNT');
+        return count;
+      }
+
+      const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
+      const agg = await getCountFromServer(
+        query(collection(db, 'presence'), where('lastSeen', '>=', fiveMinsAgoIso))
+      );
+      const count = Math.max(1, agg.data().count || 0);
+      setLocal(STORAGE_KEYS.ONLINE_COUNT, count);
+      setSyncTimestamp('ONLINE_COUNT');
+      return count;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, 'presence/count');
+      return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
+    }
+  });
+}
+
+/**
+ * On-demand manual refresh helpers so users/admins can sync latest changes anytime
+ */
+export async function refreshCoreData() {
+  const synced = await syncCoreFromServer(true);
+  if (!synced) {
+    await Promise.all([
+      fetchQuestionsCached(true),
+      fetchSubjectsCached(true),
+      fetchNotificationsCached(true),
+      fetchBotCommandsCached(true),
+    ]);
+  }
+}
+
+export async function refreshAdminMonitoringData() {
+  await Promise.all([
+    fetchPresenceCached(true),
+    fetchLoginsCached(true),
+    fetchFeedbacksCached(true),
+  ]);
 }
 
 // ---------------- Database Actions ----------------
@@ -370,14 +855,15 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   const cleanQ = sanitizeData(q);
   const newQuestion: Question = { ...cleanQ, id } as Question;
 
-  // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
   const next = [...cached, newQuestion];
   setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'questions', id), newQuestion);
+    syncMutationToServerCache('questions', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
@@ -397,6 +883,7 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
   const next = [...cached, ...created];
   setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
@@ -411,6 +898,7 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
       }
       await batch.commit();
     }
+    syncMutationToServerCache('questions', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
@@ -421,28 +909,30 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
 export async function updateQuestion(id: string, updates: Partial<Question>) {
   const cleanUpdates = sanitizeData(updates);
 
-  // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
   const next = cached.map((q) => (q.id === id ? { ...q, ...cleanUpdates } : q));
   setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await updateDoc(doc(db, 'questions', id), cleanUpdates);
+    syncMutationToServerCache('questions', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
   }
 }
 
 export async function deleteQuestion(id: string) {
-  // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
   const next = cached.filter((q) => q.id !== id);
   setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'questions', id));
+    syncMutationToServerCache('questions', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
   }
@@ -465,14 +955,15 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   const cleanSub = sanitizeData(sub);
   const newSub: Subject = { ...cleanSub, id } as Subject;
 
-  // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
   const next = [...cached, newSub];
   setLocal(STORAGE_KEYS.SUBJECTS, next);
+  setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'subjects', id), newSub);
+    syncMutationToServerCache('subjects', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'subjects');
   }
@@ -482,14 +973,15 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
 export async function updateSubject(id: string, updates: Partial<Subject>) {
   const cleanUpdates = sanitizeData(updates);
 
-  // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
   const next = cached.map((s) => (s.id === id ? { ...s, ...cleanUpdates } : s));
   setLocal(STORAGE_KEYS.SUBJECTS, next);
+  setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await updateDoc(doc(db, 'subjects', id), cleanUpdates);
+    syncMutationToServerCache('subjects', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
   }
@@ -497,7 +989,6 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
 
 /**
  * Normalize sequential order indices (0..N-1) across subjects and persist atomically.
- * Ensures legacy subjects with duplicate or missing order values reorder reliably.
  */
 export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subject[]> {
   if (orderedSubjects.length === 0) return [];
@@ -508,6 +999,7 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
   }));
 
   setLocal(STORAGE_KEYS.SUBJECTS, normalized);
+  setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: normalized }));
 
   const changed = normalized.filter((sub, idx) => orderedSubjects[idx]?.order !== idx);
@@ -525,6 +1017,7 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
       }
       await batch.commit();
     }
+    syncMutationToServerCache('subjects', normalized);
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, 'subjects');
   }
@@ -576,14 +1069,15 @@ export async function swapSubjects(
 }
 
 export async function deleteSubject(id: string) {
-  // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
   const next = cached.filter((s) => s.id !== id);
   setLocal(STORAGE_KEYS.SUBJECTS, next);
+  setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'subjects', id));
+    syncMutationToServerCache('subjects', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
   }
@@ -599,7 +1093,7 @@ export async function recordLogin(username: string, passwordUsed: string, role: 
     role,
   };
   const cached = getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
-  const next = [record, ...cached];
+  const next = [record, ...cached].slice(0, 100);
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
@@ -632,7 +1126,14 @@ export async function deleteLoginsByIds(ids: string[]) {
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
   try {
-    await Promise.all(ids.map((id) => deleteDoc(doc(db, 'logins', id))));
+    const CHUNK_SIZE = 450;
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+        batch.delete(doc(db, 'logins', id));
+      }
+      await batch.commit();
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'logins');
   }
@@ -640,11 +1141,21 @@ export async function deleteLoginsByIds(ids: string[]) {
 
 export async function updatePresenceHeartbeat(username: string, role: 'user' | 'admin') {
   const safeId = `user-${encodeURIComponent(username).replace(/%/g, '_')}`;
+  const lastPing = getLocal<{ id: string; at: number } | null>(STORAGE_KEYS.LAST_PRESENCE_PING, null);
+  const nowMs = Date.now();
+
+  // Throttle redundant presence writes when reloading rapidly within 4.5 minutes
+  if (lastPing && lastPing.id === safeId && nowMs - lastPing.at < 270000) {
+    return;
+  }
+
+  setLocal(STORAGE_KEYS.LAST_PRESENCE_PING, { id: safeId, at: nowMs });
+
   const record: PresenceRecord = {
     id: safeId,
     username,
     role,
-    lastSeen: new Date().toISOString(),
+    lastSeen: new Date(nowMs).toISOString(),
   };
   try {
     await setDoc(doc(db, 'presence', safeId), record, { merge: true });
@@ -661,6 +1172,12 @@ export async function submitFeedback(username: string, text: string) {
     text,
     createdAt: new Date().toISOString(),
   };
+
+  const cached = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+  const next = [item, ...cached].slice(0, 100);
+  setLocal(STORAGE_KEYS.FEEDBACKS, next);
+  window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: next }));
+
   try {
     await setDoc(doc(db, 'feedbacks', id), item);
   } catch (err) {
@@ -681,10 +1198,12 @@ export async function broadcastNotification(message: string, type: 'info' | 'suc
   const cached = getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
   const next = [item, ...cached.filter((n) => n.id !== id)];
   setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
+  setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'notifications', id), item);
+    syncMutationToServerCache('notifications', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'notifications');
   }
@@ -700,10 +1219,12 @@ export async function deleteNotification(id: string) {
   const cached = getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
   const next = cached.filter((n) => n.id !== id);
   setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
+  setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'notifications', id));
+    syncMutationToServerCache('notifications', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
   }
@@ -716,74 +1237,113 @@ export async function deleteAllNotifications(ids: string[]) {
   setLocal(STORAGE_KEYS.DISMISSED_NOTIFS, Array.from(dismissed));
 
   setLocal(STORAGE_KEYS.NOTIFICATIONS, []);
+  setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: [] }));
 
   try {
-    await Promise.all(ids.map((id) => deleteDoc(doc(db, 'notifications', id))));
+    const CHUNK_SIZE = 450;
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+        batch.delete(doc(db, 'notifications', id));
+      }
+      await batch.commit();
+    }
+    syncMutationToServerCache('notifications', []);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'notifications');
   }
 }
 
-/**
- * Real-time Paid Users Listener (Track accounts granted lifetime permanent access)
- */
-export function subscribePaidUsers(callback: (users: PaidUser[]) => void) {
-  const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
-  callback(cached);
+export async function fetchPaidUsersCached(force = false): Promise<PaidUser[]> {
+  await hydrateCacheFromIdb();
 
-  const unsub = onSnapshot(
-    collection(db, 'paid_users'),
-    (snapshot) => {
+  if (!force && isCacheFresh('PAID_USERS', STORAGE_KEYS.PAID_USERS)) {
+    return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+  }
+
+  return runDeduplicated(`paid_users:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('PAID_USERS', STORAGE_KEYS.PAID_USERS)) {
+      return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+    }
+    try {
+      const snapshot = await getDocs(query(collection(db, 'paid_users'), limit(200)));
       const users: PaidUser[] = [];
       snapshot.forEach((d) => {
         users.push({ id: d.id, ...(d.data() as Omit<PaidUser, 'id'>) });
       });
       users.sort((a, b) => new Date(b.paidAt).getTime() - new Date(a.paidAt).getTime());
       setLocal(STORAGE_KEYS.PAID_USERS, users);
-      callback(users);
-    },
-    (err) => {
+      setSyncTimestamp('PAID_USERS');
+      window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: users }));
+      return users;
+    } catch (err) {
       handleFirestoreError(err, OperationType.GET, 'paid_users');
-      callback(cached);
+      return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
     }
-  );
-
-  return unsub;
+  });
 }
 
-/**
- * Check if a username has paid and holds permanent active access
- */
+export function subscribePaidUsers(callback: (users: PaidUser[]) => void) {
+  const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+  callback(cached);
+
+  const handleLocalChange = (e: Event) => {
+    const customEvent = e as CustomEvent<PaidUser[]>;
+    if (Array.isArray(customEvent.detail)) {
+      callback(customEvent.detail);
+    }
+  };
+  window.addEventListener('mpq-paid-users-changed', handleLocalChange);
+
+  let active = true;
+  void fetchPaidUsersCached(false).then((fresh) => {
+    if (active) callback(fresh);
+  });
+
+  return () => {
+    active = false;
+    window.removeEventListener('mpq-paid-users-changed', handleLocalChange);
+  };
+}
+
+const checkedNonPaidAt = new Map<string, number>();
+
 export async function checkIsUserPaid(rawUsername: string): Promise<PaidUser | null> {
   const norm = rawUsername.trim().toLowerCase();
   if (!norm) return null;
 
-  // Check local cache first for instantaneous offline response
+  await hydrateCacheFromIdb();
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
   const localMatch = cached.find(
     (u) => u.username.trim().toLowerCase() === norm && u.status === 'active' && u.permanentAccess
   );
   if (localMatch) return localMatch;
 
+  const lastMiss = checkedNonPaidAt.get(norm) || 0;
+  if (Date.now() - lastMiss < 5 * 60 * 1000 || isQuotaCooldownActive(false)) {
+    return null;
+  }
+
   try {
-    const snap = await getDocFromServer(doc(db, 'paid_users', `user-${encodeURIComponent(norm)}`));
+    const snap = await getDoc(doc(db, 'paid_users', `user-${encodeURIComponent(norm)}`));
     if (snap.exists()) {
       const data = snap.data() as PaidUser;
       if (data.status === 'active' && data.permanentAccess) {
-        return { ...data, id: snap.id };
+        const matched = { ...data, id: snap.id };
+        setLocal(STORAGE_KEYS.PAID_USERS, [matched, ...cached.filter((u) => u.id !== matched.id)]);
+        return matched;
       }
     }
+    checkedNonPaidAt.set(norm, Date.now());
   } catch (err) {
+    markClientQuotaCooldownIfNeeded(err);
     handleFirestoreError(err, OperationType.GET, `paid_users/user-${norm}`);
   }
 
   return null;
 }
 
-/**
- * Register a user as having paid via the KHQR system and grant permanent access
- */
 export async function registerPaidUser(params: {
   username: string;
   phoneNumber?: string;
@@ -809,7 +1369,6 @@ export async function registerPaidUser(params: {
     note: params.note || 'បង់ប្រាក់ជោគជ័យតាម KHQR ($10.00) ទទួលបានសិទ្ធិប្រើប្រាស់ពេញមួយជីវិត',
   };
 
-  // Update local cache immediately
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
   const existingIdx = cached.findIndex((u) => u.id === id);
   if (existingIdx >= 0) {
@@ -818,11 +1377,10 @@ export async function registerPaidUser(params: {
     cached.unshift(record);
   }
   setLocal(STORAGE_KEYS.PAID_USERS, cached);
+  window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: cached }));
 
-  // Sync to Firestore
   try {
     await setDoc(doc(db, 'paid_users', id), sanitizeData(record), { merge: true });
-    // Also broadcast an in-app alert to welcome the member
     await broadcastNotification(
       `🎉 សូមស្វាគមន៍សមាជិក VIP ថ្មី «${record.username}» បានបង់ប្រាក់ $10 ជោគជ័យ និងទទួលបានសិទ្ធិចូលប្រើប្រាស់ពេញមួយជីវិត!`,
       'success'
@@ -834,9 +1392,6 @@ export async function registerPaidUser(params: {
   return record;
 }
 
-/**
- * Admin action: Manually grant lifetime permanent access to an account
- */
 export async function grantManualPermanentAccess(username: string, note?: string): Promise<PaidUser> {
   return registerPaidUser({
     username,
@@ -846,15 +1401,11 @@ export async function grantManualPermanentAccess(username: string, note?: string
   });
 }
 
-/**
- * Update paid user status (e.g. revoke or reactivate)
- */
 export async function updatePaidUserStatus(id: string, status: 'active' | 'pending' | 'revoked', permanentAccess: boolean) {
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
-  setLocal(
-    STORAGE_KEYS.PAID_USERS,
-    cached.map((u) => (u.id === id ? { ...u, status, permanentAccess } : u))
-  );
+  const next = cached.map((u) => (u.id === id ? { ...u, status, permanentAccess } : u));
+  setLocal(STORAGE_KEYS.PAID_USERS, next);
+  window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
   try {
     await updateDoc(doc(db, 'paid_users', id), { status, permanentAccess });
@@ -863,15 +1414,11 @@ export async function updatePaidUserStatus(id: string, status: 'active' | 'pendi
   }
 }
 
-/**
- * Delete a paid user record
- */
 export async function deletePaidUser(id: string) {
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
-  setLocal(
-    STORAGE_KEYS.PAID_USERS,
-    cached.filter((u) => u.id !== id)
-  );
+  const next = cached.filter((u) => u.id !== id);
+  setLocal(STORAGE_KEYS.PAID_USERS, next);
+  window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'paid_users', id));
@@ -884,11 +1431,70 @@ function getBotCommandDocId(command: string): string {
   return command.replace(/^\//, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+export async function fetchBotCommandsCached(force = false): Promise<Record<string, BotCommandConfig>> {
+  await hydrateCacheFromIdb();
+
+  if (!force && isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS)) {
+    return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+  }
+
+  const syncedFromServer = await syncCoreFromServer(force);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.BOT_COMMANDS)) {
+    return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+  }
+
+  return runDeduplicated(`bot_commands:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS)) {
+      return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+    }
+    try {
+      if (!force) {
+        const cachedSnap = await getDocsFromCache(collection(db, 'bot_commands')).catch(() => null);
+        if (cachedSnap && !cachedSnap.empty) {
+          const cachedMap: Record<string, BotCommandConfig> = {};
+          cachedSnap.forEach((d) => {
+            const data = d.data() as BotCommandConfig;
+            if (data?.command) {
+              cachedMap[data.command] = data;
+            }
+          });
+          setLocal(STORAGE_KEYS.BOT_COMMANDS, cachedMap);
+          setSyncTimestamp('BOT_COMMANDS');
+          window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: cachedMap }));
+          return cachedMap;
+        }
+      }
+
+      if (isQuotaCooldownActive(force)) {
+        return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+      }
+
+      const snapshot = await getDocs(collection(db, 'bot_commands'));
+      const map: Record<string, BotCommandConfig> = {};
+      snapshot.forEach((d) => {
+        const data = d.data() as BotCommandConfig;
+        if (data?.command) {
+          map[data.command] = data;
+        }
+      });
+      setLocal(STORAGE_KEYS.BOT_COMMANDS, map);
+      setSyncTimestamp('BOT_COMMANDS');
+      window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: map }));
+      return map;
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.GET, 'bot_commands');
+      return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+    }
+  });
+}
+
 /**
- * Real-time Command Bot Content Listener
+ * Cached Command Bot Content Listener (supports cacheOnly mode for pre-login screen)
  */
 export function subscribeBotCommands(
-  callback: (commands: Record<string, BotCommandConfig>) => void
+  callback: (commands: Record<string, BotCommandConfig>) => void,
+  options?: { cacheOnly?: boolean }
 ) {
   const cached = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
   callback(cached);
@@ -901,28 +1507,21 @@ export function subscribeBotCommands(
   };
   window.addEventListener('mpq-bot-commands-changed', handleLocalChange);
 
-  const unsub = onSnapshot(
-    collection(db, 'bot_commands'),
-    (snapshot) => {
-      const map: Record<string, BotCommandConfig> = {};
-      snapshot.forEach((d) => {
-        const data = d.data() as BotCommandConfig;
-        if (data?.command) {
-          map[data.command] = data;
-        }
+  let active = true;
+  void hydrateCacheFromIdb().then(() => {
+    if (!active) return;
+    const idbCached = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+    callback(idbCached);
+    if (!options?.cacheOnly) {
+      void fetchBotCommandsCached(false).then((fresh) => {
+        if (active) callback(fresh);
       });
-      setLocal(STORAGE_KEYS.BOT_COMMANDS, map);
-      callback(map);
-    },
-    (err) => {
-      handleFirestoreError(err, OperationType.GET, 'bot_commands');
-      callback(getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, cached));
     }
-  );
+  });
 
   return () => {
+    active = false;
     window.removeEventListener('mpq-bot-commands-changed', handleLocalChange);
-    unsub();
   };
 }
 
@@ -950,10 +1549,12 @@ export async function saveBotCommandConfig(config: BotCommandConfig) {
   const cached = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
   const next = { ...cached, [payload.command]: payload };
   setLocal(STORAGE_KEYS.BOT_COMMANDS, next);
+  setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'bot_commands', docId), payload);
+    syncMutationToServerCache('bot_commands', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
     throw err;
@@ -969,10 +1570,12 @@ export async function resetBotCommandConfig(command: string) {
   const next = { ...cached };
   delete next[command];
   setLocal(STORAGE_KEYS.BOT_COMMANDS, next);
+  setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'bot_commands', docId));
+    syncMutationToServerCache('bot_commands', next);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
   }
@@ -982,12 +1585,19 @@ export async function resetBotCommandConfig(command: string) {
 
 export async function resetAllBotCommands(commands: string[]) {
   setLocal(STORAGE_KEYS.BOT_COMMANDS, {});
+  setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: {} }));
 
   try {
-    await Promise.all(
-      commands.map((cmd) => deleteDoc(doc(db, 'bot_commands', getBotCommandDocId(cmd))))
-    );
+    const CHUNK_SIZE = 450;
+    for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
+        batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+      }
+      await batch.commit();
+    }
+    syncMutationToServerCache('bot_commands', {});
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
   }

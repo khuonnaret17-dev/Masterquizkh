@@ -16,6 +16,7 @@ import {
   subscribePresence,
   subscribeFeedbacks,
   subscribeBotCommands,
+  fetchOnlineCount,
   updatePresenceHeartbeat,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
@@ -70,23 +71,24 @@ export default function App() {
   // Audio SFX state
   const [isMuted, setIsMuted] = useState<boolean>(() => getMuteState());
 
-  // Firestore Real-time State
+  // Firestore Cached State
   const [questions, setQuestions] = useState<Question[]>([]);
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [logins, setLogins] = useState<LoginRecord[]>([]);
   const [presence, setPresence] = useState<PresenceRecord[]>([]);
+  const [onlineCount, setOnlineCount] = useState<number>(1);
   const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
 
-  // Subscriptions to Firestore
+  // Core data subscriptions: only attach AFTER user logs in to prevent unauthenticated DB reads
+  const isLoggedIn = Boolean(session);
   useEffect(() => {
+    if (!isLoggedIn) return;
+
     const unsubQ = subscribeQuestions(setQuestions);
     const unsubSub = subscribeSubjects(setSubjects);
     const unsubNotif = subscribeNotifications(setNotifications);
-    const unsubLog = subscribeLogins(setLogins);
-    const unsubPres = subscribePresence(setPresence);
-    const unsubFb = subscribeFeedbacks(setFeedbacks);
     const unsubBot = subscribeBotCommands((cmds) => {
       setBotCommands(cmds);
       if (Object.keys(cmds).length > 0) {
@@ -98,24 +100,51 @@ export default function App() {
       unsubQ();
       unsubSub();
       unsubNotif();
+      unsubBot();
+    };
+  }, [isLoggedIn]);
+
+  // Admin-only collections (logins, presence list, feedbacks): only load when Admin tab is active
+  const isAdminPanelActive = session?.role === 'admin' && activeTab === 'admin';
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    if (!isAdminPanelActive) {
+      let active = true;
+      void fetchOnlineCount(false).then((count) => {
+        if (active) setOnlineCount(count);
+      });
+      return () => {
+        active = false;
+      };
+    }
+
+    const unsubLog = subscribeLogins(setLogins);
+    const unsubPres = subscribePresence((list) => {
+      setPresence(list);
+      setOnlineCount(Math.max(1, list.length));
+    });
+    const unsubFb = subscribeFeedbacks(setFeedbacks);
+
+    return () => {
       unsubLog();
       unsubPres();
       unsubFb();
-      unsubBot();
     };
-  }, []);
+  }, [isLoggedIn, isAdminPanelActive]);
 
-  // Real-time 60-second Presence Heartbeat
+  // Real-time 5-minute Presence Heartbeat (only when tab is visible)
   useEffect(() => {
     if (!session) return;
 
-    // Send immediately on login
     updatePresenceHeartbeat(session.username, session.role);
 
-    // Send heartbeat every 60 seconds
     const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
       updatePresenceHeartbeat(session.username, session.role);
-    }, 60000);
+    }, 300000);
 
     return () => clearInterval(interval);
   }, [session]);
@@ -236,7 +265,7 @@ export default function App() {
           setActiveTab(tab);
         }}
         onLogout={handleLogout}
-        onlineCount={presence.length}
+        onlineCount={isAdminPanelActive && presence.length > 0 ? presence.length : onlineCount}
         isMuted={isMuted}
         onToggleMute={handleToggleMute}
         currentTheme={currentTheme}

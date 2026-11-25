@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1353,6 +1354,538 @@ app.post('/api/telegram/webhook', async (req, res) => {
     console.error('Telegram webhook error:', err);
     res.json({ ok: true });
   }
+});
+
+// ---------------- Shared Server-Side Firestore Read-Through Cache ----------------
+// Eliminates redundant Firestore reads when multiple users/students load the app.
+interface FirebaseAppletConfig {
+  projectId: string;
+  apiKey: string;
+  firestoreDatabaseId: string;
+}
+
+function loadFirebaseAppletConfig(): FirebaseAppletConfig | null {
+  try {
+    const raw = fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed?.projectId && parsed?.apiKey && parsed?.firestoreDatabaseId) {
+      return {
+        projectId: parsed.projectId,
+        apiKey: parsed.apiKey,
+        firestoreDatabaseId: parsed.firestoreDatabaseId,
+      };
+    }
+  } catch {
+    // Config absent or unreadable
+  }
+  return null;
+}
+
+const serverFbConfig = loadFirebaseAppletConfig();
+
+function decodeFirestoreValue(val: any): any {
+  if (!val || typeof val !== 'object') return undefined;
+  if ('stringValue' in val) return String(val.stringValue);
+  if ('integerValue' in val) return Number(val.integerValue);
+  if ('doubleValue' in val) return Number(val.doubleValue);
+  if ('booleanValue' in val) return Boolean(val.booleanValue);
+  if ('nullValue' in val) return null;
+  if ('timestampValue' in val) return String(val.timestampValue);
+  if ('arrayValue' in val) {
+    const arr = Array.isArray(val.arrayValue?.values) ? val.arrayValue.values : [];
+    return arr.map((item: any) => decodeFirestoreValue(item));
+  }
+  if ('mapValue' in val) {
+    return decodeFirestoreFields(val.mapValue?.fields || {});
+  }
+  return undefined;
+}
+
+function decodeFirestoreFields(fields: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(fields || {})) {
+    const decoded = decodeFirestoreValue(v);
+    if (decoded !== undefined) {
+      out[k] = decoded;
+    }
+  }
+  return out;
+}
+
+async function fetchCollectionViaFirestoreRest(collectionName: string): Promise<any[]> {
+  if (!serverFbConfig) {
+    throw new Error('Firebase config unavailable on server');
+  }
+  const { projectId, firestoreDatabaseId, apiKey } = serverFbConfig;
+  const docs: any[] = [];
+  let pageToken = '';
+
+  do {
+    const params = new URLSearchParams({
+      pageSize: '500',
+      key: apiKey,
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents/${encodeURIComponent(collectionName)}?${params.toString()}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err: any = new Error(`Firestore REST ${collectionName} HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    const list = Array.isArray(data?.documents) ? data.documents : [];
+    for (const d of list) {
+      const id = typeof d.name === 'string' ? d.name.split('/').pop() || '' : '';
+      docs.push({
+        id,
+        ...decodeFirestoreFields(d.fields || {}),
+      });
+    }
+    pageToken = typeof data?.nextPageToken === 'string' ? data.nextPageToken : '';
+  } while (pageToken);
+
+  return docs;
+}
+
+async function fetchActivePresenceCountViaRest(): Promise<number> {
+  if (!serverFbConfig) throw new Error('Firebase config unavailable on server');
+  const { projectId, firestoreDatabaseId, apiKey } = serverFbConfig;
+  const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents:runAggregationQuery?key=${encodeURIComponent(apiKey)}`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      structuredAggregationQuery: {
+        structuredQuery: {
+          from: [{ collectionId: 'presence' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'lastSeen' },
+              op: 'GREATER_THAN_OR_EQUAL',
+              value: { stringValue: fiveMinsAgoIso },
+            },
+          },
+        },
+        aggregations: [{ alias: 'total', count: {} }],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err: any = new Error(`Firestore REST aggregation HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  const rows = await res.json();
+  const countVal = rows?.[0]?.result?.aggregateFields?.total?.integerValue;
+  return Math.max(1, Number(countVal || 0));
+}
+
+const SERVER_CACHE_TTLS = {
+  questions: 6 * 60 * 60 * 1000, // 6 hours (admin mutations update cache in-place)
+  subjects: 6 * 60 * 60 * 1000, // 6 hours
+  bot_commands: 6 * 60 * 60 * 1000, // 6 hours
+  notifications: 60 * 60 * 1000, // 1 hour
+  onlineCount: 5 * 60 * 1000, // 5 minutes
+};
+
+const SERVER_DISK_CACHE_PATH = path.join(os.tmpdir(), 'mpq-server-core-cache-v1.json');
+
+interface ServerCoreCacheState {
+  version: number;
+  lastForceAt: number;
+  quotaCooldownUntil: number;
+  questions: { data: any[]; fetchedAt: number } | null;
+  subjects: { data: any[]; fetchedAt: number } | null;
+  notifications: { data: any[]; fetchedAt: number } | null;
+  bot_commands: { data: Record<string, any>; fetchedAt: number } | null;
+  onlineCount: { count: number; fetchedAt: number } | null;
+}
+
+function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
+  const empty: ServerCoreCacheState = {
+    version: Date.now(),
+    lastForceAt: 0,
+    quotaCooldownUntil: 0,
+    questions: null,
+    subjects: null,
+    notifications: null,
+    bot_commands: null,
+    onlineCount: null,
+  };
+  try {
+    if (!fs.existsSync(SERVER_DISK_CACHE_PATH)) return empty;
+    const raw = fs.readFileSync(SERVER_DISK_CACHE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        ...empty,
+        version: typeof parsed.version === 'number' ? parsed.version : Date.now(),
+        questions: parsed.questions?.data ? parsed.questions : null,
+        subjects: parsed.subjects?.data ? parsed.subjects : null,
+        notifications: parsed.notifications?.data ? parsed.notifications : null,
+        bot_commands: parsed.bot_commands?.data ? parsed.bot_commands : null,
+        onlineCount: parsed.onlineCount?.count ? parsed.onlineCount : null,
+      };
+    }
+  } catch {
+    // Ignore corrupted disk cache
+  }
+  return empty;
+}
+
+const serverCoreCache: ServerCoreCacheState = loadServerCoreCacheFromDisk();
+let persistCacheTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePersistServerCoreCache() {
+  if (persistCacheTimer) return;
+  persistCacheTimer = setTimeout(() => {
+    persistCacheTimer = null;
+    try {
+      fs.writeFileSync(
+        SERVER_DISK_CACHE_PATH,
+        JSON.stringify({
+          version: serverCoreCache.version,
+          questions: serverCoreCache.questions,
+          subjects: serverCoreCache.subjects,
+          notifications: serverCoreCache.notifications,
+          bot_commands: serverCoreCache.bot_commands,
+          onlineCount: serverCoreCache.onlineCount,
+        })
+      );
+    } catch {
+      // Ignore disk write failure on ephemeral environments
+    }
+  }, 500);
+}
+
+const serverCacheInFlight = new Map<string, Promise<any>>();
+
+function markQuotaCooldownIfNeeded(err: any) {
+  if (err?.status === 429 || String(err?.message || '').includes('429')) {
+    serverCoreCache.quotaCooldownUntil = Date.now() + 5 * 60 * 1000; // 5-min backoff
+  }
+}
+
+async function getServerCachedQuestions(force = false): Promise<any[]> {
+  const now = Date.now();
+  if (
+    !force &&
+    serverCoreCache.questions &&
+    (now - serverCoreCache.questions.fetchedAt < SERVER_CACHE_TTLS.questions ||
+      now < serverCoreCache.quotaCooldownUntil)
+  ) {
+    return serverCoreCache.questions.data;
+  }
+  if (now < serverCoreCache.quotaCooldownUntil) {
+    const err: any = new Error('Firestore quota cooldown active');
+    err.status = 429;
+    throw err;
+  }
+
+  const key = 'questions';
+  if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
+
+  const p = (async () => {
+    try {
+      const raw = await fetchCollectionViaFirestoreRest('questions');
+      raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      serverCoreCache.questions = { data: raw, fetchedAt: Date.now() };
+      schedulePersistServerCoreCache();
+      return raw;
+    } catch (err: any) {
+      markQuotaCooldownIfNeeded(err);
+      if (serverCoreCache.questions) {
+        return serverCoreCache.questions.data;
+      }
+      throw err;
+    }
+  })().finally(() => serverCacheInFlight.delete(key));
+
+  serverCacheInFlight.set(key, p);
+  return p;
+}
+
+async function getServerCachedSubjects(force = false): Promise<any[]> {
+  const now = Date.now();
+  if (
+    !force &&
+    serverCoreCache.subjects &&
+    (now - serverCoreCache.subjects.fetchedAt < SERVER_CACHE_TTLS.subjects ||
+      now < serverCoreCache.quotaCooldownUntil)
+  ) {
+    return serverCoreCache.subjects.data;
+  }
+  if (now < serverCoreCache.quotaCooldownUntil) {
+    const err: any = new Error('Firestore quota cooldown active');
+    err.status = 429;
+    throw err;
+  }
+
+  const key = 'subjects';
+  if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
+
+  const p = (async () => {
+    try {
+      const raw = await fetchCollectionViaFirestoreRest('subjects');
+      raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      serverCoreCache.subjects = { data: raw, fetchedAt: Date.now() };
+      schedulePersistServerCoreCache();
+      return raw;
+    } catch (err: any) {
+      markQuotaCooldownIfNeeded(err);
+      if (serverCoreCache.subjects) {
+        return serverCoreCache.subjects.data;
+      }
+      throw err;
+    }
+  })().finally(() => serverCacheInFlight.delete(key));
+
+  serverCacheInFlight.set(key, p);
+  return p;
+}
+
+async function getServerCachedNotifications(force = false): Promise<any[]> {
+  const now = Date.now();
+  if (
+    !force &&
+    serverCoreCache.notifications &&
+    (now - serverCoreCache.notifications.fetchedAt < SERVER_CACHE_TTLS.notifications ||
+      now < serverCoreCache.quotaCooldownUntil)
+  ) {
+    return serverCoreCache.notifications.data;
+  }
+  if (now < serverCoreCache.quotaCooldownUntil) {
+    const err: any = new Error('Firestore quota cooldown active');
+    err.status = 429;
+    throw err;
+  }
+
+  const key = 'notifications';
+  if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
+
+  const p = (async () => {
+    try {
+      const raw = await fetchCollectionViaFirestoreRest('notifications');
+      raw.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+      serverCoreCache.notifications = { data: raw.slice(0, 50), fetchedAt: Date.now() };
+      schedulePersistServerCoreCache();
+      return serverCoreCache.notifications.data;
+    } catch (err: any) {
+      markQuotaCooldownIfNeeded(err);
+      if (serverCoreCache.notifications) {
+        return serverCoreCache.notifications.data;
+      }
+      throw err;
+    }
+  })().finally(() => serverCacheInFlight.delete(key));
+
+  serverCacheInFlight.set(key, p);
+  return p;
+}
+
+async function getServerCachedBotCommands(force = false): Promise<Record<string, any>> {
+  const now = Date.now();
+  if (
+    !force &&
+    serverCoreCache.bot_commands &&
+    (now - serverCoreCache.bot_commands.fetchedAt < SERVER_CACHE_TTLS.bot_commands ||
+      now < serverCoreCache.quotaCooldownUntil)
+  ) {
+    return serverCoreCache.bot_commands.data;
+  }
+  if (now < serverCoreCache.quotaCooldownUntil) {
+    const err: any = new Error('Firestore quota cooldown active');
+    err.status = 429;
+    throw err;
+  }
+
+  const key = 'bot_commands';
+  if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
+
+  const p = (async () => {
+    try {
+      const raw = await fetchCollectionViaFirestoreRest('bot_commands');
+      const map: Record<string, any> = {};
+      for (const item of raw) {
+        if (item?.command) {
+          map[item.command] = item;
+        }
+      }
+      serverCoreCache.bot_commands = { data: map, fetchedAt: Date.now() };
+      schedulePersistServerCoreCache();
+      return map;
+    } catch (err: any) {
+      markQuotaCooldownIfNeeded(err);
+      if (serverCoreCache.bot_commands) {
+        return serverCoreCache.bot_commands.data;
+      }
+      throw err;
+    }
+  })().finally(() => serverCacheInFlight.delete(key));
+
+  serverCacheInFlight.set(key, p);
+  return p;
+}
+
+app.get('/api/cache/core', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const now = Date.now();
+    const rawForce = req.query.force === '1';
+    const allowForce =
+      rawForce &&
+      now >= serverCoreCache.quotaCooldownUntil &&
+      now - serverCoreCache.lastForceAt > 10000;
+    if (allowForce) {
+      serverCoreCache.lastForceAt = now;
+      serverCoreCache.version = now;
+    }
+
+    const since = Number(req.query.since || 0);
+    const hasWarmCore =
+      Boolean(serverCoreCache.questions) &&
+      Boolean(serverCoreCache.subjects) &&
+      Boolean(serverCoreCache.notifications) &&
+      Boolean(serverCoreCache.bot_commands) &&
+      (now < serverCoreCache.quotaCooldownUntil ||
+        (now - serverCoreCache.questions!.fetchedAt < SERVER_CACHE_TTLS.questions &&
+          now - serverCoreCache.subjects!.fetchedAt < SERVER_CACHE_TTLS.subjects &&
+          now - serverCoreCache.notifications!.fetchedAt < SERVER_CACHE_TTLS.notifications &&
+          now - serverCoreCache.bot_commands!.fetchedAt < SERVER_CACHE_TTLS.bot_commands));
+
+    if (!allowForce && hasWarmCore && since > 0 && since === serverCoreCache.version) {
+      return res.json({
+        unchanged: true,
+        version: serverCoreCache.version,
+        quotaLimited: now < serverCoreCache.quotaCooldownUntil,
+      });
+    }
+
+    const [qRes, sRes, nRes, bcRes] = await Promise.allSettled([
+      getServerCachedQuestions(allowForce),
+      getServerCachedSubjects(allowForce),
+      getServerCachedNotifications(allowForce),
+      getServerCachedBotCommands(allowForce),
+    ]);
+
+    const questions = qRes.status === 'fulfilled' ? qRes.value : serverCoreCache.questions?.data;
+    const subjects = sRes.status === 'fulfilled' ? sRes.value : serverCoreCache.subjects?.data;
+    const notifications =
+      nRes.status === 'fulfilled' ? nRes.value : serverCoreCache.notifications?.data;
+    const botCommands =
+      bcRes.status === 'fulfilled' ? bcRes.value : serverCoreCache.bot_commands?.data;
+
+    const anyRejected = [qRes, sRes, nRes, bcRes].some((r) => r.status === 'rejected');
+    const quotaLimited =
+      Date.now() < serverCoreCache.quotaCooldownUntil ||
+      [qRes, sRes, nRes, bcRes].some(
+        (r) => r.status === 'rejected' && (r.reason?.status === 429 || String(r.reason?.message || '').includes('429'))
+      );
+
+    const hasAnyData = Boolean(questions || subjects || notifications || botCommands);
+    if (!hasAnyData && anyRejected) {
+      return res.status(503).json({
+        success: false,
+        quotaLimited,
+        error: quotaLimited ? 'Firestore daily read quota exceeded' : 'Cache unavailable',
+      });
+    }
+
+    res.json({
+      unchanged: false,
+      version: serverCoreCache.version,
+      quotaLimited,
+      ...(questions ? { questions } : {}),
+      ...(subjects ? { subjects } : {}),
+      ...(notifications ? { notifications } : {}),
+      ...(botCommands ? { botCommands } : {}),
+    });
+  } catch (err: any) {
+    res.status(503).json({
+      success: false,
+      quotaLimited: Date.now() < serverCoreCache.quotaCooldownUntil,
+      error: err?.message || 'Cache unavailable',
+    });
+  }
+});
+
+app.get('/api/cache/online-count', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const now = Date.now();
+    if (now < serverCoreCache.quotaCooldownUntil) {
+      return res.json({ count: serverCoreCache.onlineCount?.count || 1, quotaLimited: true });
+    }
+    const force = req.query.force === '1' && (!serverCoreCache.onlineCount || now - serverCoreCache.onlineCount.fetchedAt > 15000);
+    if (!force && serverCoreCache.onlineCount && now - serverCoreCache.onlineCount.fetchedAt < SERVER_CACHE_TTLS.onlineCount) {
+      return res.json({ count: serverCoreCache.onlineCount.count });
+    }
+
+    if (serverCacheInFlight.has('onlineCount')) {
+      const count = await serverCacheInFlight.get('onlineCount')!;
+      return res.json({ count });
+    }
+
+    const p = (async () => {
+      const count = await fetchActivePresenceCountViaRest();
+      serverCoreCache.onlineCount = { count, fetchedAt: Date.now() };
+      schedulePersistServerCoreCache();
+      return count;
+    })().finally(() => serverCacheInFlight.delete('onlineCount'));
+
+    serverCacheInFlight.set('onlineCount', p);
+    const count = await p;
+    res.json({ count });
+  } catch (err: any) {
+    markQuotaCooldownIfNeeded(err);
+    res.json({ count: serverCoreCache.onlineCount?.count || 1 });
+  }
+});
+
+// In-place cache update on Admin mutations -> avoids clearing server cache and re-reading entire collections
+app.post('/api/cache/mutate', (req, res) => {
+  const { scope, replace } = req.body || {};
+  const now = Date.now();
+
+  if (scope === 'questions' && Array.isArray(replace)) {
+    const sorted = [...replace].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    serverCoreCache.questions = { data: sorted, fetchedAt: now };
+  } else if (scope === 'subjects' && Array.isArray(replace)) {
+    const sorted = [...replace].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    serverCoreCache.subjects = { data: sorted, fetchedAt: now };
+  } else if (scope === 'notifications' && Array.isArray(replace)) {
+    const sorted = [...replace]
+      .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+      .slice(0, 50);
+    serverCoreCache.notifications = { data: sorted, fetchedAt: now };
+  } else if (scope === 'bot_commands' && replace && typeof replace === 'object' && !Array.isArray(replace)) {
+    serverCoreCache.bot_commands = { data: replace, fetchedAt: now };
+  }
+
+  serverCoreCache.version = now;
+  schedulePersistServerCoreCache();
+  res.json({ ok: true, version: serverCoreCache.version });
+});
+
+app.post('/api/cache/invalidate', (req, res) => {
+  const scopes: string[] = Array.isArray(req.body?.scopes)
+    ? req.body.scopes
+    : ['questions', 'subjects', 'notifications', 'bot_commands'];
+
+  for (const scope of scopes) {
+    if (scope === 'questions') serverCoreCache.questions = null;
+    if (scope === 'subjects') serverCoreCache.subjects = null;
+    if (scope === 'notifications') serverCoreCache.notifications = null;
+    if (scope === 'bot_commands') serverCoreCache.bot_commands = null;
+  }
+  serverCoreCache.version = Date.now();
+  schedulePersistServerCoreCache();
+  res.json({ ok: true, version: serverCoreCache.version });
 });
 
 // Health check endpoint
