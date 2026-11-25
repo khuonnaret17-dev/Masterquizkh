@@ -10,6 +10,9 @@ import {
   Trash2,
   Edit2,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  GripVertical,
   CheckCircle2,
   AlertCircle,
   Eye,
@@ -34,6 +37,8 @@ import {
   Search,
   RotateCcw,
   Save,
+  FileJson,
+  Upload,
 } from 'lucide-react';
 import { Question, Subject, LoginRecord, PresenceRecord, Feedback, QuestionType, AppNotification, BotCommandConfig, BotActionButton } from '../types';
 import { toKhmerNum, getOptionLabel, shuffleArray } from '../utils/khmer';
@@ -47,12 +52,15 @@ import {
 import { DEFAULT_BOT_COMMANDS, getMergedBotCommands, KHQR_IMAGE_PATH } from '../utils/botCommands';
 import {
   addQuestion,
+  addQuestionsBatch,
   updateQuestion,
   deleteQuestion,
   swapQuestions,
   addSubject,
   updateSubject,
   deleteSubject,
+  moveSubject,
+  swapSubjects,
   broadcastNotification,
   deleteNotification,
   deleteAllNotifications,
@@ -62,6 +70,12 @@ import {
   resetBotCommandConfig,
   resetAllBotCommands,
 } from '../services/firebase';
+import {
+  SAMPLE_EXPORT_JSON_STRING,
+  buildExportJsonPayload,
+  downloadJsonFile,
+  parseQuestionsJsonInput,
+} from '../services/jsonQuestions';
 import {
   testTelegramBot,
   sendTelegramMessage,
@@ -79,6 +93,10 @@ import {
   stopTelegramCommandBot,
   getTelegramCommandBotStatus,
   CommandBotStatus,
+  DEFAULT_TELEGRAM_TARGETS,
+  TelegramTargetItem,
+  normalizeTelegramChatId,
+  parseTelegramChatIds,
 } from '../services/telegram';
 import {
   exportQuestionsToPDF,
@@ -138,7 +156,13 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   );
 
   // Bulk Import State
+  const [bulkInputMode, setBulkInputMode] = useState<'text' | 'json'>('text');
   const [bulkText, setBulkText] = useState('');
+  const [bulkJsonText, setBulkJsonText] = useState('');
+  const [jsonOverrideSubject, setJsonOverrideSubject] = useState(false);
+  const [parsedSubjectMetaMap, setParsedSubjectMetaMap] = useState<Record<string, Partial<Subject>>>({});
+  const [isSavingBulkQuestions, setIsSavingBulkQuestions] = useState(false);
+  const jsonFileInputRef = useRef<HTMLInputElement | null>(null);
   const [bulkSubject, setBulkSubject] = useState(subjects[0]?.name || '');
   const [newBulkSubjectName, setNewBulkSubjectName] = useState('');
   const [bulkImportType, setBulkImportType] = useState<'auto' | 'mcq' | 'short' | 'explanation'>('auto');
@@ -175,6 +199,28 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   );
   const [swapFromIndex, setSwapFromIndex] = useState<number>(1);
   const [swapToIndex, setSwapToIndex] = useState<number>(2);
+  const [subjectSwapFrom, setSubjectSwapFrom] = useState<number>(1);
+  const [subjectSwapTo, setSubjectSwapTo] = useState<number>(2);
+  const [subjectOrderStatusMsg, setSubjectOrderStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
+  const [isReorderingSubjects, setIsReorderingSubjects] = useState(false);
+  const [draggedSubjectIndex, setDraggedSubjectIndex] = useState<number | null>(null);
+  const [dragOverSubjectIndex, setDragOverSubjectIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (subjects.length <= 1) {
+      setSubjectSwapFrom(1);
+      setSubjectSwapTo(1);
+      return;
+    }
+    setSubjectSwapFrom((prev) => Math.min(Math.max(1, prev), subjects.length));
+    setSubjectSwapTo((prev) => {
+      const clamped = Math.min(Math.max(1, prev), subjects.length);
+      return clamped === 1 && subjects.length >= 2 ? 2 : clamped;
+    });
+  }, [subjects.length]);
+
+  const getNextSubjectOrder = () =>
+    subjects.length > 0 ? Math.max(...subjects.map((s, idx) => s.order ?? idx)) + 1 : 0;
 
   const handleAddNewSubjectDirect = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -194,7 +240,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         name,
         type: directSubjectType,
         isActive: true,
-        order: subjects.length + 1,
+        order: getNextSubjectOrder(),
       });
       setDirectSubjectStatusMsg({ text: `បានបន្ថែមមុខវិជ្ជាថ្មី "${name}" ជោគជ័យ!`, success: true });
       setDirectSubjectName('');
@@ -274,13 +320,44 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     exportShuffleSeed,
   ]);
 
+  const TG_TARGETS_STORAGE_KEY = 'master_quiz_tg_targets_v1';
+
   // Telegram Bot Settings & Batch State
   const [tgBotToken, setTgBotToken] = useState(() => {
     return localStorage.getItem('master_quiz_tg_token') || '';
   });
-  const [tgChatId, setTgChatId] = useState(() => {
-    return localStorage.getItem('master_quiz_tg_chat') || '';
+  const [tgTargets, setTgTargets] = useState<TelegramTargetItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(TG_TARGETS_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // Fallback to default targets
+    }
+    return DEFAULT_TELEGRAM_TARGETS;
   });
+  const [tgChatId, setTgChatId] = useState(() => {
+    try {
+      const savedTargets = localStorage.getItem(TG_TARGETS_STORAGE_KEY);
+      if (savedTargets) {
+        const parsed = JSON.parse(savedTargets);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((t: TelegramTargetItem) => t.enabled)
+            .map((t: TelegramTargetItem) => t.chatId)
+            .join(', ');
+        }
+      }
+    } catch {
+      // Ignore
+    }
+    return DEFAULT_TELEGRAM_TARGETS.map((t) => t.chatId).join(', ');
+  });
+  const [newTgTargetInput, setNewTgTargetInput] = useState('');
   const [tgSubject, setTgSubject] = useState<string>(subjects[0]?.name || '__ALL__');
   const [tgSendMode, setTgSendMode] = useState<'batch_cards' | 'batch_polls' | 'batch_photos' | 'single_poll'>('batch_cards');
   const [tgTextStyle, setTgTextStyle] = useState<'one_by_one' | 'digest'>('one_by_one');
@@ -776,7 +853,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           name: newSubjectName.trim(),
           type: singleType,
           isActive: true,
-          order: subjects.length + 1,
+          order: getNextSubjectOrder(),
         });
       }
 
@@ -806,48 +883,171 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     setGeneratedPreview((prev) => prev.filter((_, idx) => idx !== index));
   };
 
-  // Save Bulk Questions to Firestore
+  // Save Bulk Questions to Firestore (supports both single-subject Text import & multi-subject Export JSON import)
   const handleSaveGeneratedQuestions = async () => {
-    if (generatedPreview.length === 0) return;
+    if (generatedPreview.length === 0 || isSavingBulkQuestions) return;
+    setIsSavingBulkQuestions(true);
+    setBulkStatusMsg(null);
     try {
-      const finalSubject = (newBulkSubjectName.trim() || bulkSubject || (subjects[0]?.name ?? 'ចំណេះដឹងទូទៅ')).trim();
-      
-      // Auto-create subject if not exists in subjects list
-      const existingSub = subjects.find(
-        (s) => s.name.trim().toLowerCase() === finalSubject.toLowerCase()
-      );
-
-      if (!existingSub) {
-        const primaryType = generatedPreview[0]?.type || 'mcq';
-        await addSubject({
-          name: finalSubject,
-          type: primaryType,
-          isActive: true,
-          order: subjects.length + 1,
-        });
+      const fallbackSubject = (newBulkSubjectName.trim() || bulkSubject || (subjects[0]?.name ?? 'ចំណេះដឹងទូទៅ')).trim();
+      const normalizedQuestions: Omit<Question, 'id'>[] = [];
+      const countOffsetBySubject: Record<string, number> = {};
+      const existingSubjectMap = new Map<string, string>();
+      for (const s of subjects) {
+        existingSubjectMap.set(s.name.trim().toLowerCase(), s.name);
       }
 
-      const existingCountInSubject = questions.filter((q) => q.subject === finalSubject).length;
+      let nextSubjectOrder = getNextSubjectOrder();
+      let createdSubjectsCount = 0;
 
-      for (let i = 0; i < generatedPreview.length; i++) {
-        const q = generatedPreview[i];
-        await addQuestion({
+      // Ensure all referenced subjects exist in Firestore first
+      for (const q of generatedPreview) {
+        const rawSub = (q.subject || fallbackSubject).trim() || fallbackSubject;
+        const lowerKey = rawSub.toLowerCase();
+        if (!existingSubjectMap.has(lowerKey)) {
+          const meta = parsedSubjectMetaMap[rawSub];
+          await addSubject({
+            name: rawSub,
+            type: meta?.type || q.type || 'mcq',
+            isActive: meta?.isActive ?? true,
+            order: nextSubjectOrder++,
+          });
+          existingSubjectMap.set(lowerKey, rawSub);
+          createdSubjectsCount++;
+        }
+      }
+
+      for (const q of generatedPreview) {
+        const rawSub = (q.subject || fallbackSubject).trim() || fallbackSubject;
+        const canonicalSubject = existingSubjectMap.get(rawSub.toLowerCase()) || rawSub;
+
+        if (countOffsetBySubject[canonicalSubject] === undefined) {
+          countOffsetBySubject[canonicalSubject] = questions.filter((item) => item.subject === canonicalSubject).length;
+        }
+        countOffsetBySubject[canonicalSubject] += 1;
+
+        normalizedQuestions.push({
           ...q,
-          subject: finalSubject,
-          order: existingCountInSubject + i + 1,
+          subject: canonicalSubject,
+          order: countOffsetBySubject[canonicalSubject],
         });
       }
+
+      await addQuestionsBatch(normalizedQuestions);
+
+      const touchedSubjectsCount = Object.keys(countOffsetBySubject).length;
+      const subjectSummary =
+        touchedSubjectsCount === 1
+          ? `ទៅក្នុងមុខវិជ្ជា "${Object.keys(countOffsetBySubject)[0]}"`
+          : `ទៅក្នុង ${toKhmerNum(touchedSubjectsCount)} មុខវិជ្ជា`;
+      const newSubNote =
+        createdSubjectsCount > 0 ? ` (និងបង្កើតមុខវិជ្ជាថ្មី ${toKhmerNum(createdSubjectsCount)})` : '';
 
       setBulkStatusMsg({
-        text: `បានរក្សាទុក ${toKhmerNum(generatedPreview.length)} សំណួរទៅក្នុងមុខវិជ្ជា "${finalSubject}" ជោគជ័យ!`,
+        text: `បានរក្សាទុក ${toKhmerNum(normalizedQuestions.length)} សំណួរ${subjectSummary}${newSubNote} ជោគជ័យ!`,
         success: true,
       });
       setGeneratedPreview([]);
+      setParsedSubjectMetaMap({});
       setBulkText('');
+      setBulkJsonText('');
       setNewBulkSubjectName('');
     } catch (err: any) {
       setBulkStatusMsg({ text: err.message || 'បរាជ័យក្នុងការរក្សាទុកសំណួរ', success: false });
+    } finally {
+      setIsSavingBulkQuestions(false);
     }
+  };
+
+  // Parse JSON Import
+  const handleParseJsonImport = (rawOverride?: string) => {
+    setBulkStatusMsg(null);
+    const sourceText = rawOverride ?? bulkJsonText;
+    const fallbackSubject = (newBulkSubjectName.trim() || bulkSubject || (subjects[0]?.name ?? 'ចំណេះដឹងទូទៅ')).trim();
+    const overrideSub =
+      jsonOverrideSubject || Boolean(newBulkSubjectName.trim())
+        ? fallbackSubject
+        : undefined;
+
+    try {
+      const result = parseQuestionsJsonInput(sourceText, {
+        fallbackSubject,
+        overrideSubject: overrideSub,
+        forcedType: bulkImportType,
+      });
+
+      if (result.questions.length === 0) {
+        setGeneratedPreview([]);
+        setBulkStatusMsg({
+          text: 'រកមិនឃើញសំណួរត្រឹមត្រូវនៅក្នុងទិន្នន័យ JSON នេះទេ! សូមពិនិត្យទម្រង់ម្ដងទៀត។',
+          success: false,
+        });
+        return;
+      }
+
+      setGeneratedPreview(result.questions);
+      setParsedSubjectMetaMap(result.subjectMetaMap);
+      const uniqueSubjects = Array.from(new Set(result.questions.map((q) => q.subject)));
+      const skippedText =
+        result.skippedCount > 0 ? ` (រំលងទិន្នន័យមិនពេញលេញ ${toKhmerNum(result.skippedCount)})` : '';
+      setBulkStatusMsg({
+        text: `បានបំប្លែង ${toKhmerNum(result.questions.length)} សំណួរពី JSON សម្រាប់ ${toKhmerNum(uniqueSubjects.length)} មុខវិជ្ជា${skippedText} រួចរាល់! សូមពិនិត្យ និងចុចរក្សាទុក។`,
+        success: true,
+      });
+    } catch (err: any) {
+      setGeneratedPreview([]);
+      setBulkStatusMsg({
+        text: err?.message || 'ទម្រង់ JSON មិនត្រឹមត្រូវ!',
+        success: false,
+      });
+    }
+  };
+
+  const handleJsonFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const content = await file.text();
+      setBulkInputMode('json');
+      setBulkJsonText(content);
+      handleParseJsonImport(content);
+    } catch {
+      setBulkStatusMsg({ text: 'មិនអាចអានឯកសារ JSON នេះបានទេ!', success: false });
+    }
+  };
+
+  const handleExportJsonFromBulk = (scope: 'selected' | 'all') => {
+    setBulkStatusMsg(null);
+    const targetSubject = bulkSubject || subjects[0]?.name || '';
+    const targetList =
+      scope === 'all'
+        ? questions
+        : questions.filter((q) => q.subject === targetSubject);
+
+    if (targetList.length === 0) {
+      setBulkStatusMsg({
+        text:
+          scope === 'all'
+            ? 'មិនទាន់មានសំណួរនៅក្នុងប្រព័ន្ធសម្រាប់ Export JSON នៅឡើយទេ!'
+            : `មិនទាន់មានសំណួរនៅក្នុងមុខវិជ្ជា "${targetSubject}" សម្រាប់ Export JSON ទេ!`,
+        success: false,
+      });
+      return;
+    }
+
+    const payload = buildExportJsonPayload(targetList, subjects, {
+      subjectLabel: scope === 'all' ? '__ALL__' : targetSubject,
+    });
+    const filename =
+      scope === 'all'
+        ? 'Master_Quiz_KH_All_Questions.json'
+        : `${targetSubject}_MasterQuiz.json`;
+    downloadJsonFile(payload, filename);
+    setBulkStatusMsg({
+      text: `បាន Export ឯកសារ JSON (${toKhmerNum(targetList.length)} សំណួរ) ជោគជ័យ!`,
+      success: true,
+    });
   };
 
   // Parse Bulk Text Import
@@ -992,6 +1192,77 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
   const [swapStatusMsg, setSwapStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
 
+  // Move or Swap Subjects
+  const handleMoveSubjectStep = async (fromIdx: number, toIdx: number) => {
+    if (isReorderingSubjects) return;
+    if (fromIdx < 0 || fromIdx >= subjects.length || toIdx < 0 || toIdx >= subjects.length || fromIdx === toIdx) {
+      return;
+    }
+    const targetSub = subjects[fromIdx];
+    setIsReorderingSubjects(true);
+    setSubjectOrderStatusMsg(null);
+    try {
+      await moveSubject(subjects, fromIdx, toIdx);
+      setSubjectOrderStatusMsg({
+        text: `បានផ្លាស់ប្ដូរទីតាំងមុខវិជ្ជា "${targetSub.name}" ទៅលេខរៀងទី ${toKhmerNum(toIdx + 1)} ជោគជ័យ!`,
+        success: true,
+      });
+    } catch {
+      setSubjectOrderStatusMsg({
+        text: 'បរាជ័យក្នុងការផ្លាស់ប្ដូរទីតាំងមុខវិជ្ជា!',
+        success: false,
+      });
+    } finally {
+      setIsReorderingSubjects(false);
+    }
+  };
+
+  const handleMoveSubjectByToolbar = async () => {
+    const fromIdx = subjectSwapFrom - 1;
+    const toIdx = subjectSwapTo - 1;
+    if (!subjects[fromIdx] || !subjects[toIdx] || fromIdx === toIdx) {
+      setSubjectOrderStatusMsg({ text: 'សូមជ្រើសរើសលេខរៀងទីតាំងដែលខុសគ្នា!', success: false });
+      return;
+    }
+    await handleMoveSubjectStep(fromIdx, toIdx);
+  };
+
+  const handleSwapSubjectsByToolbar = async () => {
+    if (isReorderingSubjects) return;
+    const fromIdx = subjectSwapFrom - 1;
+    const toIdx = subjectSwapTo - 1;
+    const sub1 = subjects[fromIdx];
+    const sub2 = subjects[toIdx];
+    if (!sub1 || !sub2 || fromIdx === toIdx) {
+      setSubjectOrderStatusMsg({ text: 'សូមជ្រើសរើសមុខវិជ្ជាពីរផ្សេងគ្នាដើម្បីដោះដូរទីតាំង!', success: false });
+      return;
+    }
+    setIsReorderingSubjects(true);
+    setSubjectOrderStatusMsg(null);
+    try {
+      await swapSubjects(subjects, fromIdx, toIdx);
+      setSubjectOrderStatusMsg({
+        text: `បានដោះដូរទីតាំងរវាង "${sub1.name}" (លេខ ${toKhmerNum(subjectSwapFrom)}) និង "${sub2.name}" (លេខ ${toKhmerNum(subjectSwapTo)}) ជោគជ័យ!`,
+        success: true,
+      });
+    } catch {
+      setSubjectOrderStatusMsg({
+        text: 'បរាជ័យក្នុងការដោះដូរទីតាំងមុខវិជ្ជា!',
+        success: false,
+      });
+    } finally {
+      setIsReorderingSubjects(false);
+    }
+  };
+
+  const handleSubjectDrop = async (dropIdx: number) => {
+    const fromIdx = draggedSubjectIndex;
+    setDraggedSubjectIndex(null);
+    setDragOverSubjectIndex(null);
+    if (fromIdx === null || fromIdx === dropIdx) return;
+    await handleMoveSubjectStep(fromIdx, dropIdx);
+  };
+
   // Swap Questions
   const handleSwapQuestions = async () => {
     setSwapStatusMsg(null);
@@ -1069,11 +1340,76 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     }
   };
 
-  // Send Questions & Answers in One Batch by Subject
+  const persistTgTargets = (nextTargets: TelegramTargetItem[], syncInput = true) => {
+    setTgTargets(nextTargets);
+    try {
+      localStorage.setItem(TG_TARGETS_STORAGE_KEY, JSON.stringify(nextTargets));
+    } catch {
+      // Ignore storage error
+    }
+    if (syncInput) {
+      const joined = nextTargets
+        .filter((t) => t.enabled)
+        .map((t) => t.chatId)
+        .join(', ');
+      setTgChatId(joined);
+      localStorage.setItem('master_quiz_tg_chat', joined);
+    }
+  };
+
+  const handleToggleTgTarget = (id: string) => {
+    const next = tgTargets.map((t) => (t.id === id ? { ...t, enabled: !t.enabled } : t));
+    persistTgTargets(next, true);
+  };
+
+  const handleAddTgTarget = () => {
+    const raw = newTgTargetInput.trim();
+    if (!raw) return;
+    const parsedIds = parseTelegramChatIds(raw);
+    if (parsedIds.length === 0) return;
+    let next = [...tgTargets];
+    for (const chatId of parsedIds) {
+      const exists = next.some((t) => t.chatId.toLowerCase() === chatId.toLowerCase());
+      if (exists) {
+        next = next.map((t) =>
+          t.chatId.toLowerCase() === chatId.toLowerCase() ? { ...t, enabled: true } : t
+        );
+      } else {
+        next.push({
+          id: `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          chatId,
+          label: raw.includes('t.me/') && parsedIds.length === 1 ? raw : chatId,
+          enabled: true,
+        });
+      }
+    }
+    persistTgTargets(next, true);
+    setNewTgTargetInput('');
+  };
+
+  const handleRemoveTgTarget = (id: string) => {
+    const next = tgTargets.filter((t) => t.id !== id);
+    persistTgTargets(next, true);
+  };
+
+  const resolveActiveTelegramTargets = (): string[] => {
+    const fromInput = parseTelegramChatIds(tgChatId);
+    if (fromInput.length > 0) return fromInput;
+    return tgTargets
+      .filter((t) => t.enabled)
+      .map((t) => normalizeTelegramChatId(t.chatId))
+      .filter(Boolean);
+  };
+
+  // Send Questions & Answers in One Batch by Subject (supports multiple Telegram destinations)
   const handleSendTelegramBatchBySubject = async () => {
     const hasToken = Boolean(tgBotToken.trim() || commandBotStatus?.hasServerToken);
-    if (!hasToken || !tgChatId.trim()) {
-      setTelegramStatus({ text: 'សូមបញ្ចូល Telegram Bot Token និង Chat ID / Channel!', success: false });
+    const activeTargets = resolveActiveTelegramTargets();
+    if (!hasToken || activeTargets.length === 0) {
+      setTelegramStatus({
+        text: 'សូមបញ្ចូល Telegram Bot Token និងជ្រើសរើសគោលដៅ Telegram យ៉ាងតិច ១!',
+        success: false,
+      });
       return;
     }
 
@@ -1101,7 +1437,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     const addLog = (text: string, success: boolean) => {
       const now = new Date();
       const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-      setTgLogs((prev) => [{ id: Math.random().toString(), time: timeStr, text, success }, ...prev].slice(0, 100));
+      setTgLogs((prev) => [{ id: Math.random().toString(), time: timeStr, text, success }, ...prev].slice(0, 150));
     };
 
     try {
@@ -1109,72 +1445,94 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         // Mode 1B: App Banner Cover + Combined Q&A Text digest messages with hidden Spoiler answers
         const subjectDisplay = targetSubject === '__ALL__' ? 'គ្រប់មុខវិជ្ជាទាំងអស់' : targetSubject;
         const chunks = formatSubjectDigestMessages(subjectDisplay, subjectQuestions);
+        const totalSteps = chunks.length * activeTargets.length;
 
         setTgProgress({
           current: 0,
-          total: chunks.length,
+          total: totalSteps,
           isRunning: true,
-          message: `កំពុងរៀបចំផ្ញើរូបភាពកម្មវិធី & កម្រងវិញ្ញាសាចំនួន ${toKhmerNum(chunks.length)} សារ...`,
+          message: `កំពុងរៀបចំផ្ញើកម្រងវិញ្ញាសាទៅ ${toKhmerNum(activeTargets.length)} គោលដៅ...`,
         });
 
+        let coverBanner = '';
         try {
-          const coverBanner = await renderAppBannerImage(subjectDisplay);
-          await sendTelegramPhoto(
-            tgBotToken.trim(),
-            tgChatId.trim(),
-            coverBanner,
-            `🏛️ <b>កម្រងវិញ្ញាសា៖ ${escapeTgHtml(subjectDisplay)}</b> (${toKhmerNum(subjectQuestions.length)} សំណួរ)\n👉 <i>ចម្លើយត្រឹមត្រូវត្រូវបានលាក់ (ចុចដើម្បីមើល)</i>`,
-            'HTML'
-          );
-          await sleep(1200);
+          coverBanner = await renderAppBannerImage(subjectDisplay);
         } catch {
-          // Proceed with digest text messages even if cover image send fails
+          coverBanner = '';
         }
 
-        let sentChunks = 0;
-        for (let i = 0; i < chunks.length; i++) {
-          if (tgCancelRef.current) {
-            addLog(`ផ្អាកការផ្ញើនៅសារទី ${toKhmerNum(i + 1)}`, false);
-            break;
+        let sentOps = 0;
+        let stepDone = 0;
+        for (let tIdx = 0; tIdx < activeTargets.length; tIdx++) {
+          if (tgCancelRef.current) break;
+          const dest = activeTargets[tIdx];
+
+          if (coverBanner) {
+            try {
+              await sendTelegramPhoto(
+                tgBotToken.trim(),
+                dest,
+                coverBanner,
+                `🏛️ <b>កម្រងវិញ្ញាសា៖ ${escapeTgHtml(subjectDisplay)}</b> (${toKhmerNum(subjectQuestions.length)} សំណួរ)\n👉 <i>ចម្លើយត្រឹមត្រូវត្រូវបានលាក់ (ចុចដើម្បីមើល)</i>`,
+                'HTML'
+              );
+              await sleep(600);
+            } catch {
+              // Proceed with digest text even if cover fails
+            }
           }
 
-          setTgProgress({
-            current: i + 1,
-            total: chunks.length,
-            isRunning: true,
-            message: `កំពុងផ្ញើសារទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(chunks.length)}...`,
-          });
+          for (let i = 0; i < chunks.length; i++) {
+            if (tgCancelRef.current) {
+              addLog(`ផ្អាកការផ្ញើនៅ [${dest}] សារទី ${toKhmerNum(i + 1)}`, false);
+              break;
+            }
 
-          await sendTelegramMessage(tgBotToken.trim(), tgChatId.trim(), chunks[i], 'HTML');
-          sentChunks++;
-          addLog(`សារទី ${toKhmerNum(i + 1)} / ${toKhmerNum(chunks.length)} បានផ្ញើរួចរាល់`, true);
+            stepDone++;
+            setTgProgress({
+              current: stepDone,
+              total: totalSteps,
+              isRunning: true,
+              message: `[${dest}] កំពុងផ្ញើសារទី ${toKhmerNum(i + 1)} / ${toKhmerNum(chunks.length)}...`,
+            });
 
-          if (i < chunks.length - 1) {
-            await sleep(1500);
+            try {
+              await sendTelegramMessage(tgBotToken.trim(), dest, chunks[i], 'HTML');
+              sentOps++;
+              addLog(`[${dest}] សារទី ${toKhmerNum(i + 1)}/${toKhmerNum(chunks.length)} ✓`, true);
+            } catch (destErr: any) {
+              addLog(`[${dest}] បរាជ័យសារទី ${toKhmerNum(i + 1)}: ${destErr.message}`, false);
+            }
+
+            if (i < chunks.length - 1 || tIdx < activeTargets.length - 1) {
+              await sleep(800);
+            }
           }
         }
 
         setTelegramStatus({
           text: tgCancelRef.current
-            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(sentChunks)}/${toKhmerNum(chunks.length)} សារ)`
-            : `បានផ្ញើកម្រងសំណួរ & ចម្លើយមុខវិជ្ជា «${targetSubject === '__ALL__' ? 'ទាំងអស់' : targetSubject}» ចំនួន ${toKhmerNum(subjectQuestions.length)} សំណួរ ជា Text ទៅកាន់ Telegram ជោគជ័យ!`,
-          success: sentChunks > 0,
+            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(sentOps)}/${toKhmerNum(totalSteps)})`
+            : `បានផ្ញើកម្រងវិញ្ញាសា «${subjectDisplay}» ទៅកាន់ ${toKhmerNum(activeTargets.length)} គោលដៅ (${toKhmerNum(sentOps)}/${toKhmerNum(totalSteps)} សារជោគជ័យ)!`,
+          success: sentOps > 0,
         });
       } else if (tgSendMode === 'batch_polls') {
-        // Mode 2: One-by-One Interactive Quiz Polls for MCQs
+        // Mode 2: One-by-One Interactive Quiz Polls for MCQs across selected targets
         const mcqs = subjectQuestions.filter((q) => q.type === 'mcq' && q.options && q.options.length >= 2);
         if (mcqs.length === 0) {
-          throw new Error(`មិនមានសំណួរប្រភេទ QCM (ពហុជ្រើសរើស) ក្នុងមុខវិជ្ជានេះដើម្បីបង្កើត Quiz Poll ទេ! (សូមជ្រើសរើសទម្រង់ "កាតសំណួរ & ចម្លើយ ម្ដងមួយៗ")`);
+          throw new Error(`មិនមានសំណួរប្រភេទ QCM (ពហុជ្រើសរើស) ក្នុងមុខវិជ្ជានេះដើម្បីបង្កើត Quiz Poll ទេ!`);
         }
 
+        const totalOps = mcqs.length * activeTargets.length;
         setTgProgress({
           current: 0,
-          total: mcqs.length,
+          total: totalOps,
           isRunning: true,
-          message: `កំពុងចាប់ផ្តើមបាញ់ Quiz Polls ម្ដងមួយៗ ចំនួន ${toKhmerNum(mcqs.length)} សំណួរ...`,
+          message: `កំពុងបាញ់ Quiz Polls ទៅ ${toKhmerNum(activeTargets.length)} គោលដៅ...`,
         });
 
         let successCount = 0;
+        let stepDone = 0;
         for (let i = 0; i < mcqs.length; i++) {
           if (tgCancelRef.current) {
             addLog(`ផ្អាកការបាញ់ Polls នៅសំណួរទី ${toKhmerNum(i + 1)}`, false);
@@ -1182,42 +1540,53 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           }
 
           const q = mcqs[i];
-          setTgProgress({
-            current: i + 1,
-            total: mcqs.length,
-            isRunning: true,
-            message: `កំពុងបាញ់ Poll ទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(mcqs.length)}៖ ${q.question.slice(0, 30)}...`,
-          });
+          for (let tIdx = 0; tIdx < activeTargets.length; tIdx++) {
+            if (tgCancelRef.current) break;
+            const dest = activeTargets[tIdx];
+            stepDone++;
+            setTgProgress({
+              current: stepDone,
+              total: totalOps,
+              isRunning: true,
+              message: `Poll ទី ${toKhmerNum(i + 1)}/${toKhmerNum(mcqs.length)} → ${dest}...`,
+            });
 
-          try {
-            await sendTelegramPoll(tgBotToken.trim(), tgChatId.trim(), q);
-            successCount++;
-            addLog(`Poll ទី ${toKhmerNum(i + 1)}: ${q.question.slice(0, 35)}...`, true);
-          } catch (itemErr: any) {
-            addLog(`បរាជ័យសំណួរទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+            try {
+              await sendTelegramPoll(tgBotToken.trim(), dest, q);
+              successCount++;
+              addLog(`[${dest}] Poll ទី ${toKhmerNum(i + 1)}: ${q.question.slice(0, 30)}...`, true);
+            } catch (itemErr: any) {
+              addLog(`[${dest}] បរាជ័យ Poll ទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+            }
+
+            if (tIdx < activeTargets.length - 1) {
+              await sleep(350);
+            }
           }
 
           if (i < mcqs.length - 1) {
-            await sleep(1800);
+            await sleep(1400);
           }
         }
 
         setTelegramStatus({
           text: tgCancelRef.current
-            ? `បានផ្អាកការផ្ញើ (បាញ់បាន ${toKhmerNum(successCount)}/${toKhmerNum(mcqs.length)} Quiz Polls)`
-            : `បានបាញ់បញ្ជូន Quiz Polls ម្ដងមួយៗ ចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(mcqs.length)} សំណួរ ទៅកាន់ Telegram ជោគជ័យ!`,
+            ? `បានផ្អាកការផ្ញើ (បាញ់បាន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} Quiz Polls)`
+            : `បានបាញ់ Quiz Polls ចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} ទៅកាន់ ${toKhmerNum(activeTargets.length)} គោលដៅរួចរាល់!`,
           success: successCount > 0,
         });
       } else if (tgSendMode === 'batch_photos') {
-        // Mode 3: Send Every Question as a Styled Khmer Image Card One-by-One
+        // Mode 3: Send Every Question as a Styled Khmer Image Card across selected targets
+        const totalOps = subjectQuestions.length * activeTargets.length;
         setTgProgress({
           current: 0,
-          total: subjectQuestions.length,
+          total: totalOps,
           isRunning: true,
-          message: `កំពុងចាប់ផ្ដើមបង្កើត និងផ្ញើរូបភាពសំណួរម្ដងមួយៗ ចំនួន ${toKhmerNum(subjectQuestions.length)} រូបភាព...`,
+          message: `កំពុងបង្កើត & ផ្ញើរូបភាពសំណួរទៅ ${toKhmerNum(activeTargets.length)} គោលដៅ...`,
         });
 
         let successCount = 0;
+        let stepDone = 0;
         for (let i = 0; i < subjectQuestions.length; i++) {
           if (tgCancelRef.current) {
             addLog(`ផ្អាកការផ្ញើរូបភាពនៅសំណួរទី ${toKhmerNum(i + 1)}`, false);
@@ -1225,46 +1594,66 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           }
 
           const q = subjectQuestions[i];
-          setTgProgress({
-            current: i + 1,
-            total: subjectQuestions.length,
-            isRunning: true,
-            message: `កំពុងបង្កើត & ផ្ញើរូបភាពទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(subjectQuestions.length)}...`,
-          });
-
+          let photoBase64 = '';
+          let caption = '';
           try {
-            const photoBase64 = await renderQuestionCardImage(q, i + 1, {
+            photoBase64 = await renderQuestionCardImage(q, i + 1, {
               showAnswer: tgPhotoShowAnswer,
             });
-            const caption = formatPhotoCaption(q, i + 1, tgPhotoShowAnswer);
-            await sendTelegramPhoto(tgBotToken.trim(), tgChatId.trim(), photoBase64, caption, 'HTML');
-            successCount++;
-            addLog(`រូបភាពទី ${toKhmerNum(i + 1)} (${q.type}): ${q.question.slice(0, 35)}...`, true);
-          } catch (itemErr: any) {
-            addLog(`បរាជ័យរូបភាពទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+            caption = formatPhotoCaption(q, i + 1, tgPhotoShowAnswer);
+          } catch (renderErr: any) {
+            addLog(`បរាជ័យបង្កើតរូបភាពទី ${toKhmerNum(i + 1)}: ${renderErr.message}`, false);
+            stepDone += activeTargets.length;
+            continue;
+          }
+
+          for (let tIdx = 0; tIdx < activeTargets.length; tIdx++) {
+            if (tgCancelRef.current) break;
+            const dest = activeTargets[tIdx];
+            stepDone++;
+            setTgProgress({
+              current: stepDone,
+              total: totalOps,
+              isRunning: true,
+              message: `រូបភាពទី ${toKhmerNum(i + 1)}/${toKhmerNum(subjectQuestions.length)} → ${dest}...`,
+            });
+
+            try {
+              await sendTelegramPhoto(tgBotToken.trim(), dest, photoBase64, caption, 'HTML');
+              successCount++;
+              addLog(`[${dest}] រូបភាពទី ${toKhmerNum(i + 1)}: ${q.question.slice(0, 30)}...`, true);
+            } catch (itemErr: any) {
+              addLog(`[${dest}] បរាជ័យរូបភាពទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+            }
+
+            if (tIdx < activeTargets.length - 1) {
+              await sleep(350);
+            }
           }
 
           if (i < subjectQuestions.length - 1) {
-            await sleep(1800);
+            await sleep(1400);
           }
         }
 
         setTelegramStatus({
           text: tgCancelRef.current
-            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(successCount)}/${toKhmerNum(subjectQuestions.length)} រូបភាព)`
-            : `បានផ្ញើកាតសំណួរជារូបភាពម្ដងមួយៗ ចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(subjectQuestions.length)} សំណួរ ទៅកាន់ Telegram ជោគជ័យ!`,
+            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} រូបភាព)`
+            : `បានផ្ញើកាតរូបភាពចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} ទៅកាន់ ${toKhmerNum(activeTargets.length)} គោលដៅរួចរាល់!`,
           success: successCount > 0,
         });
       } else if (tgSendMode === 'batch_cards') {
-        // Mode 1A (Default Text): Send Designed App Banner Image + Q&A Text with Hidden Spoiler Answer
+        // Mode 1A (Default Text): Send Designed App Banner Image + Q&A Text with Hidden Spoiler Answer across selected targets
+        const totalOps = subjectQuestions.length * activeTargets.length;
         setTgProgress({
           current: 0,
-          total: subjectQuestions.length,
+          total: totalOps,
           isRunning: true,
-          message: `កំពុងចាប់ផ្តើមផ្ញើរូបភាពកម្មវិធី + សំណួរ & ចម្លើយលាក់ ម្ដងមួយៗ ចំនួន ${toKhmerNum(subjectQuestions.length)} សំណួរ...`,
+          message: `កំពុងផ្ញើរូបភាពកម្មវិធី + សំណួរទៅ ${toKhmerNum(activeTargets.length)} គោលដៅ...`,
         });
 
         let successCount = 0;
+        let stepDone = 0;
         for (let i = 0; i < subjectQuestions.length; i++) {
           if (tgCancelRef.current) {
             addLog(`ផ្អាកការផ្ញើនៅសំណួរទី ${toKhmerNum(i + 1)}`, false);
@@ -1272,30 +1661,41 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           }
 
           const q = subjectQuestions[i];
-          setTgProgress({
-            current: i + 1,
-            total: subjectQuestions.length,
-            isRunning: true,
-            message: `កំពុងផ្ញើរូបភាពកម្មវិធី + សំណួរទី ${toKhmerNum(i + 1)} នៃ ${toKhmerNum(subjectQuestions.length)}...`,
-          });
+          const bannerBase64 = await renderAppBannerImage(q.subject, i + 1).catch(() => undefined);
 
-          try {
-            await sendTelegramQuestionTextWithBanner(tgBotToken.trim(), tgChatId.trim(), q, i + 1);
-            successCount++;
-            addLog(`សំណួរទី ${toKhmerNum(i + 1)} (${q.type}): ${q.question.slice(0, 35)}...`, true);
-          } catch (itemErr: any) {
-            addLog(`បរាជ័យសំណួរទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+          for (let tIdx = 0; tIdx < activeTargets.length; tIdx++) {
+            if (tgCancelRef.current) break;
+            const dest = activeTargets[tIdx];
+            stepDone++;
+            setTgProgress({
+              current: stepDone,
+              total: totalOps,
+              isRunning: true,
+              message: `សំណួរទី ${toKhmerNum(i + 1)}/${toKhmerNum(subjectQuestions.length)} → ${dest}...`,
+            });
+
+            try {
+              await sendTelegramQuestionTextWithBanner(tgBotToken.trim(), dest, q, i + 1, bannerBase64);
+              successCount++;
+              addLog(`[${dest}] សំណួរទី ${toKhmerNum(i + 1)}: ${q.question.slice(0, 30)}...`, true);
+            } catch (itemErr: any) {
+              addLog(`[${dest}] បរាជ័យសំណួរទី ${toKhmerNum(i + 1)}: ${itemErr.message}`, false);
+            }
+
+            if (tIdx < activeTargets.length - 1) {
+              await sleep(350);
+            }
           }
 
           if (i < subjectQuestions.length - 1) {
-            await sleep(1800);
+            await sleep(1400);
           }
         }
 
         setTelegramStatus({
           text: tgCancelRef.current
-            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(successCount)}/${toKhmerNum(subjectQuestions.length)} សំណួរ)`
-            : `បានផ្ញើសំណួរ & ចម្លើយជា Text ម្ដងមួយៗ ចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(subjectQuestions.length)} សំណួរ ទៅកាន់ Telegram ជោគជ័យ!`,
+            ? `បានផ្អាកការផ្ញើ (ផ្ញើបាន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} សារ)`
+            : `បានផ្ញើសំណួរ & ចម្លើយចំនួន ${toKhmerNum(successCount)}/${toKhmerNum(totalOps)} ទៅកាន់ ${toKhmerNum(activeTargets.length)} គោលដៅរួចរាល់!`,
           success: successCount > 0,
         });
       }
@@ -1307,11 +1707,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     }
   };
 
-  // Send Single Question One-by-One (Text Card, Poll, or Photo) and advance to next question
+  // Send Single Question One-by-One (Text Card, Poll, or Photo) to all active targets and advance
   const handleSendSingleQuestion = async (sendAs: 'card' | 'poll' | 'photo') => {
     const hasToken = Boolean(tgBotToken.trim() || commandBotStatus?.hasServerToken);
-    if (!hasToken || !tgChatId.trim()) {
-      setTelegramStatus({ text: 'សូមបញ្ចូល Telegram Bot Token និង Chat ID / Channel!', success: false });
+    const activeTargets = resolveActiveTelegramTargets();
+    if (!hasToken || activeTargets.length === 0) {
+      setTelegramStatus({
+        text: 'សូមបញ្ចូល Telegram Bot Token និងជ្រើសរើសគោលដៅ Telegram យ៉ាងតិច ១!',
+        success: false,
+      });
       return;
     }
 
@@ -1340,39 +1744,77 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     setTelegramStatus(null);
 
     try {
-      if (sendAs === 'poll') {
-        await sendTelegramPoll(tgBotToken.trim(), tgChatId.trim(), targetQ);
-      } else if (sendAs === 'photo') {
-        const photoBase64 = await renderQuestionCardImage(targetQ, targetIndex + 1, {
+      let photoBase64 = '';
+      let photoCaption = '';
+      let bannerBase64 = '';
+
+      if (sendAs === 'photo') {
+        photoBase64 = await renderQuestionCardImage(targetQ, targetIndex + 1, {
           showAnswer: tgPhotoShowAnswer,
         });
-        const caption = formatPhotoCaption(targetQ, targetIndex + 1, tgPhotoShowAnswer);
-        await sendTelegramPhoto(tgBotToken.trim(), tgChatId.trim(), photoBase64, caption, 'HTML');
-      } else {
-        await sendTelegramQuestionTextWithBanner(
-          tgBotToken.trim(),
-          tgChatId.trim(),
-          targetQ,
-          targetIndex + 1
-        );
+        photoCaption = formatPhotoCaption(targetQ, targetIndex + 1, tgPhotoShowAnswer);
+      } else if (sendAs === 'card') {
+        bannerBase64 = await renderAppBannerImage(targetQ.subject, targetIndex + 1);
       }
 
-      if (targetQ.id) {
-        setTgSentIds((prev) => (prev.includes(targetQ.id!) ? prev : [...prev, targetQ.id!]));
+      const succeededTargets: string[] = [];
+      const failedTargets: Array<{ dest: string; error: string }> = [];
+
+      for (let tIdx = 0; tIdx < activeTargets.length; tIdx++) {
+        const dest = activeTargets[tIdx];
+        try {
+          if (sendAs === 'poll') {
+            await sendTelegramPoll(tgBotToken.trim(), dest, targetQ);
+          } else if (sendAs === 'photo') {
+            await sendTelegramPhoto(tgBotToken.trim(), dest, photoBase64, photoCaption, 'HTML');
+          } else {
+            await sendTelegramQuestionTextWithBanner(
+              tgBotToken.trim(),
+              dest,
+              targetQ,
+              targetIndex + 1,
+              bannerBase64
+            );
+          }
+          succeededTargets.push(dest);
+        } catch (err: any) {
+          failedTargets.push({ dest, error: err?.message || 'បរាជ័យ' });
+        }
+
+        if (tIdx < activeTargets.length - 1) {
+          await sleep(300);
+        }
       }
 
-      const nextQ = subjectPool[targetIndex + 1];
-      if (nextQ?.id) {
-        setTgSelectedQuestionId(nextQ.id);
+      if (succeededTargets.length > 0) {
+        if (targetQ.id) {
+          setTgSentIds((prev) => (prev.includes(targetQ.id!) ? prev : [...prev, targetQ.id!]));
+        }
+        const nextQ = subjectPool[targetIndex + 1];
+        if (nextQ?.id) {
+          setTgSelectedQuestionId(nextQ.id);
+        }
       }
 
       const modeLabel = sendAs === 'poll' ? 'ជា Poll' : sendAs === 'photo' ? 'ជារូបភាព' : 'ជា Text';
-      setTelegramStatus({
-        text: nextQ
-          ? `បានផ្ញើសំណួរទី ${toKhmerNum(targetIndex + 1)} (${modeLabel}) ទៅ Telegram ជោគជ័យ! រួចរាល់សម្រាប់ផ្ញើសំណួរទី ${toKhmerNum(targetIndex + 2)} បន្ត។`
-          : `បានផ្ញើសំណួរទី ${toKhmerNum(targetIndex + 1)} (${modeLabel}) ទៅ Telegram ជោគជ័យ! (ដល់សំណួរចុងក្រោយហើយ)`,
-        success: true,
-      });
+      if (failedTargets.length === 0) {
+        setTelegramStatus({
+          text: `បានផ្ញើសំណួរទី ${toKhmerNum(targetIndex + 1)} (${modeLabel}) ទៅ ${toKhmerNum(succeededTargets.length)}/${toKhmerNum(activeTargets.length)} គោលដៅ (${succeededTargets.join(', ')}) ជោគជ័យ!`,
+          success: true,
+        });
+      } else if (succeededTargets.length > 0) {
+        const failSummary = failedTargets.map((f) => `${f.dest}: ${f.error}`).join(' | ');
+        setTelegramStatus({
+          text: `ផ្ញើជោគជ័យ ${toKhmerNum(succeededTargets.length)}/${toKhmerNum(activeTargets.length)} គោលដៅ (${succeededTargets.join(', ')}) · មានគោលដៅមិនជោគជ័យ៖ ${failSummary}`,
+          success: true,
+        });
+      } else {
+        const failSummary = failedTargets.map((f) => `${f.dest}: ${f.error}`).join(' | ');
+        setTelegramStatus({
+          text: `បរាជ័យក្នុងការផ្ញើទៅ Telegram៖ ${failSummary}`,
+          success: false,
+        });
+      }
     } catch (err: any) {
       setTelegramStatus({ text: err.message || 'បរាជ័យក្នុងការផ្ញើទៅ Telegram', success: false });
     } finally {
@@ -1426,6 +1868,36 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       setIsExportingPDF(false);
       setPdfProgress(null);
     }
+  };
+
+  // Download Export JSON from Export Tab
+  const handleExportJSON = (scope: 'filtered' | 'all') => {
+    const targetQuestions = scope === 'all' ? questions : selectedExportQuestions;
+    const titleLabel =
+      scope === 'all' || resolvedExportSubjectName === '__ALL__'
+        ? 'គ្រប់មុខវិជ្ជាទាំងអស់'
+        : resolvedExportSubjectName;
+
+    if (targetQuestions.length === 0) {
+      setExportStatusMsg({
+        text: 'មិនមានសំណួរនៅក្នុងជម្រើសនេះសម្រាប់ទាញយកជា JSON ទេ!',
+        success: false,
+      });
+      return;
+    }
+
+    const payload = buildExportJsonPayload(targetQuestions, subjects, {
+      subjectLabel: scope === 'all' ? '__ALL__' : resolvedExportSubjectName,
+    });
+    const filename =
+      scope === 'all' || resolvedExportSubjectName === '__ALL__'
+        ? 'Master_Quiz_KH_All_Questions.json'
+        : `${resolvedExportSubjectName}_MasterQuiz.json`;
+    downloadJsonFile(payload, filename);
+    setExportStatusMsg({
+      text: `បានទាញយកឯកសារ JSON («${titleLabel}» — ${toKhmerNum(targetQuestions.length)} សំណួរ) ជោគជ័យ!`,
+      success: true,
+    });
   };
 
   const [broadcastStatusMsg, setBroadcastStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
@@ -1583,9 +2055,9 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 mb-6 sm:mb-8 app-subcard p-1.5 rounded-2xl">
         {[
           { id: 'single', label: 'បញ្ចូលសំណួរទោល', icon: PlusCircle },
-          { id: 'bulk_ai', label: 'បញ្ចូលសំណួរជាដុំ', icon: FileSpreadsheet },
+          { id: 'bulk_ai', label: 'បញ្ចូលជាដុំ / JSON', icon: FileSpreadsheet },
           { id: 'manage', label: 'គ្រប់គ្រងមុខវិជ្ជា/សំណួរ', icon: Settings },
-          { id: 'export', label: 'Export វិញ្ញាសា (PDF)', icon: Download },
+          { id: 'export', label: 'Export (PDF / JSON)', icon: Download },
           { id: 'telegram', label: 'Telegram Bot', icon: Send },
           { id: 'monitoring', label: 'ដំណឹង & វត្តមាន', icon: Bell },
         ].map((tab) => {
@@ -1771,21 +2243,62 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         </div>
       )}
 
-      {/* 2. BULK IMPORT */}
+      {/* 2. BULK IMPORT (TEXT & EXPORT JSON) */}
       {activeSubTab === 'bulk_ai' && (
         <div className="space-y-8 max-w-4xl mx-auto">
           <div className="app-card rounded-2xl p-6 sm:p-8 shadow-sm">
-            <div className="flex items-center gap-3 mb-5">
-              <div className="w-10 h-10 rounded-xl bg-amber-600 text-white flex items-center justify-center shrink-0">
-                <FileSpreadsheet className="w-5 h-5" />
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-600 text-white flex items-center justify-center shrink-0">
+                  {bulkInputMode === 'json' ? (
+                    <FileJson className="w-5 h-5" />
+                  ) : (
+                    <FileSpreadsheet className="w-5 h-5" />
+                  )}
+                </div>
+                <div>
+                  <h2 className="font-moul text-base sm:text-lg app-text-primary">
+                    បញ្ចូលសំណួរ-ចម្លើយជាដុំ (Bulk & Export JSON)
+                  </h2>
+                  <p className="text-sm app-text-secondary">
+                    {bulkInputMode === 'json'
+                      ? 'ផ្ទុកឯកសារ .json ឬបិទភ្ជាប់ទម្រង់ Export JSON ដើម្បីនាំចូល និង Export ទិន្នន័យយ៉ាងរហ័ស'
+                      : 'ចម្លង និងបិទភ្ជាប់សំណួរចម្លើយច្រើនក្នុងពេលតែមួយ និងចាត់ចែងចូលមុខវិជ្ជាជាក់លាក់'}
+                  </p>
+                </div>
               </div>
-              <div>
-                <h2 className="font-moul text-base sm:text-lg app-text-primary">
-                  បញ្ចូលសំណួរ-ចម្លើយជាដុំ (Bulk Import)
-                </h2>
-                <p className="text-sm app-text-secondary">
-                  ចម្លង និងបិទភ្ជាប់សំណួរចម្លើយច្រើនក្នុងពេលតែមួយ និងចាត់ចែងចូលមុខវិជ្ជាជាក់លាក់
-                </p>
+
+              <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl app-subcard shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBulkInputMode('text');
+                    setBulkStatusMsg(null);
+                  }}
+                  className={`px-3 py-2 rounded-lg text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    bulkInputMode === 'text'
+                      ? 'bg-amber-600 text-white shadow-sm'
+                      : 'app-text-secondary hover:opacity-85'
+                  }`}
+                >
+                  <FileText className="w-4 h-4 shrink-0" />
+                  <span>ទម្រង់អត្ថបទ</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBulkInputMode('json');
+                    setBulkStatusMsg(null);
+                  }}
+                  className={`px-3 py-2 rounded-lg text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    bulkInputMode === 'json'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'app-text-secondary hover:opacity-85'
+                  }`}
+                >
+                  <FileJson className="w-4 h-4 shrink-0" />
+                  <span>ទម្រង់ JSON</span>
+                </button>
               </div>
             </div>
 
@@ -1826,6 +2339,24 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                   * បើបំពេញប្រអប់នេះ សំណួរទាំងអស់នឹងត្រូវចាត់ចូលមុខវិជ្ជានេះដោយស្វ័យប្រវត្តិ។
                 </p>
               </div>
+
+              {bulkInputMode === 'json' && (
+                <div className="sm:col-span-2 pt-2 border-t app-border flex items-start gap-2.5">
+                  <input
+                    id="json-override-subject-toggle"
+                    type="checkbox"
+                    checked={jsonOverrideSubject}
+                    onChange={(e) => setJsonOverrideSubject(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded accent-blue-600 cursor-pointer shrink-0"
+                  />
+                  <label htmlFor="json-override-subject-toggle" className="text-xs sm:text-sm app-text-primary cursor-pointer">
+                    <span className="font-semibold">កំណត់មុខវិជ្ជាដែលជ្រើសរើសខាងលើសម្រាប់គ្រប់សំណួរក្នុង JSON</span>
+                    <span className="block text-xs app-text-secondary mt-0.5">
+                      ប្រសិនបើមិនធីកទេ កម្មវិធីនឹងប្រើឈ្មោះមុខវិជ្ជា ("subject") ដែលមានស្រាប់ក្នុង JSON និងបង្កើតមុខវិជ្ជាថ្មីដោយស្វ័យប្រវត្តិ (សមស្របសម្រាប់ទាញយក Export JSON ចូលវិញ)។
+                    </span>
+                  </label>
+                </div>
+              )}
             </div>
 
             <div className="mb-4">
@@ -1855,13 +2386,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 mb-3">
-              <span className="text-xs sm:text-sm font-semibold app-text-secondary">ទម្រង់គំរូរហ័ស៖</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setBulkImportType('mcq');
-                  setBulkText(`១. តើព្រះរាជាណាចក្រកម្ពុជាប្រកាន់យករបបដឹកនាំរដ្ឋបែបណា?
+            {bulkInputMode === 'text' ? (
+              <>
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <span className="text-xs sm:text-sm font-semibold app-text-secondary">ទម្រង់គំរូរហ័ស៖</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBulkImportType('mcq');
+                      setBulkText(`១. តើព្រះរាជាណាចក្រកម្ពុជាប្រកាន់យករបបដឹកនាំរដ្ឋបែបណា?
 ក. របបរាជានិយមអាស្រ័យរដ្ឋធម្មនុញ្ញ (ចម្លើយត្រឹមត្រូវ)
 ខ. របបសាធារណរដ្ឋ
 គ. របបប្រជាធិបតេយ្យសេរីពហុបក្ស
@@ -1874,58 +2407,58 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 គ. ៥ ឆ្នាំ (ចម្លើយត្រឹមត្រូវ)
 ឃ. ៦ ឆ្នាំ
 សម្គាល់ ៖ មាត្រា ៧៨ នៃរដ្ឋធម្មនុញ្ញ។`);
-                }}
-                className="px-3 py-1.5 rounded-lg app-subcard text-blue-700 dark:text-amber-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
-              >
-                + គំរូ QCM
-              </button>
+                    }}
+                    className="px-3 py-1.5 rounded-lg app-subcard text-blue-700 dark:text-amber-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
+                  >
+                    + គំរូ QCM
+                  </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setBulkImportType('short');
-                  setBulkText(`១. តើរដ្ឋធម្មនុញ្ញជាអ្វី?
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBulkImportType('short');
+                      setBulkText(`១. តើរដ្ឋធម្មនុញ្ញជាអ្វី?
 ចម្លើយ ៖ រដ្ឋធម្មនុញ្ញគឺជាច្បាប់កំពូលនៃព្រះរាជាណាចក្រកម្ពុជា។ ច្បាប់ និងសេចក្តីសម្រេចទាំងឡាយនៃស្ថាប័ននានារបស់រដ្ឋ ត្រូវតែស្របទៅនឹងរដ្ឋធម្មនុញ្ញជាដាច់ខាត។
 
 ២. តើស្ថាប័នកំពូលនៃអំណាចតុលាការនៅកម្ពុជាជាស្ថាប័នណា?
 ចម្លើយ ៖ ឧត្តមក្រុមប្រឹក្សានៃអង្គចៅក្រម និងតុលាការកំពូល។`);
-                }}
-                className="px-3 py-1.5 rounded-lg app-subcard text-emerald-700 dark:text-emerald-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
-              >
-                + គំរូ Q & A
-              </button>
+                    }}
+                    className="px-3 py-1.5 rounded-lg app-subcard text-emerald-700 dark:text-emerald-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
+                  >
+                    + គំរូ Q & A
+                  </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setBulkImportType('explanation');
-                  setBulkText(`១. នីតិរដ្ឋ
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBulkImportType('explanation');
+                      setBulkText(`១. នីតិរដ្ឋ
 ចម្លើយ ៖ រដ្ឋដែលគ្រប់គ្រងដោយគោរពតាមគោលការណ៍ច្បាប់ ដោយគ្មានបុគ្គលណាម្នាក់នៅពីលើច្បាប់ឡើយ។
 
 ២. អធិបតេយ្យភាព
 ចម្លើយ ៖ អំណាចកំពូល និងឯករាជ្យពេញលេញរបស់រដ្ឋក្នុងការសម្រេចកិច្ចការផ្ទៃក្នុង និងកិច្ចការក្រៅប្រទេស។`);
-                }}
-                className="px-3 py-1.5 rounded-lg app-subcard text-purple-700 dark:text-purple-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
-              >
-                + គំរូពន្យល់ពាក្យ
-              </button>
+                    }}
+                    className="px-3 py-1.5 rounded-lg app-subcard text-purple-700 dark:text-purple-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
+                  >
+                    + គំរូពន្យល់ពាក្យ
+                  </button>
 
-              {bulkText && (
-                <button
-                  type="button"
-                  onClick={() => setBulkText('')}
-                  className="px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 text-xs font-semibold border border-red-300 dark:border-red-700 transition ml-auto cursor-pointer"
-                >
-                  សម្អាត (Clear)
-                </button>
-              )}
-            </div>
+                  {bulkText && (
+                    <button
+                      type="button"
+                      onClick={() => setBulkText('')}
+                      className="px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 text-xs font-semibold border border-red-300 dark:border-red-700 transition ml-auto cursor-pointer"
+                    >
+                      សម្អាត (Clear)
+                    </button>
+                  )}
+                </div>
 
-            <textarea
-              rows={9}
-              value={bulkText}
-              onChange={(e) => setBulkText(e.target.value)}
-              placeholder={`បិទភ្ជាប់អត្ថបទសំណួររបស់អ្នកនៅទីនេះ...
+                <textarea
+                  rows={9}
+                  value={bulkText}
+                  onChange={(e) => setBulkText(e.target.value)}
+                  placeholder={`បិទភ្ជាប់អត្ថបទសំណួររបស់អ្នកនៅទីនេះ...
 ឧទាហរណ៍ MCQ៖
 ១. សំណួរ...
 ក. ជម្រើសក
@@ -1933,46 +2466,161 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 គ. ជម្រើសគ
 ឃ. ជម្រើសឃ
 ចម្លើយ ៖ ខ`}
-              className="w-full px-3.5 py-2.5 rounded-xl app-input text-sm font-mono mb-4"
-            />
-
-            <button
-              type="button"
-              onClick={handleParseBulkText}
-              className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm sm:text-base flex items-center justify-center gap-2 transition cursor-pointer"
-            >
-              <span>ពិនិត្យ និងបំប្លែងទិន្នន័យ (Parse Preview)</span>
-            </button>
-          </div>
-
-          {generatedPreview.length > 0 && (
-            <div className="app-card rounded-2xl p-6 sm:p-8 shadow-sm">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 pb-4 border-b app-border">
-                <div>
-                  <h3 className="font-moul text-base text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
-                    <CheckCircle2 className="w-5 h-5" />
-                    <span>សំណួរដែលបានរៀបចំរួចរាល់ ({toKhmerNum(generatedPreview.length)})</span>
-                  </h3>
-                  <p className="text-sm app-text-secondary mt-1">
-                    មុខវិជ្ជាគោលដៅ៖{' '}
-                    <strong className="app-text-primary">
-                      {newBulkSubjectName.trim() || bulkSubject || 'មិនទាន់កំណត់'}
-                    </strong>
-                    {!subjects.some(
-                      (s) => s.name.toLowerCase() === (newBulkSubjectName.trim() || bulkSubject).toLowerCase()
-                    ) && ' (នឹងបង្កើតមុខវិជ្ជាថ្មីដោយស្វ័យប្រវត្តិ)'}
-                  </p>
-                </div>
+                  className="w-full px-3.5 py-2.5 rounded-xl app-input text-sm font-mono mb-4"
+                />
 
                 <button
                   type="button"
-                  onClick={handleSaveGeneratedQuestions}
-                  className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer"
+                  onClick={handleParseBulkText}
+                  className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm sm:text-base flex items-center justify-center gap-2 transition cursor-pointer"
                 >
-                  <Check className="w-4 h-4" />
-                  <span>រក្សាទុកទាំងអស់ទៅក្នុង Database</span>
+                  <span>ពិនិត្យ និងបំប្លែងទិន្នន័យ (Parse Preview)</span>
                 </button>
-              </div>
+              </>
+            ) : (
+              <>
+                <input
+                  ref={jsonFileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  onChange={handleJsonFileUpload}
+                  className="hidden"
+                />
+
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <button
+                    type="button"
+                    onClick={() => jsonFileInputRef.current?.click()}
+                    className="px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Upload className="w-3.5 h-3.5 shrink-0" />
+                    <span>ផ្ទុកឯកសារ .json</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBulkImportType('auto');
+                      setBulkJsonText(SAMPLE_EXPORT_JSON_STRING);
+                      setBulkStatusMsg(null);
+                    }}
+                    className="px-3 py-2 rounded-lg app-subcard text-blue-700 dark:text-amber-300 text-xs font-semibold hover:opacity-85 transition cursor-pointer"
+                  >
+                    + គំរូ Export JSON
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleExportJsonFromBulk('selected')}
+                    className="px-3 py-2 rounded-lg app-subcard text-emerald-700 dark:text-emerald-300 text-xs font-semibold flex items-center gap-1.5 hover:opacity-85 transition cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5 shrink-0" />
+                    <span>Export JSON (មុខវិជ្ជានេះ)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleExportJsonFromBulk('all')}
+                    className="px-3 py-2 rounded-lg app-subcard text-purple-700 dark:text-purple-300 text-xs font-semibold flex items-center gap-1.5 hover:opacity-85 transition cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5 shrink-0" />
+                    <span>Export JSON ទាំងអស់</span>
+                  </button>
+
+                  {bulkJsonText && (
+                    <button
+                      type="button"
+                      onClick={() => setBulkJsonText('')}
+                      className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 text-xs font-semibold border border-red-300 dark:border-red-700 transition ml-auto cursor-pointer"
+                    >
+                      សម្អាត (Clear)
+                    </button>
+                  )}
+                </div>
+
+                <textarea
+                  rows={11}
+                  value={bulkJsonText}
+                  onChange={(e) => setBulkJsonText(e.target.value)}
+                  placeholder={`បិទភ្ជាប់ទម្រង់ Export JSON នៅទីនេះ ឬចុច "ផ្ទុកឯកសារ .json" ខាងលើ...
+{
+  "questions": [
+    {
+      "subject": "ចំណេះដឹងទូទៅ",
+      "type": "mcq",
+      "question": "តើរដ្ឋសភាកម្ពុជាមានអាណត្តិប៉ុន្មានឆ្នាំ?",
+      "options": ["ក. ៣ ឆ្នាំ", "ខ. ៤ ឆ្នាំ", "គ. ៥ ឆ្នាំ", "ឃ. ៦ ឆ្នាំ"],
+      "correct": 2,
+      "answer": "យោង ៖ មាត្រា ៧៨ នៃរដ្ឋធម្មនុញ្ញ"
+    }
+  ]
+}`}
+                  className="w-full px-3.5 py-2.5 rounded-xl app-input text-xs sm:text-sm font-mono mb-4"
+                />
+
+                <button
+                  type="button"
+                  onClick={() => handleParseJsonImport()}
+                  className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm sm:text-base flex items-center justify-center gap-2 transition cursor-pointer"
+                >
+                  <FileJson className="w-4 h-4" />
+                  <span>ពិនិត្យ និងបំប្លែងទិន្នន័យ JSON (Parse JSON Preview)</span>
+                </button>
+              </>
+            )}
+          </div>
+
+          {generatedPreview.length > 0 && (() => {
+            const previewSubjects = Array.from(
+              new Set(
+                generatedPreview.map(
+                  (q) =>
+                    (q.subject || newBulkSubjectName.trim() || bulkSubject || 'មិនទាន់កំណត់').trim()
+                )
+              )
+            );
+            const missingSubjectsCount = previewSubjects.filter(
+              (subName) => !subjects.some((s) => s.name.trim().toLowerCase() === subName.toLowerCase())
+            ).length;
+
+            return (
+              <div className="app-card rounded-2xl p-6 sm:p-8 shadow-sm">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 pb-4 border-b app-border">
+                  <div>
+                    <h3 className="font-moul text-base text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
+                      <CheckCircle2 className="w-5 h-5" />
+                      <span>សំណួរដែលបានរៀបចំរួចរាល់ ({toKhmerNum(generatedPreview.length)})</span>
+                    </h3>
+                    <p className="text-sm app-text-secondary mt-1">
+                      មុខវិជ្ជាគោលដៅ៖{' '}
+                      <strong className="app-text-primary">
+                        {previewSubjects.length === 1
+                          ? previewSubjects[0]
+                          : `${toKhmerNum(previewSubjects.length)} មុខវិជ្ជា (${previewSubjects.slice(0, 3).join(', ')}${previewSubjects.length > 3 ? '...' : ''})`}
+                      </strong>
+                      {missingSubjectsCount > 0 &&
+                        ` (នឹងបង្កើតមុខវិជ្ជាថ្មី ${toKhmerNum(missingSubjectsCount)} ដោយស្វ័យប្រវត្តិ)`}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={isSavingBulkQuestions}
+                    onClick={handleSaveGeneratedQuestions}
+                    className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer disabled:cursor-not-allowed shrink-0"
+                  >
+                    {isSavingBulkQuestions ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Check className="w-4 h-4" />
+                    )}
+                    <span>
+                      {isSavingBulkQuestions
+                        ? 'កំពុងរក្សាទុក...'
+                        : 'រក្សាទុកទាំងអស់ទៅក្នុង Database'}
+                    </span>
+                  </button>
+                </div>
 
               <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
                 {generatedPreview.map((q, idx) => (
@@ -2033,8 +2681,9 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                   </div>
                 ))}
               </div>
-            </div>
-          )}
+              </div>
+            );
+          })()}
 
           {bulkStatusMsg && (
             <div
@@ -2139,6 +2788,81 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               គ្រប់គ្រងមុខវិជ្ជា (Subjects Management)
             </h2>
 
+            {subjects.length > 1 && (
+              <div className="p-4 rounded-xl app-subcard mb-5 flex flex-col gap-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <span className="font-bold app-text-primary flex items-center gap-1.5">
+                    <ArrowUpDown className="w-4 h-4 text-blue-600 dark:text-amber-400" />
+                    <span>ផ្លាស់ប្ដូរទីតាំងមុខវិជ្ជា៖</span>
+                  </span>
+                  <select
+                    value={subjectSwapFrom}
+                    onChange={(e) => setSubjectSwapFrom(Number(e.target.value))}
+                    className="px-3 py-1.5 rounded-lg app-input text-sm font-semibold max-w-[240px]"
+                    aria-label="ជ្រើសរើសមុខវិជ្ជាដើម"
+                  >
+                    {subjects.map((s, i) => (
+                      <option key={s.id} value={i + 1}>
+                        {toKhmerNum(i + 1)}. {s.name}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="app-text-secondary">ទៅទីតាំង</span>
+                  <select
+                    value={subjectSwapTo}
+                    onChange={(e) => setSubjectSwapTo(Number(e.target.value))}
+                    className="px-3 py-1.5 rounded-lg app-input text-sm font-semibold"
+                    aria-label="ជ្រើសរើសលេខរៀងថ្មី"
+                  >
+                    {subjects.map((s, i) => (
+                      <option key={s.id} value={i + 1}>
+                        លេខ {toKhmerNum(i + 1)} ({s.name})
+                      </option>
+                    ))}
+                  </select>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isReorderingSubjects || subjectSwapFrom === subjectSwapTo}
+                      onClick={handleMoveSubjectByToolbar}
+                      className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold transition cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      រំកិលទៅលេខនេះ
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isReorderingSubjects || subjectSwapFrom === subjectSwapTo}
+                      onClick={handleSwapSubjectsByToolbar}
+                      className="px-3.5 py-1.5 rounded-xl app-card hover:opacity-85 disabled:opacity-50 app-text-primary border app-border font-bold transition cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      ដោះដូរគ្នា (Swap)
+                    </button>
+                  </div>
+                </div>
+
+                <p className="text-xs app-text-secondary">
+                  គន្លឹះ៖ អ្នកអាចចុចប៊ូតុង ↑ / ↓ នៅខាងស្ដាំ ឬអូសទម្លាក់ (Drag & Drop) ជួរមុខវិជ្ជាដោយផ្ទាល់ដើម្បីរៀបចំលំដាប់។
+                </p>
+
+                {subjectOrderStatusMsg && (
+                  <div
+                    className={`w-full p-3 rounded-xl text-sm flex items-center gap-2 border ${
+                      subjectOrderStatusMsg.success
+                        ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 dark:border-emerald-700 text-emerald-900 dark:text-emerald-200'
+                        : 'bg-red-50 dark:bg-red-950/60 border-red-400 dark:border-red-700 text-red-900 dark:text-red-200'
+                    }`}
+                  >
+                    {subjectOrderStatusMsg.success ? (
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                    )}
+                    <span>{subjectOrderStatusMsg.text}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
                 <thead>
@@ -2161,10 +2885,52 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                   ) : (
                     subjects.map((sub, idx) => {
                       const count = questions.filter((q) => q.subject === sub.name).length;
+                      const isDragging = draggedSubjectIndex === idx;
+                      const isDragOver = dragOverSubjectIndex === idx && draggedSubjectIndex !== idx;
                       return (
-                        <tr key={sub.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition">
-                          <td className="py-3 px-3 font-moul text-blue-700 dark:text-amber-300 tabular-nums">
-                            {toKhmerNum(idx + 1)}
+                        <tr
+                          key={sub.id}
+                          draggable={subjects.length > 1 && !isReorderingSubjects}
+                          onDragStart={(e) => {
+                            setDraggedSubjectIndex(idx);
+                            e.dataTransfer.effectAllowed = 'move';
+                            e.dataTransfer.setData('text/plain', sub.id);
+                          }}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            if (dragOverSubjectIndex !== idx) {
+                              setDragOverSubjectIndex(idx);
+                            }
+                          }}
+                          onDragLeave={() => {
+                            if (dragOverSubjectIndex === idx) {
+                              setDragOverSubjectIndex(null);
+                            }
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            void handleSubjectDrop(idx);
+                          }}
+                          onDragEnd={() => {
+                            setDraggedSubjectIndex(null);
+                            setDragOverSubjectIndex(null);
+                          }}
+                          className={`hover:bg-slate-50 dark:hover:bg-slate-800/40 transition ${
+                            isDragging ? 'opacity-50' : ''
+                          } ${
+                            isDragOver ? 'bg-blue-50/80 dark:bg-blue-950/40 ring-2 ring-inset ring-blue-500/60' : ''
+                          }`}
+                        >
+                          <td className="py-3 px-3 font-moul text-blue-700 dark:text-amber-300 tabular-nums whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1.5">
+                              {subjects.length > 1 && (
+                                <GripVertical
+                                  className="w-4 h-4 app-text-muted cursor-grab active:cursor-grabbing shrink-0 hidden sm:inline-block"
+                                  aria-hidden="true"
+                                />
+                              )}
+                              <span>{toKhmerNum(idx + 1)}</span>
+                            </div>
                           </td>
                           <td className="py-3 px-3 font-semibold app-text-primary">{sub.name}</td>
                           <td className="py-3 px-3 text-xs font-bold app-text-secondary whitespace-nowrap">
@@ -2186,10 +2952,34 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                           </td>
                           <td className="py-3 px-3 text-right whitespace-nowrap">
                             <div className="inline-flex items-center gap-1.5">
+                              {subjects.length > 1 && (
+                                <>
+                                  <button
+                                    type="button"
+                                    disabled={idx === 0 || isReorderingSubjects}
+                                    onClick={() => void handleMoveSubjectStep(idx, idx - 1)}
+                                    className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center rounded-lg app-subcard app-text-primary hover:opacity-80 disabled:opacity-35 cursor-pointer disabled:cursor-not-allowed"
+                                    title="រំកិលមុខវិជ្ជាឡើងលើ"
+                                    aria-label={`រំកិល ${sub.name} ឡើងលើ`}
+                                  >
+                                    <ArrowUp className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={idx === subjects.length - 1 || isReorderingSubjects}
+                                    onClick={() => void handleMoveSubjectStep(idx, idx + 1)}
+                                    className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center rounded-lg app-subcard app-text-primary hover:opacity-80 disabled:opacity-35 cursor-pointer disabled:cursor-not-allowed"
+                                    title="រំកិលមុខវិជ្ជាចុះក្រោម"
+                                    aria-label={`រំកិល ${sub.name} ចុះក្រោម`}
+                                  >
+                                    <ArrowDown className="w-4 h-4" />
+                                  </button>
+                                </>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => handleOpenEditSubjectModal(sub)}
-                                className="p-2 rounded-lg app-subcard app-text-primary hover:opacity-80 cursor-pointer"
+                                className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center rounded-lg app-subcard app-text-primary hover:opacity-80 cursor-pointer"
                                 title="កែប្រែមេរៀន/មុខវិជ្ជា"
                               >
                                 <Edit2 className="w-4 h-4" />
@@ -2197,7 +2987,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handleDeleteSubjectClick(sub)}
-                                className="p-2 rounded-lg bg-red-50 dark:bg-red-950/60 hover:opacity-80 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-800 transition cursor-pointer"
+                                className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center rounded-lg bg-red-50 dark:bg-red-950/60 hover:opacity-80 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-800 transition cursor-pointer"
                                 title="លុបមុខវិជ្ជា និងសំណួរទាំងអស់"
                               >
                                 <Trash2 className="w-4 h-4" />
@@ -2410,10 +3200,10 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b app-border">
                 <div>
                   <h2 className="font-moul text-base sm:text-lg app-text-primary mb-1">
-                    ទាញយកវិញ្ញាសាជាឯកសារ PDF A4
+                    ទាញយកវិញ្ញាសាជា PDF A4 ឬ JSON
                   </h2>
                   <p className="text-sm app-text-secondary">
-                    ជ្រើសរើសម៉ូតឯកសារ ពុម្ពអក្សរខ្មែរ និងកំណត់ក្បាលទំព័រ (Header) / បាតទំព័រ (Footer) តាមតម្រូវការ
+                    ជ្រើសរើសម៉ូតឯកសារ ពុម្ពអក្សរខ្មែរ កំណត់ក្បាលទំព័រ (Header) / បាតទំព័រ (Footer) ឬ Export ជាឯកសារ JSON
                   </p>
                 </div>
 
@@ -3031,25 +3821,49 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handleExportPDF}
-                disabled={isExportingPDF || exportQuestionsList.length === 0}
-                className="w-full py-3.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm sm:text-base flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-              >
-                {isExportingPDF ? (
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Download className="w-4 h-4" />
-                )}
-                <span>
-                  {isExportingPDF
-                    ? pdfProgress
-                      ? `កំពុងបង្កើត PDF ទំព័រ ${toKhmerNum(pdfProgress.current)}/${toKhmerNum(pdfProgress.total)}...`
-                      : 'កំពុងរៀបចំឯកសារ PDF...'
-                    : `ទាញយកវិញ្ញាសាជា PDF (A4) · ${toKhmerNum(exportQuestionsList.length)} សំណួរ`}
-                </span>
-              </button>
+              <div className="space-y-3">
+                <button
+                  type="button"
+                  onClick={handleExportPDF}
+                  disabled={isExportingPDF || exportQuestionsList.length === 0}
+                  className="w-full py-3.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm sm:text-base flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  {isExportingPDF ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  <span>
+                    {isExportingPDF
+                      ? pdfProgress
+                        ? `កំពុងបង្កើត PDF ទំព័រ ${toKhmerNum(pdfProgress.current)}/${toKhmerNum(pdfProgress.total)}...`
+                        : 'កំពុងរៀបចំឯកសារ PDF...'
+                      : `ទាញយកវិញ្ញាសាជា PDF (A4) · ${toKhmerNum(exportQuestionsList.length)} សំណួរ`}
+                  </span>
+                </button>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleExportJSON('filtered')}
+                    disabled={exportQuestionsList.length === 0}
+                    className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    <FileJson className="w-4 h-4 shrink-0" />
+                    <span>Export JSON (តាមជម្រើស · {toKhmerNum(exportQuestionsList.length)} សំណួរ)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleExportJSON('all')}
+                    disabled={questions.length === 0}
+                    className="w-full py-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    <Download className="w-4 h-4 shrink-0" />
+                    <span>Export JSON ទាំងអស់ ({toKhmerNum(questions.length)} សំណួរ)</span>
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* Live Printable Preview Container */}
@@ -3699,7 +4513,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
               <div>
                 <label className="block text-sm font-semibold app-text-primary mb-1.5">
-                  Chat ID ឬ Channel Username *
+                  Chat ID ឬ Channel(s) *
                 </label>
                 <input
                   type="text"
@@ -3709,12 +4523,110 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                     setTgChatId(val);
                     localStorage.setItem('master_quiz_tg_chat', val.trim());
                   }}
-                  placeholder="ឧ. @qcm_and_q_a ឬ -100123456789"
+                  placeholder="ឧ. @master_quiz_kh_Channel, 700259660"
                   className="w-full px-3.5 py-2.5 rounded-xl app-input text-sm font-mono"
                 />
                 <p className="text-xs app-text-secondary mt-1.5">
-                  Channel ត្រូវតែបន្ថែម Bot ធ្វើជា Administrator ជាមុនសិន
+                  អាចបញ្ចូលច្រើនគោលដៅ (ដកឃ្លា ឬក្បៀស) ឬបិទភ្ជាប់ Link https://t.me/... ដោយផ្ទាល់
                 </p>
+              </div>
+            </div>
+
+            {/* Preset & Custom Telegram Destinations Checklist */}
+            <div className="pt-3 border-t app-border space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs sm:text-sm font-bold app-text-primary">
+                  គោលដៅ Telegram ដែលត្រូវផ្ញើចេញ ({toKhmerNum(resolveActiveTelegramTargets().length)} បានជ្រើស)
+                </span>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => persistTgTargets(tgTargets.map((t) => ({ ...t, enabled: true })), true)}
+                    className="px-2.5 py-1 rounded-lg app-card text-xs font-semibold app-text-primary hover:opacity-80 cursor-pointer"
+                  >
+                    ជ្រើសទាំងអស់
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => persistTgTargets(tgTargets.map((t) => ({ ...t, enabled: false })), true)}
+                    className="px-2.5 py-1 rounded-lg app-card text-xs font-semibold app-text-secondary hover:opacity-80 cursor-pointer"
+                  >
+                    ដកទាំងអស់
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => persistTgTargets(DEFAULT_TELEGRAM_TARGETS, true)}
+                    className="px-2.5 py-1 rounded-lg app-card text-xs font-semibold khmer-accent-text hover:opacity-80 cursor-pointer"
+                  >
+                    ស្ដារលំនាំដើម (៤)
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {tgTargets.map((target) => (
+                  <div
+                    key={target.id}
+                    className={`px-3 py-2 rounded-xl border flex items-center justify-between gap-2 transition ${
+                      target.enabled
+                        ? 'app-card border-[var(--theme-accent)]'
+                        : 'app-card border-transparent opacity-65'
+                    }`}
+                  >
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none min-w-0 flex-1">
+                      <input
+                        type="checkbox"
+                        checked={target.enabled}
+                        onChange={() => handleToggleTgTarget(target.id)}
+                        disabled={isSendingTelegram}
+                        className="w-4 h-4 rounded accent-[var(--theme-accent)] shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="text-xs sm:text-sm font-mono font-bold app-text-primary truncate">
+                          {target.chatId}
+                        </div>
+                        {target.label && target.label !== target.chatId && (
+                          <div className="text-[11px] app-text-secondary truncate">
+                            {target.label}
+                          </div>
+                        )}
+                      </div>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveTgTarget(target.id)}
+                      disabled={isSendingTelegram}
+                      aria-label={`លុប ${target.chatId}`}
+                      className="w-7 h-7 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/50 text-stone-400 hover:text-red-600 flex items-center justify-center cursor-pointer shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  value={newTgTargetInput}
+                  onChange={(e) => setNewTgTargetInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleAddTgTarget();
+                    }
+                  }}
+                  placeholder="បន្ថែមគោលដៅថ្មី (ឧ. https://t.me/... ឬ -100... ឬ User ID)"
+                  className="flex-1 px-3 py-2 rounded-xl app-input text-xs sm:text-sm font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddTgTarget}
+                  disabled={!newTgTargetInput.trim() || isSendingTelegram}
+                  className="px-4 py-2 rounded-xl app-card text-xs sm:text-sm font-bold khmer-accent-text hover:opacity-85 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                >
+                  + បន្ថែមគោលដៅ
+                </button>
               </div>
             </div>
           </div>

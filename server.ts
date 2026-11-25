@@ -420,6 +420,21 @@ ${ogImageTags}
 </html>`);
 });
 
+function normalizeServerTelegramChatId(raw: unknown): string {
+  const trimmed = typeof raw === 'string' || typeof raw === 'number' ? String(raw).trim() : '';
+  if (!trimmed) return '';
+  const urlMatch = trimmed.match(
+    /^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/([A-Za-z0-9_]{3,})(?:[/?#].*)?$/i
+  );
+  if (urlMatch && urlMatch[1]) {
+    const slug = urlMatch[1];
+    if (!['joinchat', 'c', 's', 'addstickers', 'addtheme', 'proxy', 'socks'].includes(slug.toLowerCase())) {
+      return `@${slug}`;
+    }
+  }
+  return trimmed;
+}
+
 // Endpoint: Send Quiz Poll to Telegram Bot
 app.post('/api/telegram/send-poll', async (req, res) => {
   try {
@@ -434,12 +449,13 @@ app.post('/api/telegram/send-poll', async (req, res) => {
       is_anonymous,
     } = req.body;
     const resolvedToken = resolveServerBotToken(botToken);
-    if (!resolvedToken || !chatId || !question || !options) {
+    const cleanChatId = normalizeServerTelegramChatId(chatId);
+    if (!resolvedToken || !cleanChatId || !question || !options) {
       return res.status(400).json({ success: false, error: 'Missing required parameters' });
     }
 
     const payload: any = {
-      chat_id: chatId,
+      chat_id: cleanChatId,
       question: question.length > 300 ? question.slice(0, 297) + '...' : question,
       options: options.slice(0, 10).map((opt: string) => (opt.length > 100 ? opt.slice(0, 97) + '...' : opt)),
       type: 'quiz',
@@ -509,12 +525,13 @@ app.post('/api/telegram/send-message', async (req, res) => {
   try {
     const { botToken, chatId, text, parse_mode } = req.body;
     const resolvedToken = resolveServerBotToken(botToken);
-    if (!resolvedToken || !chatId || !text) {
+    const cleanChatId = normalizeServerTelegramChatId(chatId);
+    if (!resolvedToken || !cleanChatId || !text) {
       return res.status(400).json({ success: false, error: 'Missing required parameters (botToken, chatId, text)' });
     }
 
     const payload: any = {
-      chat_id: chatId,
+      chat_id: cleanChatId,
       text: text,
       disable_web_page_preview: true,
     };
@@ -562,7 +579,8 @@ app.post('/api/telegram/send-photo', async (req, res) => {
   try {
     const { botToken, chatId, photoBase64, caption, parse_mode, reply_markup } = req.body;
     const resolvedToken = resolveServerBotToken(botToken);
-    if (!resolvedToken || !chatId || !photoBase64) {
+    const cleanChatId = normalizeServerTelegramChatId(chatId);
+    if (!resolvedToken || !cleanChatId || !photoBase64) {
       return res.status(400).json({ success: false, error: 'Missing parameters' });
     }
 
@@ -587,7 +605,7 @@ app.post('/api/telegram/send-photo', async (req, res) => {
       const addFld = (name: string, value: string) => {
         chunks.push(Buffer.from(`--${b}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
       };
-      addFld('chat_id', chatId);
+      addFld('chat_id', cleanChatId);
       if (cap) {
         const finalCap = !mode && cap.length > 1024 ? cap.slice(0, 1020) + '...' : cap;
         addFld('caption', finalCap);
@@ -1012,33 +1030,8 @@ async function registerCommandsWithTelegram(botToken: string): Promise<boolean> 
     throw new Error(data.description || 'Failed to register Bot Commands');
   }
 
-  // Configure Khmer Bot Description, Short Description, and Chat Menu Button directly on Telegram
-  await fetch(`https://api.telegram.org/bot${botToken}/setMyDescription`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      description:
-        'សូមស្វាគមន៍មកកាន់ Master Quiz KH Bot!\n\n' +
-        'ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា (QCM, Q&A, ពន្យល់ពាក្យ និង Export PDF)។\n' +
-        'ចុច Start ឬវាយ /register ដើម្បីទទួលការណែនាំអំពីការចុះឈ្មោះប្រើប្រាស់កម្មវិធីភ្លាមៗ!',
-    }),
-  }).catch(() => {});
-
-  await fetch(`https://api.telegram.org/bot${botToken}/setMyShortDescription`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      short_description: 'ជំនួយការស្វ័យប្រវត្តិ Master Quiz KH · ណែនាំចុះឈ្មោះ ការប្រើប្រាស់ និង KHQR',
-    }),
-  }).catch(() => {});
-
-  await fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      menu_button: { type: 'commands' },
-    }),
-  }).catch(() => {});
+  // Note: Do NOT modify Bot Info (setMyDescription / setMyShortDescription / setMyName)
+  // or Mini App / Menu Button (setChatMenuButton) so the owner can manage them manually in Telegram.
 
   return true;
 }
@@ -1248,7 +1241,7 @@ app.post('/api/telegram/bot/test', async (req, res) => {
   }
 });
 
-// Endpoint: Register Telegram Bot Slash Commands menu (setMyCommands + Bot profile description)
+// Endpoint: Register Telegram Bot Slash Commands menu (setMyCommands only; leaves Bot Info and Mini App untouched)
 app.post('/api/telegram/bot/set-commands', async (req, res) => {
   try {
     const cleanToken = resolveServerBotToken(req.body?.botToken);

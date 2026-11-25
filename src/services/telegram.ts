@@ -18,6 +18,52 @@ export function escapeTgHtml(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
+export interface TelegramTargetItem {
+  id: string;
+  chatId: string;
+  label: string;
+  enabled: boolean;
+}
+
+export const DEFAULT_TELEGRAM_TARGETS: TelegramTargetItem[] = [
+  { id: 't_naret26', chatId: '@Naret26', label: 'https://t.me/Naret26', enabled: true },
+  { id: 't_khmerfamilyoflaw', chatId: '@khmerfamilyoflaw', label: 'https://t.me/khmerfamilyoflaw', enabled: true },
+  { id: 't_master_quiz_kh_channel', chatId: '@master_quiz_kh_Channel', label: 'https://t.me/master_quiz_kh_Channel', enabled: true },
+  { id: 't_700259660', chatId: '700259660', label: '700259660', enabled: true },
+];
+
+export function normalizeTelegramChatId(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  const urlMatch = trimmed.match(
+    /^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/([A-Za-z0-9_]{3,})(?:[/?#].*)?$/i
+  );
+  if (urlMatch && urlMatch[1]) {
+    const slug = urlMatch[1];
+    if (!['joinchat', 'c', 's', 'addstickers', 'addtheme', 'proxy', 'socks'].includes(slug.toLowerCase())) {
+      return `@${slug}`;
+    }
+  }
+  return trimmed;
+}
+
+export function parseTelegramChatIds(input: string): string[] {
+  const parts = (input || '')
+    .split(/[\s,;]+/)
+    .map((part) => normalizeTelegramChatId(part))
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of parts) {
+    const key = item.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
 interface BackendApiResult<T = any> {
   backendAvailable: boolean;
   ok: boolean;
@@ -151,7 +197,7 @@ export async function sendTelegramMessage(
   attempt = 0
 ): Promise<any> {
   const cleanToken = (botToken || '').trim();
-  const cleanChatId = (chatId || '').trim();
+  const cleanChatId = normalizeTelegramChatId(chatId || '');
 
   const apiRes = await callBackendApi<{
     success?: boolean;
@@ -268,7 +314,7 @@ export async function sendTelegramPoll(
   }
 
   const cleanToken = (botToken || '').trim();
-  const cleanChatId = (chatId || '').trim();
+  const cleanChatId = normalizeTelegramChatId(chatId || '');
 
   const apiRes = await callBackendApi<{
     success?: boolean;
@@ -380,7 +426,7 @@ export async function sendTelegramPhoto(
   attempt = 0
 ): Promise<any> {
   const cleanToken = (botToken || '').trim();
-  const cleanChatId = (chatId || '').trim();
+  const cleanChatId = normalizeTelegramChatId(chatId || '');
 
   const apiRes = await callBackendApi<{
     success?: boolean;
@@ -903,9 +949,10 @@ export async function sendTelegramQuestionTextWithBanner(
   botToken: string,
   chatId: string,
   q: Question,
-  index: number
+  index: number,
+  preRenderedBanner?: string
 ): Promise<any> {
-  const bannerBase64 = await renderAppBannerImage(q.subject, index);
+  const bannerBase64 = preRenderedBanner || (await renderAppBannerImage(q.subject, index));
   const caption = formatPhotoCaption(q, index, false);
   const result = await sendTelegramPhoto(botToken, chatId, bannerBase64, caption, 'HTML');
 
@@ -1061,34 +1108,8 @@ export async function registerTelegramCommands(botToken: string): Promise<any> {
     throw new Error(data.description || 'មិនអាចចុះឈ្មោះ Command Bot បានទេ');
   }
 
-  const descParams = new URLSearchParams();
-  descParams.set(
-    'description',
-    'សូមស្វាគមន៍មកកាន់ Master Quiz KH Bot!\n\n' +
-      'ប្រព័ន្ធត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋកម្ពុជា (QCM, Q&A, ពន្យល់ពាក្យ និង Export PDF)។\n' +
-      'ចុច Start ឬវាយ /register ដើម្បីទទួលការណែនាំអំពីការចុះឈ្មោះប្រើប្រាស់កម្មវិធីភ្លាមៗ!'
-  );
-  await fetch(`https://api.telegram.org/bot${token}/setMyDescription`, {
-    method: 'POST',
-    body: descParams,
-  }).catch(() => {});
-
-  const shortParams = new URLSearchParams();
-  shortParams.set(
-    'short_description',
-    'ជំនួយការស្វ័យប្រវត្តិ Master Quiz KH · ណែនាំចុះឈ្មោះ ការប្រើប្រាស់ និង KHQR'
-  );
-  await fetch(`https://api.telegram.org/bot${token}/setMyShortDescription`, {
-    method: 'POST',
-    body: shortParams,
-  }).catch(() => {});
-
-  const menuParams = new URLSearchParams();
-  menuParams.set('menu_button', JSON.stringify({ type: 'commands' }));
-  await fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
-    method: 'POST',
-    body: menuParams,
-  }).catch(() => {});
+  // Note: Do NOT modify Bot Info (setMyDescription / setMyShortDescription)
+  // or Mini App / Menu Button (setChatMenuButton) so the owner manages them manually.
 
   return { success: true, commands: FALLBACK_TELEGRAM_BOT_COMMANDS };
 }

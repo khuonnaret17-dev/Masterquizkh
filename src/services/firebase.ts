@@ -8,6 +8,7 @@ import {
   setDoc,
   deleteDoc,
   updateDoc,
+  writeBatch,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { Question, Subject, Feedback, AppNotification, LoginRecord, PresenceRecord, PaidUser, BotCommandConfig } from '../types';
@@ -94,8 +95,19 @@ function setLocal<T>(key: string, data: T) {
  * Real-time Questions Listener (Pure Firestore Sync)
  */
 export function subscribeQuestions(callback: (questions: Question[]) => void) {
-  const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const sortQuestions = (list: Question[]) =>
+    [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  const cached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   callback(cached);
+
+  const handleLocalChange = (e: Event) => {
+    const customEvent = e as CustomEvent<Question[]>;
+    if (Array.isArray(customEvent.detail)) {
+      callback(sortQuestions(customEvent.detail));
+    }
+  };
+  window.addEventListener('mpq-questions-changed', handleLocalChange);
 
   const unsub = onSnapshot(
     collection(db, 'questions'),
@@ -108,26 +120,40 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
         snapshot.forEach((d) => {
           questions.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
         });
-        questions.sort((a, b) => (a.order || 0) - (b.order || 0));
-        setLocal(STORAGE_KEYS.QUESTIONS, questions);
-        callback(questions);
+        const sorted = sortQuestions(questions);
+        setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+        callback(sorted);
       }
     },
     (err) => {
       handleFirestoreError(err, OperationType.GET, 'questions');
-      callback(cached);
+      callback(sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, cached)));
     }
   );
 
-  return unsub;
+  return () => {
+    window.removeEventListener('mpq-questions-changed', handleLocalChange);
+    unsub();
+  };
 }
 
 /**
  * Real-time Subjects Listener (Pure Firestore Sync)
  */
 export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
-  const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+  const sortSubjects = (list: Subject[]) =>
+    [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  const cached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   callback(cached);
+
+  const handleLocalChange = (e: Event) => {
+    const customEvent = e as CustomEvent<Subject[]>;
+    if (Array.isArray(customEvent.detail)) {
+      callback(sortSubjects(customEvent.detail));
+    }
+  };
+  window.addEventListener('mpq-subjects-changed', handleLocalChange);
 
   const unsub = onSnapshot(
     collection(db, 'subjects'),
@@ -140,18 +166,21 @@ export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
         snapshot.forEach((d) => {
           subs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
         });
-        subs.sort((a, b) => (a.order || 0) - (b.order || 0));
-        setLocal(STORAGE_KEYS.SUBJECTS, subs);
-        callback(subs);
+        const sorted = sortSubjects(subs);
+        setLocal(STORAGE_KEYS.SUBJECTS, sorted);
+        callback(sorted);
       }
     },
     (err) => {
       handleFirestoreError(err, OperationType.GET, 'subjects');
-      callback(cached);
+      callback(sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, cached)));
     }
   );
 
-  return unsub;
+  return () => {
+    window.removeEventListener('mpq-subjects-changed', handleLocalChange);
+    unsub();
+  };
 }
 
 
@@ -343,7 +372,9 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
 
   // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
-  setLocal(STORAGE_KEYS.QUESTIONS, [...cached, newQuestion]);
+  const next = [...cached, newQuestion];
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'questions', id), newQuestion);
@@ -353,15 +384,48 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   return newQuestion;
 }
 
+export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<Question[]> {
+  if (items.length === 0) return [];
+
+  const stamp = Date.now();
+  const created: Question[] = items.map((item, idx) => {
+    const id = `q-${stamp}-${idx}-${Math.random().toString(36).substring(2, 6)}`;
+    const cleanQ = sanitizeData(item);
+    return { ...cleanQ, id } as Question;
+  });
+
+  const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const next = [...cached, ...created];
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+
+  try {
+    const CHUNK_SIZE = 450;
+    for (let i = 0; i < created.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      const chunk = created.slice(i, i + CHUNK_SIZE);
+      for (const q of chunk) {
+        if (q.id) {
+          batch.set(doc(db, 'questions', q.id), q);
+        }
+      }
+      await batch.commit();
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, 'questions');
+  }
+
+  return created;
+}
+
 export async function updateQuestion(id: string, updates: Partial<Question>) {
   const cleanUpdates = sanitizeData(updates);
 
   // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
-  setLocal(
-    STORAGE_KEYS.QUESTIONS,
-    cached.map((q) => (q.id === id ? { ...q, ...cleanUpdates } : q))
-  );
+  const next = cached.map((q) => (q.id === id ? { ...q, ...cleanUpdates } : q));
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await updateDoc(doc(db, 'questions', id), cleanUpdates);
@@ -373,10 +437,9 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
 export async function deleteQuestion(id: string) {
   // Immediately sync local cache
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
-  setLocal(
-    STORAGE_KEYS.QUESTIONS,
-    cached.filter((q) => q.id !== id)
-  );
+  const next = cached.filter((q) => q.id !== id);
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'questions', id));
@@ -404,7 +467,9 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
 
   // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
-  setLocal(STORAGE_KEYS.SUBJECTS, [...cached, newSub]);
+  const next = [...cached, newSub];
+  setLocal(STORAGE_KEYS.SUBJECTS, next);
+  window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await setDoc(doc(db, 'subjects', id), newSub);
@@ -419,10 +484,9 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
 
   // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
-  setLocal(
-    STORAGE_KEYS.SUBJECTS,
-    cached.map((s) => (s.id === id ? { ...s, ...cleanUpdates } : s))
-  );
+  const next = cached.map((s) => (s.id === id ? { ...s, ...cleanUpdates } : s));
+  setLocal(STORAGE_KEYS.SUBJECTS, next);
+  window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await updateDoc(doc(db, 'subjects', id), cleanUpdates);
@@ -431,13 +495,92 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   }
 }
 
+/**
+ * Normalize sequential order indices (0..N-1) across subjects and persist atomically.
+ * Ensures legacy subjects with duplicate or missing order values reorder reliably.
+ */
+export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subject[]> {
+  if (orderedSubjects.length === 0) return [];
+
+  const normalized: Subject[] = orderedSubjects.map((sub, idx) => ({
+    ...sub,
+    order: idx,
+  }));
+
+  setLocal(STORAGE_KEYS.SUBJECTS, normalized);
+  window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: normalized }));
+
+  const changed = normalized.filter((sub, idx) => orderedSubjects[idx]?.order !== idx);
+  if (changed.length === 0) return normalized;
+
+  try {
+    const CHUNK_SIZE = 450;
+    for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
+      const batch = writeBatch(db);
+      const chunk = changed.slice(i, i + CHUNK_SIZE);
+      for (const sub of chunk) {
+        if (sub.id) {
+          batch.update(doc(db, 'subjects', sub.id), { order: sub.order });
+        }
+      }
+      await batch.commit();
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, 'subjects');
+  }
+
+  return normalized;
+}
+
+export async function moveSubject(
+  subjects: Subject[],
+  fromIndex: number,
+  toIndex: number
+): Promise<Subject[]> {
+  if (
+    fromIndex < 0 ||
+    fromIndex >= subjects.length ||
+    toIndex < 0 ||
+    toIndex >= subjects.length ||
+    fromIndex === toIndex
+  ) {
+    return subjects;
+  }
+
+  const next = [...subjects];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return reorderSubjects(next);
+}
+
+export async function swapSubjects(
+  subjects: Subject[],
+  fromIndex: number,
+  toIndex: number
+): Promise<Subject[]> {
+  if (
+    fromIndex < 0 ||
+    fromIndex >= subjects.length ||
+    toIndex < 0 ||
+    toIndex >= subjects.length ||
+    fromIndex === toIndex
+  ) {
+    return subjects;
+  }
+
+  const next = [...subjects];
+  const temp = next[fromIndex];
+  next[fromIndex] = next[toIndex];
+  next[toIndex] = temp;
+  return reorderSubjects(next);
+}
+
 export async function deleteSubject(id: string) {
   // Immediately sync local cache
   const cached = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
-  setLocal(
-    STORAGE_KEYS.SUBJECTS,
-    cached.filter((s) => s.id !== id)
-  );
+  const next = cached.filter((s) => s.id !== id);
+  setLocal(STORAGE_KEYS.SUBJECTS, next);
+  window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
     await deleteDoc(doc(db, 'subjects', id));
