@@ -7,6 +7,7 @@ import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/teleg
 import { ThemeSelectorModal } from './ThemeSelectorModal';
 import { FloatingMessengerWidget } from './FloatingMessengerWidget';
 import { PWAInstallButton } from './PWAInstallButton';
+import { OfflineIndicator } from './OfflineIndicator';
 import {
   KhmerLatticeBar,
   KhmerLotusCrest,
@@ -563,6 +564,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         hideClosedLauncher
         botCommands={botCommands}
       />
+
+      <OfflineIndicator />
     </div>
   );
 };

@@ -201,6 +201,10 @@ export const Navbar: React.FC<NavbarProps> = ({
               <span className="hidden lg:inline">កំពុងសិក្សា</span>
             </div>
 
+            <div className="hidden sm:block shrink-0">
+              <PWAInstallButton variant="header" />
+            </div>
+
             <div className="relative" ref={menuRef}>
               <button
                 type="button"

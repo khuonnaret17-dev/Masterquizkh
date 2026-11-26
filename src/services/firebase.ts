@@ -3,6 +3,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut,
   onAuthStateChanged,
   User as FirebaseUser,
@@ -131,21 +133,55 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   console.warn('Firestore Operation Info: ', JSON.stringify(errInfo));
 }
 
+// Handle OAuth redirect completion (used automatically when iOS Home Screen PWA blocks popups)
+void getRedirectResult(auth)
+  .then((res) => {
+    if (res?.user) {
+      try {
+        localStorage.removeItem('mpq_conn_tested_at_v2');
+      } catch {
+        // Ignore storage error
+      }
+      void testConnection(true);
+    }
+  })
+  .catch(() => {
+    // Ignore no-op or blocked redirect errors
+  });
+
 // Auth Helpers (with proper unsubscribe cleanup support)
 export function subscribeAuthState(callback: (user: FirebaseUser | null) => void): () => void {
   return onAuthStateChanged(auth, callback);
 }
 
-export async function signInWithGoogle(): Promise<FirebaseUser> {
-  const result = await signInWithPopup(auth, googleProvider);
-  // Reset connection test & core check so newly authenticated user can sync immediately
+export async function signInWithGoogle(): Promise<FirebaseUser | null> {
+  const isStandalonePWA =
+    typeof window !== 'undefined' &&
+    (window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true);
+
   try {
-    localStorage.removeItem('mpq_conn_tested_at_v2');
-  } catch {
-    // Ignore storage error
+    const result = await signInWithPopup(auth, googleProvider);
+    // Reset connection test & core check so newly authenticated user can sync immediately
+    try {
+      localStorage.removeItem('mpq_conn_tested_at_v2');
+    } catch {
+      // Ignore storage error
+    }
+    void testConnection(true);
+    return result.user;
+  } catch (err: unknown) {
+    const code = (err as { code?: string })?.code || '';
+    const shouldFallbackRedirect =
+      isStandalonePWA ||
+      code === 'auth/popup-blocked' ||
+      code === 'auth/operation-not-supported-in-this-environment';
+    if (shouldFallbackRedirect) {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    }
+    throw err;
   }
-  void testConnection(true);
-  return result.user;
 }
 
 export async function signOutFirebase(): Promise<void> {
@@ -233,10 +269,19 @@ function setSyncTimestamp(key: SyncKey, timestamp = Date.now()) {
   setLocal(STORAGE_KEYS.SYNC_META, meta);
 }
 
-function isCacheFresh(key: SyncKey, storageKey?: string): boolean {
+function isCacheFresh(key: SyncKey, storageKey?: string, requireNonEmptyArray = false): boolean {
   const lastSync = getSyncTimestamp(key);
   if (!lastSync) return false;
-  if (storageKey && !hasCachedValue(storageKey)) return false;
+  if (storageKey) {
+    if (!hasCachedValue(storageKey)) return false;
+    if (requireNonEmptyArray) {
+      const val = getLocal<unknown>(storageKey, null);
+      if (Array.isArray(val) && val.length === 0) return false;
+      if (val && typeof val === 'object' && !Array.isArray(val) && Object.keys(val).length === 0) {
+        return false;
+      }
+    }
+  }
   return Date.now() - lastSync < SYNC_TTLS_MS[key];
 }
 
@@ -462,11 +507,10 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 
       if (payload?.quotaLimited) {
         clientQuotaCooldownUntil = Date.now() + 5 * 60 * 1000;
-        setSyncTimestamp('CORE_CHECK');
       }
 
       if (!res.ok || !payload) {
-        return Boolean(payload?.quotaLimited || payload?.requiresAuth);
+        return false;
       }
 
       setSyncTimestamp('CORE_CHECK');
@@ -524,17 +568,18 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   await hydrateCacheFromIdb();
 
-  if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS)) {
+  if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)) {
     return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   }
 
   const syncedFromServer = await syncCoreFromServer(force);
-  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.QUESTIONS)) {
-    return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  const afterServer = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  if (syncedFromServer && afterServer.length > 0) {
+    return afterServer;
   }
 
   return runDeduplicated(`questions:${force ? 'force' : 'ttl'}`, async () => {
-    if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS)) {
+    if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)) {
       return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     }
     try {
@@ -572,6 +617,9 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
       const sorted = sortQuestions(questions);
       setLocal(STORAGE_KEYS.QUESTIONS, sorted);
       setSyncTimestamp('QUESTIONS');
+      if (sorted.length > 0) {
+        syncMutationToServerCache('questions', sorted);
+      }
       window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
       return sorted;
     } catch (err) {
@@ -617,17 +665,18 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
 export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   await hydrateCacheFromIdb();
 
-  if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS)) {
+  if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)) {
     return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   }
 
   const syncedFromServer = await syncCoreFromServer(force);
-  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.SUBJECTS)) {
-    return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  const afterServer = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  if (syncedFromServer && afterServer.length > 0) {
+    return afterServer;
   }
 
   return runDeduplicated(`subjects:${force ? 'force' : 'ttl'}`, async () => {
-    if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS)) {
+    if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)) {
       return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     }
     try {
@@ -660,6 +709,9 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
       const sorted = sortSubjects(subs);
       setLocal(STORAGE_KEYS.SUBJECTS, sorted);
       setSyncTimestamp('SUBJECTS');
+      if (sorted.length > 0) {
+        syncMutationToServerCache('subjects', sorted);
+      }
       window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
       return sorted;
     } catch (err) {

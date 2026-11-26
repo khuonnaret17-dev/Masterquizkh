@@ -16,6 +16,9 @@ export default defineConfig(() => {
           'favicon-32x32.png',
           'apple-touch-icon.png',
           'app-logo.png',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
         ],
         manifest: {
           id: '/',
@@ -23,11 +26,16 @@ export default defineConfig(() => {
           short_name: 'Master Quiz',
           description:
             'ប្រព័ន្ធគ្រប់គ្រង និងធ្វើតេស្តសមត្ថភាពត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ (Master Quiz KH)',
+          lang: 'km',
+          dir: 'ltr',
           theme_color: '#8f251b',
           background_color: '#f7f2e6',
           display: 'standalone',
+          orientation: 'any',
           start_url: '/',
           scope: '/',
+          categories: ['education'],
+          prefer_related_applications: false,
           icons: [
             {
               src: '/pwa-192x192.png',

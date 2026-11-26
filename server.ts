@@ -1523,7 +1523,8 @@ const SERVER_CACHE_TTLS = {
   onlineCount: 5 * 60 * 1000, // 5 minutes
 };
 
-const SERVER_DISK_CACHE_PATH = path.join(os.tmpdir(), 'mpq-server-core-cache-v1.json');
+const SERVER_DISK_CACHE_PRIMARY = path.resolve(__dirname, '.mpq_server_core_cache.json');
+const SERVER_DISK_CACHE_FALLBACK = path.join(os.tmpdir(), 'mpq-server-core-cache-v1.json');
 
 interface ServerCoreCacheState {
   version: number;
@@ -1547,23 +1548,25 @@ function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
     bot_commands: null,
     onlineCount: null,
   };
-  try {
-    if (!fs.existsSync(SERVER_DISK_CACHE_PATH)) return empty;
-    const raw = fs.readFileSync(SERVER_DISK_CACHE_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      return {
-        ...empty,
-        version: typeof parsed.version === 'number' ? parsed.version : Date.now(),
-        questions: parsed.questions?.data ? parsed.questions : null,
-        subjects: parsed.subjects?.data ? parsed.subjects : null,
-        notifications: parsed.notifications?.data ? parsed.notifications : null,
-        bot_commands: parsed.bot_commands?.data ? parsed.bot_commands : null,
-        onlineCount: parsed.onlineCount?.count ? parsed.onlineCount : null,
-      };
+  for (const cachePath of [SERVER_DISK_CACHE_PRIMARY, SERVER_DISK_CACHE_FALLBACK]) {
+    try {
+      if (!fs.existsSync(cachePath)) continue;
+      const raw = fs.readFileSync(cachePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        return {
+          ...empty,
+          version: typeof parsed.version === 'number' ? parsed.version : Date.now(),
+          questions: parsed.questions?.data ? parsed.questions : null,
+          subjects: parsed.subjects?.data ? parsed.subjects : null,
+          notifications: parsed.notifications?.data ? parsed.notifications : null,
+          bot_commands: parsed.bot_commands?.data ? parsed.bot_commands : null,
+          onlineCount: parsed.onlineCount?.count ? parsed.onlineCount : null,
+        };
+      }
+    } catch {
+      // Try next cache location
     }
-  } catch {
-    // Ignore corrupted disk cache
   }
   return empty;
 }
@@ -1575,22 +1578,24 @@ function schedulePersistServerCoreCache() {
   if (persistCacheTimer) return;
   persistCacheTimer = setTimeout(() => {
     persistCacheTimer = null;
+    const serialized = JSON.stringify({
+      version: serverCoreCache.version,
+      questions: serverCoreCache.questions,
+      subjects: serverCoreCache.subjects,
+      notifications: serverCoreCache.notifications,
+      bot_commands: serverCoreCache.bot_commands,
+      onlineCount: serverCoreCache.onlineCount,
+    });
     try {
-      fs.writeFileSync(
-        SERVER_DISK_CACHE_PATH,
-        JSON.stringify({
-          version: serverCoreCache.version,
-          questions: serverCoreCache.questions,
-          subjects: serverCoreCache.subjects,
-          notifications: serverCoreCache.notifications,
-          bot_commands: serverCoreCache.bot_commands,
-          onlineCount: serverCoreCache.onlineCount,
-        })
-      );
+      fs.writeFileSync(SERVER_DISK_CACHE_PRIMARY, serialized, { mode: 0o600 });
     } catch {
-      // Ignore disk write failure on ephemeral environments
+      try {
+        fs.writeFileSync(SERVER_DISK_CACHE_FALLBACK, serialized);
+      } catch {
+        // Ignore disk write failure on read-only environments
+      }
     }
-  }, 500);
+  }, 400);
 }
 
 const serverCacheInFlight = new Map<string, Promise<any>>();
@@ -1972,9 +1977,36 @@ async function startServer() {
   } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: null,
+      },
       appType: 'spa',
     });
+
+    // Suppress Vite HMR WebSocket attempts when HMR is disabled in AI Studio / Cloud Run preview
+    app.get('/@vite/client', async (_req, res, next) => {
+      try {
+        const transformed = await vite.transformRequest('/@vite/client');
+        if (!transformed?.code) return next();
+        const patched = transformed.code
+          .replace(
+            /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
+            'const transport = normalizeModuleRunnerTransport({ async connect() {}, async disconnect() {}, send() {} });'
+          )
+          .replace(
+            'console.debug("[vite] connecting...");',
+            'console.debug("[vite] HMR disabled");'
+          );
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        return res.send(patched);
+      } catch {
+        return next();
+      }
+    });
+
     app.use(vite.middlewares);
   }
 

@@ -11,6 +11,8 @@ import {
   X,
   ChevronDown,
   ChevronUp,
+  RefreshCw,
+  Cloud,
 } from 'lucide-react';
 import { Question, Subject, UserSession, QuizContext, GlobalStats } from '../types';
 import { toKhmerNum, khmerAlphabetSort, shuffleArray, getOptionLabel } from '../utils/khmer';
@@ -23,6 +25,10 @@ interface PlaySectionProps {
   session: UserSession;
   onStartQuiz: (quizQuestions: Question[], title: string, context?: QuizContext) => void;
   globalStats?: GlobalStats;
+  firebaseUserEmail?: string | null;
+  isSyncingCore?: boolean;
+  onSyncNow?: () => Promise<void> | void;
+  onConnectGoogle?: () => Promise<void> | void;
 }
 
 export const PlaySection: React.FC<PlaySectionProps> = ({
@@ -31,6 +37,10 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
   session,
   onStartQuiz,
   globalStats,
+  firebaseUserEmail = null,
+  isSyncingCore = false,
+  onSyncNow,
+  onConnectGoogle,
 }) => {
   const [activeTab, setActiveTab] = useState<'subject' | 'mixed' | 'dictionary'>('subject');
 
@@ -359,15 +369,53 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
           </div>
 
           {activeSubjects.filter((sub) => typeFilter === 'all' || sub.type === typeFilter).length === 0 && (
-            <div className="py-16 px-6 text-center rounded-2xl khmer-frame-card">
+            <div className="py-12 sm:py-16 px-6 text-center rounded-2xl khmer-frame-card">
               <KhmerLotusDivider width={180} className="mx-auto mb-3" />
-              <BookOpen className="w-12 h-12 app-text-muted mx-auto mb-3" />
-              <h4 className="font-moul text-base app-text-primary mb-2">
-                មិនទាន់មានមុខវិជ្ជា ឬវិញ្ញាសាក្នុងប្រព័ន្ធនៅឡើយទេ
-              </h4>
-              <p className="text-sm app-text-secondary max-w-md mx-auto">
-                អ្នកគ្រប់គ្រង (Admin) អាចចូលទៅកាន់ផ្ទាំង «គ្រប់គ្រង» ដើម្បីបន្ថែមមុខវិជ្ជា និងបញ្ចូលវិញ្ញាសាថ្មីៗ។
-              </p>
+              {isSyncingCore ? (
+                <>
+                  <RefreshCw className="w-10 h-10 khmer-accent-text mx-auto mb-3 animate-spin" />
+                  <h4 className="font-moul text-base app-text-primary mb-2">
+                    កំពុងទាញទិន្នន័យសំណួរ និងមុខវិជ្ជា...
+                  </h4>
+                  <p className="text-sm app-text-secondary max-w-md mx-auto">
+                    សូមរង់ចាំបន្តិច ប្រព័ន្ធកំពុងភ្ជាប់ទាញយកវិញ្ញាសាថ្មីៗពី Cloud។
+                  </p>
+                </>
+              ) : (
+                <>
+                  <BookOpen className="w-12 h-12 app-text-muted mx-auto mb-3" />
+                  <h4 className="font-moul text-base app-text-primary mb-2">
+                    មិនទាន់មានមុខវិជ្ជា ឬវិញ្ញាសាក្នុងទូរស័ព្ទនេះនៅឡើយទេ
+                  </h4>
+                  <p className="text-sm app-text-secondary max-w-md mx-auto mb-5 leading-relaxed">
+                    {!firebaseUserEmail
+                      ? 'សម្រាប់ការបើកពី Home Screen លើកដំបូង សូមចុចទាញទិន្នន័យ ឬភ្ជាប់គណនី Google ដើម្បីផ្ទុកវិញ្ញាសាទាំងអស់ចូលកម្មវិធី។'
+                      : 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ឬអ្នកគ្រប់គ្រងអាចបញ្ចូលមុខវិជ្ជាថ្មីក្នុងផ្ទាំង «គ្រប់គ្រង»។'}
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-2.5">
+                    {onSyncNow && (
+                      <button
+                        type="button"
+                        onClick={() => void onSyncNow()}
+                        className="min-h-[42px] px-4 py-2 rounded-xl khmer-btn-primary text-xs sm:text-sm font-semibold flex items-center gap-2 cursor-pointer"
+                      >
+                        <RefreshCw className="w-4 h-4 shrink-0" />
+                        <span>ទាញទិន្នន័យឡើងវិញ</span>
+                      </button>
+                    )}
+                    {!firebaseUserEmail && onConnectGoogle && (
+                      <button
+                        type="button"
+                        onClick={() => void onConnectGoogle()}
+                        className="min-h-[42px] px-4 py-2 rounded-xl app-subcard border app-border text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-85 flex items-center gap-2 cursor-pointer"
+                      >
+                        <Cloud className="w-4 h-4 shrink-0" />
+                        <span>ភ្ជាប់ Google Sync</span>
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>

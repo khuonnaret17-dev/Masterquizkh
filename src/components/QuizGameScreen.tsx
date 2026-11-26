@@ -32,7 +32,6 @@ import {
   getOptionLabel,
   playCorrectSound,
   playWrongSound,
-  playClickSound,
   shuffleArray,
 } from '../utils/khmer';
 
@@ -166,7 +165,6 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
 
   const handleSelectOption = (optionIndex: number) => {
     if (userAnswers[currentIndex] !== undefined) return;
-    playClickSound();
 
     const isCorrect = optionIndex === qOptionsData.correctIndex;
     if (isCorrect) {

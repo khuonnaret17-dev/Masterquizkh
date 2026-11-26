@@ -9,6 +9,7 @@ import { QuizGameScreen } from './components/QuizGameScreen';
 import { AdminSection } from './components/AdminSection';
 import { FloatingMessengerWidget } from './components/FloatingMessengerWidget';
 import { ThemeSelectorModal } from './components/ThemeSelectorModal';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { getStoredTheme } from './services/theme';
 import {
   subscribeAuthState,
@@ -26,6 +27,8 @@ import {
   fetchPresencePage,
   refreshAdminMonitoringData,
   updatePresenceHeartbeat,
+  refreshCoreData,
+  signInWithGoogle,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
 import {
@@ -109,12 +112,16 @@ export default function App() {
   const [isLoadingMoreFeedbacks, setIsLoadingMoreFeedbacks] = useState(false);
 
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
+  const [isSyncingCore, setIsSyncingCore] = useState(false);
 
   // Core data subscriptions: only attach AFTER user logs in (re-sync cleanly on Firebase Auth sign-in)
   const isLoggedIn = Boolean(session);
   const firebaseUid = firebaseUser?.uid || '';
   useEffect(() => {
     if (!isLoggedIn) return;
+
+    let active = true;
+    setIsSyncingCore(true);
 
     const unsubQ = subscribeQuestions(setQuestions);
     const unsubSub = subscribeSubjects(setSubjects);
@@ -127,7 +134,15 @@ export default function App() {
       }
     });
 
+    const syncPromise = firebaseUid ? refreshCoreData() : Promise.resolve();
+    void syncPromise.finally(() => {
+      setTimeout(() => {
+        if (active) setIsSyncingCore(false);
+      }, 400);
+    });
+
     return () => {
+      active = false;
       unsubQ();
       unsubSub();
       unsubNotif();
@@ -135,6 +150,27 @@ export default function App() {
       unsubBot();
     };
   }, [isLoggedIn, firebaseUid]);
+
+  const handleSyncCoreNow = useCallback(async () => {
+    setIsSyncingCore(true);
+    try {
+      await refreshCoreData();
+    } finally {
+      setIsSyncingCore(false);
+    }
+  }, []);
+
+  const handleConnectGoogle = useCallback(async () => {
+    setIsSyncingCore(true);
+    try {
+      await signInWithGoogle();
+      await refreshCoreData();
+    } catch {
+      // Ignore user-cancelled popup
+    } finally {
+      setIsSyncingCore(false);
+    }
+  }, []);
 
   // Admin-only paginated collections (20 per page + startAfter): only load when Admin tab is active
   const isAdminPanelActive = session?.role === 'admin' && activeTab === 'admin';
@@ -455,6 +491,10 @@ export default function App() {
             session={session}
             onStartQuiz={handleStartQuiz}
             globalStats={globalStats}
+            firebaseUserEmail={firebaseUser?.email || null}
+            isSyncingCore={isSyncingCore}
+            onSyncNow={handleSyncCoreNow}
+            onConnectGoogle={handleConnectGoogle}
           />
         )}
       </main>
@@ -473,6 +513,8 @@ export default function App() {
         currentTheme={currentTheme}
         onThemeSelect={(t) => setCurrentTheme(t)}
       />
+
+      <OfflineIndicator />
     </div>
   );
 }
