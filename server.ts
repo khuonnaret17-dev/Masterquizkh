@@ -1037,6 +1037,18 @@ async function registerCommandsWithTelegram(botToken: string): Promise<boolean> 
   return true;
 }
 
+function isTelegramDeliveryBlockedError(status: number, description?: string): boolean {
+  if (status === 403) return true;
+  const desc = (description || '').toLowerCase();
+  return (
+    desc.includes('blocked by the user') ||
+    desc.includes('user is deactivated') ||
+    desc.includes('bot was kicked') ||
+    desc.includes("can't initiate conversation") ||
+    desc.includes('chat not found')
+  );
+}
+
 async function processTelegramUpdate(botToken: string, update: any, appUrl: string) {
   if (!update) return;
 
@@ -1045,6 +1057,7 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
   let isPrivateChat = true;
 
   if (update.message && update.message.chat && typeof update.message.text === 'string') {
+    if (update.message.from?.is_bot) return;
     const text = update.message.text.trim();
     isPrivateChat = update.message.chat.type === 'private';
     if (text.startsWith('/') || isPrivateChat) {
@@ -1093,12 +1106,15 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
         headers: { 'Content-Type': `multipart/form-data; boundary=${b}` },
         body: Buffer.concat(chunks),
       });
-      const photoData = await photoRes.json().catch(() => ({ ok: false }));
+      const photoData = await safeTelegramJson(photoRes);
       if (photoRes.ok && photoData.ok) {
         botWorker.lastError = null;
         botWorker.handledCount += 1;
         botWorker.lastCommandAt = new Date().toISOString();
         botWorker.lastCommandText = commandInput.slice(0, 60);
+        return;
+      }
+      if (isTelegramDeliveryBlockedError(photoRes.status, photoData?.description)) {
         return;
       }
       botWorker.lastError = photoData?.description || `Telegram sendPhoto error (${photoRes.status})`;
@@ -1119,9 +1135,12 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
       reply_markup: reply.reply_markup,
     }),
   });
-  const sendData = await sendRes.json().catch(() => ({ ok: false }));
+  const sendData = await safeTelegramJson(sendRes);
 
   if (!sendRes.ok || !sendData.ok) {
+    if (isTelegramDeliveryBlockedError(sendRes.status, sendData?.description)) {
+      return;
+    }
     botWorker.lastError = sendData?.description || `Telegram sendMessage error (${sendRes.status})`;
     console.warn('Telegram Command Bot primary sendMessage failed:', botWorker.lastError);
     // Fallback retry without inline keyboard URL buttons / HTML in case Telegram rejected a button URL
@@ -1134,7 +1153,7 @@ async function processTelegramUpdate(botToken: string, update: any, appUrl: stri
         disable_web_page_preview: true,
       }),
     });
-    const fallbackData = await fallbackRes.json().catch(() => ({ ok: false }));
+    const fallbackData = await safeTelegramJson(fallbackRes);
     if (!fallbackRes.ok || !fallbackData.ok) {
       return;
     }
@@ -1412,7 +1431,7 @@ function decodeFirestoreFields(fields: Record<string, any>): Record<string, any>
   return out;
 }
 
-async function fetchCollectionViaFirestoreRest(collectionName: string): Promise<any[]> {
+async function fetchCollectionViaFirestoreRest(collectionName: string, authHeader?: string): Promise<any[]> {
   if (!serverFbConfig) {
     throw new Error('Firebase config unavailable on server');
   }
@@ -1420,15 +1439,20 @@ async function fetchCollectionViaFirestoreRest(collectionName: string): Promise<
   const docs: any[] = [];
   let pageToken = '';
 
+  const headers: Record<string, string> = {};
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    headers['Authorization'] = authHeader;
+  }
+
   do {
     const params = new URLSearchParams({
-      pageSize: '500',
+      pageSize: '20',
       key: apiKey,
     });
     if (pageToken) params.set('pageToken', pageToken);
 
     const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents/${encodeURIComponent(collectionName)}?${params.toString()}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { headers });
     if (!res.ok) {
       const err: any = new Error(`Firestore REST ${collectionName} HTTP ${res.status}`);
       err.status = res.status;
@@ -1449,15 +1473,20 @@ async function fetchCollectionViaFirestoreRest(collectionName: string): Promise<
   return docs;
 }
 
-async function fetchActivePresenceCountViaRest(): Promise<number> {
+async function fetchActivePresenceCountViaRest(authHeader?: string): Promise<number> {
   if (!serverFbConfig) throw new Error('Firebase config unavailable on server');
   const { projectId, firestoreDatabaseId, apiKey } = serverFbConfig;
   const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
   const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents:runAggregationQuery?key=${encodeURIComponent(apiKey)}`;
 
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    headers['Authorization'] = authHeader;
+  }
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       structuredAggregationQuery: {
         structuredQuery: {
@@ -1469,6 +1498,7 @@ async function fetchActivePresenceCountViaRest(): Promise<number> {
               value: { stringValue: fiveMinsAgoIso },
             },
           },
+          limit: 20,
         },
         aggregations: [{ alias: 'total', count: {} }],
       },
@@ -1571,7 +1601,7 @@ function markQuotaCooldownIfNeeded(err: any) {
   }
 }
 
-async function getServerCachedQuestions(force = false): Promise<any[]> {
+async function getServerCachedQuestions(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
   if (
     !force &&
@@ -1586,13 +1616,19 @@ async function getServerCachedQuestions(force = false): Promise<any[]> {
     err.status = 429;
     throw err;
   }
+  if (!authHeader) {
+    if (serverCoreCache.questions) return serverCoreCache.questions.data;
+    const err: any = new Error('Authentication required for Firestore read');
+    err.status = 401;
+    throw err;
+  }
 
   const key = 'questions';
   if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
 
   const p = (async () => {
     try {
-      const raw = await fetchCollectionViaFirestoreRest('questions');
+      const raw = await fetchCollectionViaFirestoreRest('questions', authHeader);
       raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       serverCoreCache.questions = { data: raw, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
@@ -1610,7 +1646,7 @@ async function getServerCachedQuestions(force = false): Promise<any[]> {
   return p;
 }
 
-async function getServerCachedSubjects(force = false): Promise<any[]> {
+async function getServerCachedSubjects(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
   if (
     !force &&
@@ -1625,13 +1661,19 @@ async function getServerCachedSubjects(force = false): Promise<any[]> {
     err.status = 429;
     throw err;
   }
+  if (!authHeader) {
+    if (serverCoreCache.subjects) return serverCoreCache.subjects.data;
+    const err: any = new Error('Authentication required for Firestore read');
+    err.status = 401;
+    throw err;
+  }
 
   const key = 'subjects';
   if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
 
   const p = (async () => {
     try {
-      const raw = await fetchCollectionViaFirestoreRest('subjects');
+      const raw = await fetchCollectionViaFirestoreRest('subjects', authHeader);
       raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       serverCoreCache.subjects = { data: raw, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
@@ -1649,7 +1691,7 @@ async function getServerCachedSubjects(force = false): Promise<any[]> {
   return p;
 }
 
-async function getServerCachedNotifications(force = false): Promise<any[]> {
+async function getServerCachedNotifications(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
   if (
     !force &&
@@ -1664,15 +1706,21 @@ async function getServerCachedNotifications(force = false): Promise<any[]> {
     err.status = 429;
     throw err;
   }
+  if (!authHeader) {
+    if (serverCoreCache.notifications) return serverCoreCache.notifications.data;
+    const err: any = new Error('Authentication required for Firestore read');
+    err.status = 401;
+    throw err;
+  }
 
   const key = 'notifications';
   if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
 
   const p = (async () => {
     try {
-      const raw = await fetchCollectionViaFirestoreRest('notifications');
+      const raw = await fetchCollectionViaFirestoreRest('notifications', authHeader);
       raw.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-      serverCoreCache.notifications = { data: raw.slice(0, 50), fetchedAt: Date.now() };
+      serverCoreCache.notifications = { data: raw.slice(0, 20), fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return serverCoreCache.notifications.data;
     } catch (err: any) {
@@ -1688,7 +1736,7 @@ async function getServerCachedNotifications(force = false): Promise<any[]> {
   return p;
 }
 
-async function getServerCachedBotCommands(force = false): Promise<Record<string, any>> {
+async function getServerCachedBotCommands(force = false, authHeader?: string): Promise<Record<string, any>> {
   const now = Date.now();
   if (
     !force &&
@@ -1703,13 +1751,19 @@ async function getServerCachedBotCommands(force = false): Promise<Record<string,
     err.status = 429;
     throw err;
   }
+  if (!authHeader) {
+    if (serverCoreCache.bot_commands) return serverCoreCache.bot_commands.data;
+    const err: any = new Error('Authentication required for Firestore read');
+    err.status = 401;
+    throw err;
+  }
 
   const key = 'bot_commands';
   if (serverCacheInFlight.has(key)) return serverCacheInFlight.get(key)!;
 
   const p = (async () => {
     try {
-      const raw = await fetchCollectionViaFirestoreRest('bot_commands');
+      const raw = await fetchCollectionViaFirestoreRest('bot_commands', authHeader);
       const map: Record<string, any> = {};
       for (const item of raw) {
         if (item?.command) {
@@ -1736,9 +1790,11 @@ app.get('/api/cache/core', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
     const now = Date.now();
+    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
     const rawForce = req.query.force === '1';
     const allowForce =
       rawForce &&
+      Boolean(authHeader) &&
       now >= serverCoreCache.quotaCooldownUntil &&
       now - serverCoreCache.lastForceAt > 10000;
     if (allowForce) {
@@ -1767,10 +1823,10 @@ app.get('/api/cache/core', async (req, res) => {
     }
 
     const [qRes, sRes, nRes, bcRes] = await Promise.allSettled([
-      getServerCachedQuestions(allowForce),
-      getServerCachedSubjects(allowForce),
-      getServerCachedNotifications(allowForce),
-      getServerCachedBotCommands(allowForce),
+      getServerCachedQuestions(allowForce, authHeader),
+      getServerCachedSubjects(allowForce, authHeader),
+      getServerCachedNotifications(allowForce, authHeader),
+      getServerCachedBotCommands(allowForce, authHeader),
     ]);
 
     const questions = qRes.status === 'fulfilled' ? qRes.value : serverCoreCache.questions?.data;
@@ -1786,13 +1842,21 @@ app.get('/api/cache/core', async (req, res) => {
       [qRes, sRes, nRes, bcRes].some(
         (r) => r.status === 'rejected' && (r.reason?.status === 429 || String(r.reason?.message || '').includes('429'))
       );
+    const requiresAuth = [qRes, sRes, nRes, bcRes].some(
+      (r) => r.status === 'rejected' && (r.reason?.status === 401 || r.reason?.status === 403)
+    );
 
     const hasAnyData = Boolean(questions || subjects || notifications || botCommands);
     if (!hasAnyData && anyRejected) {
-      return res.status(503).json({
+      return res.status(requiresAuth ? 401 : 503).json({
         success: false,
         quotaLimited,
-        error: quotaLimited ? 'Firestore daily read quota exceeded' : 'Cache unavailable',
+        requiresAuth,
+        error: quotaLimited
+          ? 'Firestore daily read quota exceeded'
+          : requiresAuth
+            ? 'Authentication required for Firestore read'
+            : 'Cache unavailable',
       });
     }
 
@@ -1800,6 +1864,7 @@ app.get('/api/cache/core', async (req, res) => {
       unchanged: false,
       version: serverCoreCache.version,
       quotaLimited,
+      requiresAuth,
       ...(questions ? { questions } : {}),
       ...(subjects ? { subjects } : {}),
       ...(notifications ? { notifications } : {}),
@@ -1818,8 +1883,12 @@ app.get('/api/cache/online-count', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
     const now = Date.now();
-    if (now < serverCoreCache.quotaCooldownUntil) {
-      return res.json({ count: serverCoreCache.onlineCount?.count || 1, quotaLimited: true });
+    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
+    if (now < serverCoreCache.quotaCooldownUntil || !authHeader) {
+      return res.json({
+        count: serverCoreCache.onlineCount?.count || 1,
+        quotaLimited: now < serverCoreCache.quotaCooldownUntil,
+      });
     }
     const force = req.query.force === '1' && (!serverCoreCache.onlineCount || now - serverCoreCache.onlineCount.fetchedAt > 15000);
     if (!force && serverCoreCache.onlineCount && now - serverCoreCache.onlineCount.fetchedAt < SERVER_CACHE_TTLS.onlineCount) {
@@ -1832,7 +1901,7 @@ app.get('/api/cache/online-count', async (req, res) => {
     }
 
     const p = (async () => {
-      const count = await fetchActivePresenceCountViaRest();
+      const count = await fetchActivePresenceCountViaRest(authHeader);
       serverCoreCache.onlineCount = { count, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return count;

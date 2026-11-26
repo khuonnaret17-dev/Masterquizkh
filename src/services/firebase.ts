@@ -1,5 +1,13 @@
 import { initializeApp } from 'firebase/app';
 import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+  User as FirebaseUser,
+} from 'firebase/auth';
+import {
   getFirestore,
   initializeFirestore,
   persistentLocalCache,
@@ -15,10 +23,15 @@ import {
   where,
   orderBy,
   limit,
+  startAfter,
   setDoc,
   deleteDoc,
   updateDoc,
   writeBatch,
+  increment,
+  QueryConstraint,
+  QueryDocumentSnapshot,
+  DocumentData,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
@@ -30,6 +43,7 @@ import {
   PresenceRecord,
   PaidUser,
   BotCommandConfig,
+  GlobalStats,
 } from '../types';
 import { INITIAL_NOTIFICATIONS } from './initialData';
 import { syncTelegramBotTemplates } from './telegram';
@@ -40,8 +54,20 @@ import {
   setCachedValue,
 } from './localCacheDb';
 
-// Initialize Firebase App & Firestore with persistent IndexedDB local cache
+// Strict maximum items per single Firestore list query (aligned with firestore.rules limit <= 20)
+export const MAX_QUERY_LIMIT = 20;
+
+export interface PaginatedPageResult<T> {
+  items: T[];
+  lastDoc: QueryDocumentSnapshot<DocumentData> | null;
+  hasMore: boolean;
+}
+
+// Initialize Firebase App, Auth, & Firestore with persistent IndexedDB local cache
 const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+const googleProvider = new GoogleAuthProvider();
+
 export const db = (() => {
   try {
     return initializeFirestore(
@@ -73,6 +99,14 @@ interface FirestoreErrorInfo {
   path: string | null;
   authInfo: {
     userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
   };
 }
 
@@ -80,7 +114,16 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: 'anonymous-client',
+      userId: auth.currentUser?.uid || null,
+      email: auth.currentUser?.email || null,
+      emailVerified: auth.currentUser?.emailVerified ?? null,
+      isAnonymous: auth.currentUser?.isAnonymous ?? null,
+      tenantId: auth.currentUser?.tenantId || null,
+      providerInfo:
+        auth.currentUser?.providerData?.map((provider) => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
     },
     operationType,
     path,
@@ -88,11 +131,43 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   console.warn('Firestore Operation Info: ', JSON.stringify(errInfo));
 }
 
-// Test initial connection once every 24 hours per device (avoids extra server reads on every Mini App launch)
-async function testConnection() {
+// Auth Helpers (with proper unsubscribe cleanup support)
+export function subscribeAuthState(callback: (user: FirebaseUser | null) => void): () => void {
+  return onAuthStateChanged(auth, callback);
+}
+
+export async function signInWithGoogle(): Promise<FirebaseUser> {
+  const result = await signInWithPopup(auth, googleProvider);
+  // Reset connection test & core check so newly authenticated user can sync immediately
   try {
+    localStorage.removeItem('mpq_conn_tested_at_v2');
+  } catch {
+    // Ignore storage error
+  }
+  void testConnection(true);
+  return result.user;
+}
+
+export async function signOutFirebase(): Promise<void> {
+  await signOut(auth);
+}
+
+async function getAuthBearerHeader(): Promise<string | undefined> {
+  if (!auth.currentUser) return undefined;
+  try {
+    const token = await auth.currentUser.getIdToken();
+    return token ? `Bearer ${token}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Startup Connection Validation (runs once per 24h when authenticated to avoid unauthenticated reads)
+async function testConnection(force = false) {
+  try {
+    if (!auth.currentUser) return;
     const lastTested = Number(localStorage.getItem('mpq_conn_tested_at_v2') || '0');
-    if (lastTested && Date.now() - lastTested < 24 * 60 * 60 * 1000) {
+    if (!force && lastTested && Date.now() - lastTested < 24 * 60 * 60 * 1000) {
       return;
     }
     localStorage.setItem('mpq_conn_tested_at_v2', String(Date.now()));
@@ -116,6 +191,7 @@ const STORAGE_KEYS = {
   PRESENCE: 'mpq_cached_presence',
   PAID_USERS: 'mpq_cached_paid_users',
   BOT_COMMANDS: 'mpq_cached_bot_commands',
+  GLOBAL_STATS: 'mpq_cached_global_stats_v1',
   SYNC_META: 'mpq_sync_meta_v2',
   CORE_SERVER_VERSION: 'mpq_core_server_version_v1',
   ONLINE_COUNT: 'mpq_cached_online_count_v1',
@@ -128,11 +204,12 @@ const SYNC_TTLS_MS = {
   BOT_COMMANDS: 6 * 60 * 60 * 1000, // 6 hours
   NOTIFICATIONS: 30 * 60 * 1000, // 30 minutes
   PAID_USERS: 15 * 60 * 1000, // 15 minutes
-  LOGINS: 5 * 60 * 1000, // 5 minutes (Admin only)
-  FEEDBACKS: 5 * 60 * 1000, // 5 minutes (Admin only)
-  PRESENCE: 2 * 60 * 1000, // 2 minutes (Admin only)
-  ONLINE_COUNT: 5 * 60 * 1000, // 5 minutes (1 shared server aggregation read)
-  CORE_CHECK: 5 * 60 * 1000, // Only check /api/cache/core version every 5 minutes
+  GLOBAL_STATS: 15 * 60 * 1000, // 15 minutes
+  LOGINS: 5 * 60 * 1000, // 5 minutes (Admin only, 20 per page)
+  FEEDBACKS: 5 * 60 * 1000, // 5 minutes (Admin only, 20 per page)
+  PRESENCE: 2 * 60 * 1000, // 2 minutes (Admin only, 20 per page)
+  ONLINE_COUNT: 5 * 60 * 1000, // 5 minutes (1 shared aggregation read)
+  CORE_CHECK: 5 * 60 * 1000, // Check /api/cache/core version every 5 minutes
 };
 
 type SyncKey = keyof typeof SYNC_TTLS_MS;
@@ -234,9 +311,107 @@ function resolveNotificationsWithDismissed(rawNotifs: AppNotification[]): AppNot
 }
 
 /**
+ * Reusable Cursor Pagination Helper (strictly <= 20 items per query using limit() + startAfter())
+ */
+async function fetchCollectionPageFromFirestore<T>(
+  collectionName: string,
+  constraints: QueryConstraint[],
+  cursorDoc: QueryDocumentSnapshot<DocumentData> | null,
+  mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => T,
+  forceServer = false
+): Promise<PaginatedPageResult<T>> {
+  const pageConstraints = cursorDoc
+    ? [...constraints, startAfter(cursorDoc), limit(MAX_QUERY_LIMIT)]
+    : [...constraints, limit(MAX_QUERY_LIMIT)];
+  const q = query(collection(db, collectionName), ...pageConstraints);
+
+  if (!forceServer) {
+    const cachedSnap = await getDocsFromCache(q).catch(() => null);
+    if (cachedSnap && !cachedSnap.empty) {
+      const items: T[] = [];
+      cachedSnap.forEach((d) => items.push(mapDoc(d)));
+      return {
+        items,
+        lastDoc: cachedSnap.docs[cachedSnap.docs.length - 1] || null,
+        hasMore: cachedSnap.docs.length === MAX_QUERY_LIMIT,
+      };
+    }
+  }
+
+  if (!auth.currentUser) {
+    return { items: [], lastDoc: null, hasMore: false };
+  }
+
+  const snap = await getDocs(q);
+  const items: T[] = [];
+  snap.forEach((d) => items.push(mapDoc(d)));
+  return {
+    items,
+    lastDoc: snap.docs[snap.docs.length - 1] || null,
+    hasMore: snap.docs.length === MAX_QUERY_LIMIT,
+  };
+}
+
+/**
+ * Paginated sequential cursor loader for full datasets (uses limit(20) + startAfter() per page)
+ */
+async function fetchAllPagesWithLimit20<T>(
+  collectionName: string,
+  constraints: QueryConstraint[],
+  mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => T,
+  forceServer = false,
+  maxPages = 40
+): Promise<T[]> {
+  const collected: T[] = [];
+  let cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null;
+  let pageCount = 0;
+
+  while (pageCount < maxPages) {
+    const page: PaginatedPageResult<T> = await fetchCollectionPageFromFirestore<T>(
+      collectionName,
+      constraints,
+      cursorDoc,
+      mapDoc,
+      forceServer
+    );
+    collected.push(...page.items);
+    pageCount += 1;
+    if (!page.hasMore || !page.lastDoc) break;
+    cursorDoc = page.lastDoc;
+  }
+
+  return collected;
+}
+
+// Non-blocking atomic counter helper on stats/global
+function adjustGlobalStat(field: keyof Omit<GlobalStats, 'updatedAt'>, delta: number) {
+  if (!auth.currentUser || delta === 0) return;
+  const cached = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+  const currentVal = Number(cached[field] || 0);
+  const nextStats: GlobalStats = {
+    ...cached,
+    [field]: Math.max(0, currentVal + delta),
+    updatedAt: new Date().toISOString(),
+  };
+  setLocal(STORAGE_KEYS.GLOBAL_STATS, nextStats);
+  window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: nextStats }));
+
+  void setDoc(
+    doc(db, 'stats', 'global'),
+    {
+      [field]: increment(delta),
+      updatedAt: nextStats.updatedAt,
+    },
+    { merge: true }
+  ).catch(() => {
+    // Ignore non-critical counter sync error
+  });
+}
+
+/**
  * Shared Server Cache Sync:
  * Fetches questions, subjects, notifications, and bot_commands from Node server RAM cache first
- * (0 Firestore reads for 99.9% of users), with IndexedDB + Firestore fallback.
+ * (0 Firestore reads for 99.9% of users), with IndexedDB + Firestore limit(20) fallback.
  */
 async function syncCoreFromServer(force = false): Promise<boolean> {
   await hydrateCacheFromIdb();
@@ -275,8 +450,13 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
       if (force) params.set('force', '1');
       if (!force && savedVersion > 0) params.set('since', String(savedVersion));
 
+      const authHeader = await getAuthBearerHeader();
+      const headers: Record<string, string> = {};
+      if (authHeader) headers['Authorization'] = authHeader;
+
       const res = await fetch(`/api/cache/core?${params.toString()}`, {
         cache: 'no-store',
+        headers,
       });
       const payload = await res.json().catch(() => null);
 
@@ -286,7 +466,7 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
       }
 
       if (!res.ok || !payload) {
-        return Boolean(payload?.quotaLimited);
+        return Boolean(payload?.quotaLimited || payload?.requiresAuth);
       }
 
       setSyncTimestamp('CORE_CHECK');
@@ -339,7 +519,7 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
   });
 }
 
-// ---------------- Cached Fetchers & Event-Synced Subscriptions ----------------
+// ---------------- Cached Fetchers & Paginated Loaders ----------------
 
 export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   await hydrateCacheFromIdb();
@@ -359,29 +539,36 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
     }
     try {
       if (!force) {
-        const cachedSnap = await getDocsFromCache(collection(db, 'questions')).catch(() => null);
+        const cachedSnap = await getDocsFromCache(
+          query(collection(db, 'questions'), limit(MAX_QUERY_LIMIT))
+        ).catch(() => null);
         if (cachedSnap && !cachedSnap.empty) {
-          const cachedList: Question[] = [];
-          cachedSnap.forEach((d) => {
-            cachedList.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
-          });
-          const sorted = sortQuestions(cachedList);
-          setLocal(STORAGE_KEYS.QUESTIONS, sorted);
-          setSyncTimestamp('QUESTIONS');
-          window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
-          return sorted;
+          const cachedAll = await fetchAllPagesWithLimit20<Question>(
+            'questions',
+            [],
+            (d) => ({ id: d.id, ...(d.data() as Omit<Question, 'id'>) }),
+            false
+          );
+          if (cachedAll.length > 0) {
+            const sorted = sortQuestions(cachedAll);
+            setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+            setSyncTimestamp('QUESTIONS');
+            window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
+            return sorted;
+          }
         }
       }
 
-      if (isQuotaCooldownActive(force)) {
+      if (isQuotaCooldownActive(force) || !auth.currentUser) {
         return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
       }
 
-      const snapshot = await getDocs(collection(db, 'questions'));
-      const questions: Question[] = [];
-      snapshot.forEach((d) => {
-        questions.push({ id: d.id, ...(d.data() as Omit<Question, 'id'>) });
-      });
+      const questions = await fetchAllPagesWithLimit20<Question>(
+        'questions',
+        [],
+        (d) => ({ id: d.id, ...(d.data() as Omit<Question, 'id'>) }),
+        force
+      );
       const sorted = sortQuestions(questions);
       setLocal(STORAGE_KEYS.QUESTIONS, sorted);
       setSyncTimestamp('QUESTIONS');
@@ -389,7 +576,7 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
       return sorted;
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
-      handleFirestoreError(err, OperationType.GET, 'questions');
+      handleFirestoreError(err, OperationType.LIST, 'questions');
       return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     }
   });
@@ -445,12 +632,13 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
     }
     try {
       if (!force) {
-        const cachedSnap = await getDocsFromCache(collection(db, 'subjects')).catch(() => null);
-        if (cachedSnap && !cachedSnap.empty) {
-          const cachedSubs: Subject[] = [];
-          cachedSnap.forEach((d) => {
-            cachedSubs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
-          });
+        const cachedSubs = await fetchAllPagesWithLimit20<Subject>(
+          'subjects',
+          [],
+          (d) => ({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) }),
+          false
+        ).catch(() => []);
+        if (cachedSubs.length > 0) {
           const sorted = sortSubjects(cachedSubs);
           setLocal(STORAGE_KEYS.SUBJECTS, sorted);
           setSyncTimestamp('SUBJECTS');
@@ -459,15 +647,16 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
         }
       }
 
-      if (isQuotaCooldownActive(force)) {
+      if (isQuotaCooldownActive(force) || !auth.currentUser) {
         return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
       }
 
-      const snapshot = await getDocs(collection(db, 'subjects'));
-      const subs: Subject[] = [];
-      snapshot.forEach((d) => {
-        subs.push({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) });
-      });
+      const subs = await fetchAllPagesWithLimit20<Subject>(
+        'subjects',
+        [],
+        (d) => ({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) }),
+        force
+      );
       const sorted = sortSubjects(subs);
       setLocal(STORAGE_KEYS.SUBJECTS, sorted);
       setSyncTimestamp('SUBJECTS');
@@ -475,7 +664,7 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
       return sorted;
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
-      handleFirestoreError(err, OperationType.GET, 'subjects');
+      handleFirestoreError(err, OperationType.LIST, 'subjects');
       return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     }
   });
@@ -535,39 +724,24 @@ export async function fetchNotificationsCached(force = false): Promise<AppNotifi
       return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
     }
     try {
-      const notifQuery = query(collection(db, 'notifications'), orderBy('timestamp', 'desc'), limit(50));
-      if (!force) {
-        const cachedSnap = await getDocsFromCache(notifQuery).catch(() => null);
-        if (cachedSnap && !cachedSnap.empty) {
-          const cachedNotifs: AppNotification[] = [];
-          cachedSnap.forEach((d) => {
-            cachedNotifs.push({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) });
-          });
-          const next = resolveNotificationsWithDismissed(cachedNotifs);
-          setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
-          setSyncTimestamp('NOTIFICATIONS');
-          window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
-          return next;
-        }
-      }
-
-      if (isQuotaCooldownActive(force)) {
+      const page = await fetchCollectionPageFromFirestore<AppNotification>(
+        'notifications',
+        [orderBy('timestamp', 'desc')],
+        null,
+        (d) => ({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) }),
+        force
+      );
+      if (page.items.length === 0 && (isQuotaCooldownActive(force) || !auth.currentUser)) {
         return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
       }
-
-      const snapshot = await getDocs(notifQuery);
-      const serverNotifs: AppNotification[] = [];
-      snapshot.forEach((d) => {
-        serverNotifs.push({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) });
-      });
-      const next = resolveNotificationsWithDismissed(serverNotifs);
+      const next = resolveNotificationsWithDismissed(page.items);
       setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
       setSyncTimestamp('NOTIFICATIONS');
       window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
       return next;
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
-      handleFirestoreError(err, OperationType.GET, 'notifications');
+      handleFirestoreError(err, OperationType.LIST, 'notifications');
       return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
     }
   });
@@ -606,6 +780,40 @@ export function subscribeNotifications(callback: (notifications: AppNotification
   };
 }
 
+// ---------------- Paginated Admin Feeds (20 per page + startAfter) ----------------
+
+export async function fetchFeedbacksPage(
+  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  force = false
+): Promise<PaginatedPageResult<Feedback>> {
+  await hydrateCacheFromIdb();
+  if (isQuotaCooldownActive(force)) {
+    return {
+      items: cursorDoc ? [] : getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+  try {
+    const page = await fetchCollectionPageFromFirestore<Feedback>(
+      'feedbacks',
+      [orderBy('createdAt', 'desc')],
+      cursorDoc,
+      (d) => ({ id: d.id, ...(d.data() as Omit<Feedback, 'id'>) }),
+      force
+    );
+    return page;
+  } catch (err) {
+    markClientQuotaCooldownIfNeeded(err);
+    handleFirestoreError(err, OperationType.LIST, 'feedbacks');
+    return {
+      items: cursorDoc ? [] : getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+}
+
 export async function fetchFeedbacksCached(force = false): Promise<Feedback[]> {
   await hydrateCacheFromIdb();
 
@@ -617,23 +825,14 @@ export async function fetchFeedbacksCached(force = false): Promise<Feedback[]> {
     if (!force && isCacheFresh('FEEDBACKS', STORAGE_KEYS.FEEDBACKS)) {
       return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
     }
-    try {
-      const snapshot = await getDocs(
-        query(collection(db, 'feedbacks'), orderBy('createdAt', 'desc'), limit(100))
-      );
-      const items: Feedback[] = [];
-      snapshot.forEach((d) => {
-        items.push({ id: d.id, ...(d.data() as Omit<Feedback, 'id'>) });
-      });
-      items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setLocal(STORAGE_KEYS.FEEDBACKS, items);
+    const page = await fetchFeedbacksPage(null, force);
+    if (page.items.length > 0 || auth.currentUser) {
+      setLocal(STORAGE_KEYS.FEEDBACKS, page.items);
       setSyncTimestamp('FEEDBACKS');
-      window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: items }));
-      return items;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, 'feedbacks');
-      return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+      window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: page.items }));
+      return page.items;
     }
+    return getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
   });
 }
 
@@ -660,6 +859,38 @@ export function subscribeFeedbacks(callback: (feedbacks: Feedback[]) => void) {
   };
 }
 
+export async function fetchLoginsPage(
+  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  force = false
+): Promise<PaginatedPageResult<LoginRecord>> {
+  await hydrateCacheFromIdb();
+  if (isQuotaCooldownActive(force)) {
+    return {
+      items: cursorDoc ? [] : getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+  try {
+    const page = await fetchCollectionPageFromFirestore<LoginRecord>(
+      'logins',
+      [orderBy('timestamp', 'desc')],
+      cursorDoc,
+      (d) => ({ id: d.id, ...(d.data() as Omit<LoginRecord, 'id'>) }),
+      force
+    );
+    return page;
+  } catch (err) {
+    markClientQuotaCooldownIfNeeded(err);
+    handleFirestoreError(err, OperationType.LIST, 'logins');
+    return {
+      items: cursorDoc ? [] : getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+}
+
 export async function fetchLoginsCached(force = false): Promise<LoginRecord[]> {
   await hydrateCacheFromIdb();
 
@@ -671,23 +902,14 @@ export async function fetchLoginsCached(force = false): Promise<LoginRecord[]> {
     if (!force && isCacheFresh('LOGINS', STORAGE_KEYS.LOGINS)) {
       return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
     }
-    try {
-      const snapshot = await getDocs(
-        query(collection(db, 'logins'), orderBy('timestamp', 'desc'), limit(100))
-      );
-      const items: LoginRecord[] = [];
-      snapshot.forEach((d) => {
-        items.push({ id: d.id, ...(d.data() as Omit<LoginRecord, 'id'>) });
-      });
-      items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      setLocal(STORAGE_KEYS.LOGINS, items);
+    const page = await fetchLoginsPage(null, force);
+    if (page.items.length > 0 || auth.currentUser) {
+      setLocal(STORAGE_KEYS.LOGINS, page.items);
       setSyncTimestamp('LOGINS');
-      window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: items }));
-      return items;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, 'logins');
-      return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+      window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: page.items }));
+      return page.items;
     }
+    return getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
   });
 }
 
@@ -714,6 +936,46 @@ export function subscribeLogins(callback: (logins: LoginRecord[]) => void) {
   };
 }
 
+export async function fetchPresencePage(
+  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  force = false
+): Promise<PaginatedPageResult<PresenceRecord>> {
+  await hydrateCacheFromIdb();
+  const filterActive = (list: PresenceRecord[]) => {
+    const now = Date.now();
+    return list.filter((item) => now - new Date(item.lastSeen).getTime() < 300000);
+  };
+  if (isQuotaCooldownActive(force)) {
+    return {
+      items: cursorDoc ? [] : filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, [])),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+  try {
+    const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
+    const page = await fetchCollectionPageFromFirestore<PresenceRecord>(
+      'presence',
+      [where('lastSeen', '>=', fiveMinsAgoIso), orderBy('lastSeen', 'desc')],
+      cursorDoc,
+      (d) => ({ id: d.id, ...(d.data() as Omit<PresenceRecord, 'id'>) }),
+      force
+    );
+    return {
+      ...page,
+      items: filterActive(page.items),
+    };
+  } catch (err) {
+    markClientQuotaCooldownIfNeeded(err);
+    handleFirestoreError(err, OperationType.LIST, 'presence');
+    return {
+      items: cursorDoc ? [] : filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, [])),
+      lastDoc: null,
+      hasMore: false,
+    };
+  }
+}
+
 export async function fetchPresenceCached(force = false): Promise<PresenceRecord[]> {
   await hydrateCacheFromIdb();
 
@@ -730,26 +992,14 @@ export async function fetchPresenceCached(force = false): Promise<PresenceRecord
     if (!force && isCacheFresh('PRESENCE', STORAGE_KEYS.PRESENCE)) {
       return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
     }
-    try {
-      const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
-      const snapshot = await getDocs(
-        query(collection(db, 'presence'), where('lastSeen', '>=', fiveMinsAgoIso), limit(100))
-      );
-      const items: PresenceRecord[] = [];
-      snapshot.forEach((d) => {
-        items.push({ id: d.id, ...(d.data() as Omit<PresenceRecord, 'id'>) });
-      });
-      const activeItems = filterActive(items);
-      setLocal(STORAGE_KEYS.PRESENCE, activeItems);
+    const page = await fetchPresencePage(null, force);
+    if (page.items.length > 0 || auth.currentUser) {
+      setLocal(STORAGE_KEYS.PRESENCE, page.items);
       setSyncTimestamp('PRESENCE');
-      setLocal(STORAGE_KEYS.ONLINE_COUNT, Math.max(1, activeItems.length));
-      setSyncTimestamp('ONLINE_COUNT');
-      window.dispatchEvent(new CustomEvent('mpq-presence-changed', { detail: activeItems }));
-      return activeItems;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, 'presence');
-      return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
+      window.dispatchEvent(new CustomEvent('mpq-presence-changed', { detail: page.items }));
+      return page.items;
     }
+    return filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []));
   });
 }
 
@@ -777,9 +1027,10 @@ export function subscribePresence(callback: (presence: PresenceRecord[]) => void
 }
 
 /**
- * Lightweight Online Count aggregation (uses shared server RAM cache first -> 0 client Firestore reads)
+ * Lightweight Online Count via Server Aggregation Cache + getCountFromServer(limit(20))
  */
 export async function fetchOnlineCount(force = false): Promise<number> {
+  await hydrateCacheFromIdb();
   if (!force && isCacheFresh('ONLINE_COUNT', STORAGE_KEYS.ONLINE_COUNT)) {
     return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
   }
@@ -789,8 +1040,13 @@ export async function fetchOnlineCount(force = false): Promise<number> {
       return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
     }
     try {
+      const authHeader = await getAuthBearerHeader();
+      const headers: Record<string, string> = {};
+      if (authHeader) headers['Authorization'] = authHeader;
+
       const serverRes = await fetch(`/api/cache/online-count${force ? '?force=1' : ''}`, {
         cache: 'no-store',
+        headers,
       }).catch(() => null);
       if (serverRes && serverRes.ok) {
         const data = await serverRes.json();
@@ -800,19 +1056,94 @@ export async function fetchOnlineCount(force = false): Promise<number> {
         return count;
       }
 
+      if (!auth.currentUser || isQuotaCooldownActive(force)) {
+        return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
+      }
+
       const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
       const agg = await getCountFromServer(
-        query(collection(db, 'presence'), where('lastSeen', '>=', fiveMinsAgoIso))
+        query(collection(db, 'presence'), where('lastSeen', '>=', fiveMinsAgoIso), limit(MAX_QUERY_LIMIT))
       );
       const count = Math.max(1, agg.data().count || 0);
       setLocal(STORAGE_KEYS.ONLINE_COUNT, count);
       setSyncTimestamp('ONLINE_COUNT');
       return count;
     } catch (err) {
-      handleFirestoreError(err, OperationType.GET, 'presence/count');
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.LIST, 'presence/count');
       return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
     }
   });
+}
+
+/**
+ * Aggregated Collection Counts using stats/global (1 getDoc) + getCountFromServer(limit(20))
+ */
+export async function fetchGlobalStatsCached(force = false): Promise<GlobalStats> {
+  await hydrateCacheFromIdb();
+  if (!force && isCacheFresh('GLOBAL_STATS', STORAGE_KEYS.GLOBAL_STATS)) {
+    return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+  }
+
+  return runDeduplicated(`global_stats:${force ? 'force' : 'ttl'}`, async () => {
+    if (!force && isCacheFresh('GLOBAL_STATS', STORAGE_KEYS.GLOBAL_STATS)) {
+      return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+    }
+    if (!auth.currentUser || isQuotaCooldownActive(force)) {
+      return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+    }
+    try {
+      const snap = await getDoc(doc(db, 'stats', 'global'));
+      if (snap.exists()) {
+        const data = snap.data() as GlobalStats;
+        setLocal(STORAGE_KEYS.GLOBAL_STATS, data);
+        setSyncTimestamp('GLOBAL_STATS');
+        window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: data }));
+        return data;
+      }
+
+      // Bootstrap counts via bounded getCountFromServer queries (obeying limit <= 20 rule)
+      const [qAgg, sAgg, nAgg, fAgg] = await Promise.allSettled([
+        getCountFromServer(query(collection(db, 'questions'), limit(MAX_QUERY_LIMIT))),
+        getCountFromServer(query(collection(db, 'subjects'), limit(MAX_QUERY_LIMIT))),
+        getCountFromServer(query(collection(db, 'notifications'), limit(MAX_QUERY_LIMIT))),
+        getCountFromServer(query(collection(db, 'feedbacks'), limit(MAX_QUERY_LIMIT))),
+      ]);
+      const fallbackStats: GlobalStats = {
+        questionsCount: qAgg.status === 'fulfilled' ? qAgg.value.data().count : undefined,
+        subjectsCount: sAgg.status === 'fulfilled' ? sAgg.value.data().count : undefined,
+        notificationsCount: nAgg.status === 'fulfilled' ? nAgg.value.data().count : undefined,
+        feedbacksCount: fAgg.status === 'fulfilled' ? fAgg.value.data().count : undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      setLocal(STORAGE_KEYS.GLOBAL_STATS, fallbackStats);
+      setSyncTimestamp('GLOBAL_STATS');
+      return fallbackStats;
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.GET, 'stats/global');
+      return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+    }
+  });
+}
+
+export function subscribeGlobalStats(callback: (stats: GlobalStats) => void) {
+  callback(getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {}));
+  const handleChange = (e: Event) => {
+    const customEvent = e as CustomEvent<GlobalStats>;
+    if (customEvent.detail) callback(customEvent.detail);
+  };
+  window.addEventListener('mpq-global-stats-changed', handleChange);
+
+  let active = true;
+  void fetchGlobalStatsCached(false).then((stats) => {
+    if (active) callback(stats);
+  });
+
+  return () => {
+    active = false;
+    window.removeEventListener('mpq-global-stats-changed', handleChange);
+  };
 }
 
 /**
@@ -828,6 +1159,7 @@ export async function refreshCoreData() {
       fetchBotCommandsCached(true),
     ]);
   }
+  await fetchGlobalStatsCached(true);
 }
 
 export async function refreshAdminMonitoringData() {
@@ -835,6 +1167,7 @@ export async function refreshAdminMonitoringData() {
     fetchPresenceCached(true),
     fetchLoginsCached(true),
     fetchFeedbacksCached(true),
+    fetchGlobalStatsCached(true),
   ]);
 }
 
@@ -864,6 +1197,7 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   try {
     await setDoc(doc(db, 'questions', id), newQuestion);
     syncMutationToServerCache('questions', next);
+    adjustGlobalStat('questionsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
@@ -899,6 +1233,7 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
       await batch.commit();
     }
     syncMutationToServerCache('questions', next);
+    adjustGlobalStat('questionsCount', created.length);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
@@ -933,14 +1268,12 @@ export async function deleteQuestion(id: string) {
   try {
     await deleteDoc(doc(db, 'questions', id));
     syncMutationToServerCache('questions', next);
+    adjustGlobalStat('questionsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
   }
 }
 
-/**
- * Swap two questions positions (e.g. swap position of Q1 and Q8)
- */
 export async function swapQuestions(q1: Question, q2: Question) {
   if (!q1.id || !q2.id) return;
   const tempOrder = q1.order ?? 0;
@@ -964,6 +1297,7 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   try {
     await setDoc(doc(db, 'subjects', id), newSub);
     syncMutationToServerCache('subjects', next);
+    adjustGlobalStat('subjectsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'subjects');
   }
@@ -987,9 +1321,6 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   }
 }
 
-/**
- * Normalize sequential order indices (0..N-1) across subjects and persist atomically.
- */
 export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subject[]> {
   if (orderedSubjects.length === 0) return [];
 
@@ -1078,6 +1409,7 @@ export async function deleteSubject(id: string) {
   try {
     await deleteDoc(doc(db, 'subjects', id));
     syncMutationToServerCache('subjects', next);
+    adjustGlobalStat('subjectsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
   }
@@ -1085,20 +1417,23 @@ export async function deleteSubject(id: string) {
 
 export async function recordLogin(username: string, passwordUsed: string, role: 'user' | 'admin') {
   const id = `login-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-  const record: LoginRecord = {
+  const record: LoginRecord = sanitizeData({
     id,
     username,
     passwordUsed,
     timestamp: new Date().toISOString(),
     role,
-  };
+    uid: auth.currentUser?.uid,
+  });
   const cached = getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
   const next = [record, ...cached].slice(0, 100);
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
+  if (!auth.currentUser) return;
   try {
     await setDoc(doc(db, 'logins', id), record);
+    adjustGlobalStat('loginsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'logins');
   }
@@ -1110,8 +1445,10 @@ export async function deleteLoginRecord(id: string) {
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
+  if (!auth.currentUser) return;
   try {
     await deleteDoc(doc(db, 'logins', id));
+    adjustGlobalStat('loginsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `logins/${id}`);
   }
@@ -1125,6 +1462,7 @@ export async function deleteLoginsByIds(ids: string[]) {
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
+  if (!auth.currentUser) return;
   try {
     const CHUNK_SIZE = 450;
     for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
@@ -1134,6 +1472,7 @@ export async function deleteLoginsByIds(ids: string[]) {
       }
       await batch.commit();
     }
+    adjustGlobalStat('loginsCount', -ids.length);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'logins');
   }
@@ -1144,19 +1483,20 @@ export async function updatePresenceHeartbeat(username: string, role: 'user' | '
   const lastPing = getLocal<{ id: string; at: number } | null>(STORAGE_KEYS.LAST_PRESENCE_PING, null);
   const nowMs = Date.now();
 
-  // Throttle redundant presence writes when reloading rapidly within 4.5 minutes
   if (lastPing && lastPing.id === safeId && nowMs - lastPing.at < 270000) {
     return;
   }
 
   setLocal(STORAGE_KEYS.LAST_PRESENCE_PING, { id: safeId, at: nowMs });
+  if (!auth.currentUser) return;
 
-  const record: PresenceRecord = {
+  const record: PresenceRecord = sanitizeData({
     id: safeId,
     username,
     role,
     lastSeen: new Date(nowMs).toISOString(),
-  };
+    uid: auth.currentUser.uid,
+  });
   try {
     await setDoc(doc(db, 'presence', safeId), record, { merge: true });
   } catch (err) {
@@ -1166,20 +1506,23 @@ export async function updatePresenceHeartbeat(username: string, role: 'user' | '
 
 export async function submitFeedback(username: string, text: string) {
   const id = `fb-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  const item: Feedback = {
+  const item: Feedback = sanitizeData({
     id,
     username,
     text,
     createdAt: new Date().toISOString(),
-  };
+    uid: auth.currentUser?.uid,
+  });
 
   const cached = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
   const next = [item, ...cached].slice(0, 100);
   setLocal(STORAGE_KEYS.FEEDBACKS, next);
   window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: next }));
 
+  if (!auth.currentUser) return item;
   try {
     await setDoc(doc(db, 'feedbacks', id), item);
+    adjustGlobalStat('feedbacksCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'feedbacks');
   }
@@ -1204,6 +1547,7 @@ export async function broadcastNotification(message: string, type: 'info' | 'suc
   try {
     await setDoc(doc(db, 'notifications', id), item);
     syncMutationToServerCache('notifications', next);
+    adjustGlobalStat('notificationsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'notifications');
   }
@@ -1225,6 +1569,7 @@ export async function deleteNotification(id: string) {
   try {
     await deleteDoc(doc(db, 'notifications', id));
     syncMutationToServerCache('notifications', next);
+    adjustGlobalStat('notificationsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
   }
@@ -1250,6 +1595,7 @@ export async function deleteAllNotifications(ids: string[]) {
       await batch.commit();
     }
     syncMutationToServerCache('notifications', []);
+    adjustGlobalStat('notificationsCount', -ids.length);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'notifications');
   }
@@ -1267,18 +1613,23 @@ export async function fetchPaidUsersCached(force = false): Promise<PaidUser[]> {
       return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
     }
     try {
-      const snapshot = await getDocs(query(collection(db, 'paid_users'), limit(200)));
-      const users: PaidUser[] = [];
-      snapshot.forEach((d) => {
-        users.push({ id: d.id, ...(d.data() as Omit<PaidUser, 'id'>) });
-      });
-      users.sort((a, b) => new Date(b.paidAt).getTime() - new Date(a.paidAt).getTime());
-      setLocal(STORAGE_KEYS.PAID_USERS, users);
-      setSyncTimestamp('PAID_USERS');
-      window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: users }));
-      return users;
+      const page = await fetchCollectionPageFromFirestore<PaidUser>(
+        'paid_users',
+        [orderBy('paidAt', 'desc')],
+        null,
+        (d) => ({ id: d.id, ...(d.data() as Omit<PaidUser, 'id'>) }),
+        force
+      );
+      if (page.items.length > 0 || auth.currentUser) {
+        setLocal(STORAGE_KEYS.PAID_USERS, page.items);
+        setSyncTimestamp('PAID_USERS');
+        window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: page.items }));
+        return page.items;
+      }
+      return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
     } catch (err) {
-      handleFirestoreError(err, OperationType.GET, 'paid_users');
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.LIST, 'paid_users');
       return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
     }
   });
@@ -1321,7 +1672,7 @@ export async function checkIsUserPaid(rawUsername: string): Promise<PaidUser | n
   if (localMatch) return localMatch;
 
   const lastMiss = checkedNonPaidAt.get(norm) || 0;
-  if (Date.now() - lastMiss < 5 * 60 * 1000 || isQuotaCooldownActive(false)) {
+  if (!auth.currentUser || Date.now() - lastMiss < 5 * 60 * 1000 || isQuotaCooldownActive(false)) {
     return null;
   }
 
@@ -1355,7 +1706,7 @@ export async function registerPaidUser(params: {
   const id = `user-${encodeURIComponent(norm)}`;
   const now = new Date().toISOString();
 
-  const record: PaidUser = {
+  const record: PaidUser = sanitizeData({
     id,
     username: params.username.trim(),
     phoneNumber: params.phoneNumber?.trim() || '',
@@ -1367,7 +1718,8 @@ export async function registerPaidUser(params: {
     transactionRef: params.transactionRef?.trim() || `KHQR-${Date.now().toString(36).toUpperCase()}`,
     method: params.method || 'KHQR_BAKONG_ABA',
     note: params.note || 'បង់ប្រាក់ជោគជ័យតាម KHQR ($10.00) ទទួលបានសិទ្ធិប្រើប្រាស់ពេញមួយជីវិត',
-  };
+    uid: auth.currentUser?.uid,
+  });
 
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
   const existingIdx = cached.findIndex((u) => u.id === id);
@@ -1449,15 +1801,17 @@ export async function fetchBotCommandsCached(force = false): Promise<Record<stri
     }
     try {
       if (!force) {
-        const cachedSnap = await getDocsFromCache(collection(db, 'bot_commands')).catch(() => null);
-        if (cachedSnap && !cachedSnap.empty) {
+        const cachedList = await fetchAllPagesWithLimit20<BotCommandConfig>(
+          'bot_commands',
+          [],
+          (d) => d.data() as BotCommandConfig,
+          false
+        ).catch(() => []);
+        if (cachedList.length > 0) {
           const cachedMap: Record<string, BotCommandConfig> = {};
-          cachedSnap.forEach((d) => {
-            const data = d.data() as BotCommandConfig;
-            if (data?.command) {
-              cachedMap[data.command] = data;
-            }
-          });
+          for (const item of cachedList) {
+            if (item?.command) cachedMap[item.command] = item;
+          }
           setLocal(STORAGE_KEYS.BOT_COMMANDS, cachedMap);
           setSyncTimestamp('BOT_COMMANDS');
           window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: cachedMap }));
@@ -1465,33 +1819,34 @@ export async function fetchBotCommandsCached(force = false): Promise<Record<stri
         }
       }
 
-      if (isQuotaCooldownActive(force)) {
+      if (isQuotaCooldownActive(force) || !auth.currentUser) {
         return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
       }
 
-      const snapshot = await getDocs(collection(db, 'bot_commands'));
+      const list = await fetchAllPagesWithLimit20<BotCommandConfig>(
+        'bot_commands',
+        [],
+        (d) => d.data() as BotCommandConfig,
+        force
+      );
       const map: Record<string, BotCommandConfig> = {};
-      snapshot.forEach((d) => {
-        const data = d.data() as BotCommandConfig;
-        if (data?.command) {
-          map[data.command] = data;
+      for (const item of list) {
+        if (item?.command) {
+          map[item.command] = item;
         }
-      });
+      }
       setLocal(STORAGE_KEYS.BOT_COMMANDS, map);
       setSyncTimestamp('BOT_COMMANDS');
       window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: map }));
       return map;
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
-      handleFirestoreError(err, OperationType.GET, 'bot_commands');
+      handleFirestoreError(err, OperationType.LIST, 'bot_commands');
       return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
     }
   });
 }
 
-/**
- * Cached Command Bot Content Listener (supports cacheOnly mode for pre-login screen)
- */
 export function subscribeBotCommands(
   callback: (commands: Record<string, BotCommandConfig>) => void,
   options?: { cacheOnly?: boolean }

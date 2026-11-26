@@ -39,8 +39,9 @@ import {
   Save,
   FileJson,
   Upload,
+  Cloud,
 } from 'lucide-react';
-import { Question, Subject, LoginRecord, PresenceRecord, Feedback, QuestionType, AppNotification, BotCommandConfig, BotActionButton } from '../types';
+import { Question, Subject, LoginRecord, PresenceRecord, Feedback, QuestionType, AppNotification, BotCommandConfig, BotActionButton, GlobalStats } from '../types';
 import { toKhmerNum, getOptionLabel, shuffleArray } from '../utils/khmer';
 import { KhmerCornerMotif } from './KhmerOrnaments';
 import { SocialShareModal, ShareBatchCandidate } from './SocialShareModal';
@@ -71,6 +72,7 @@ import {
   resetAllBotCommands,
   refreshCoreData,
   refreshAdminMonitoringData,
+  signInWithGoogle,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
@@ -125,6 +127,18 @@ interface AdminSectionProps {
   feedbacks: Feedback[];
   notifications: AppNotification[];
   botCommands?: Record<string, BotCommandConfig>;
+  globalStats?: GlobalStats;
+  firebaseUserEmail?: string | null;
+  hasMoreLogins?: boolean;
+  isLoadingMoreLogins?: boolean;
+  onLoadMoreLogins?: () => void;
+  hasMorePresence?: boolean;
+  isLoadingMorePresence?: boolean;
+  onLoadMorePresence?: () => void;
+  hasMoreFeedbacks?: boolean;
+  isLoadingMoreFeedbacks?: boolean;
+  onLoadMoreFeedbacks?: () => void;
+  onRefreshMonitoring?: () => Promise<void>;
 }
 
 export const AdminSection: React.FC<AdminSectionProps> = ({
@@ -135,6 +149,18 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   feedbacks,
   notifications,
   botCommands = {},
+  globalStats,
+  firebaseUserEmail = null,
+  hasMoreLogins = false,
+  isLoadingMoreLogins = false,
+  onLoadMoreLogins,
+  hasMorePresence = false,
+  isLoadingMorePresence = false,
+  onLoadMorePresence,
+  hasMoreFeedbacks = false,
+  isLoadingMoreFeedbacks = false,
+  onLoadMoreFeedbacks,
+  onRefreshMonitoring,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<
     'single' | 'bulk_ai' | 'manage' | 'export' | 'telegram' | 'monitoring'
@@ -173,23 +199,16 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     null
   );
 
-  // Sync state whenever subjects change
+  // Sync selected subject fallbacks safely using functional updaters (prevents redundant re-renders)
+  const subjectNamesKey = useMemo(() => subjects.map((s) => s.name).join('||'), [subjects]);
   useEffect(() => {
-    if (subjects.length > 0) {
-      if (!bulkSubject || !subjects.some((s) => s.name === bulkSubject)) {
-        setBulkSubject(subjects[0].name);
-      }
-      if (!singleSubject || !subjects.some((s) => s.name === singleSubject)) {
-        setSingleSubject(subjects[0].name);
-      }
-      if (!selectedSubjectToManage || !subjects.some((s) => s.name === selectedSubjectToManage)) {
-        setSelectedSubjectToManage(subjects[0].name);
-      }
-      if (!exportSubject || !subjects.some((s) => s.name === exportSubject)) {
-        setExportSubject(subjects[0].name);
-      }
-    }
-  }, [subjects]);
+    if (subjects.length === 0) return;
+    const validNames = new Set(subjects.map((s) => s.name));
+    const firstName = subjects[0].name;
+    setBulkSubject((prev) => (prev && validNames.has(prev) ? prev : firstName));
+    setSingleSubject((prev) => (prev && validNames.has(prev) ? prev : firstName));
+    setSelectedSubjectToManage((prev) => (prev && validNames.has(prev) ? prev : firstName));
+  }, [subjectNamesKey, subjects]);
 
   // Management State
   const [directSubjectName, setDirectSubjectName] = useState('');
@@ -2030,13 +2049,33 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [isSyncingAdminData, setIsSyncingAdminData] = useState(false);
   const [adminSyncDone, setAdminSyncDone] = useState(false);
   const [isSyncingMonitoring, setIsSyncingMonitoring] = useState(false);
+  const [isConnectingGoogle, setIsConnectingGoogle] = useState(false);
+
+  const handleConnectGoogleAdmin = async () => {
+    if (isConnectingGoogle) return;
+    setIsConnectingGoogle(true);
+    try {
+      await signInWithGoogle();
+      await Promise.all([
+        refreshCoreData(),
+        onRefreshMonitoring ? onRefreshMonitoring() : refreshAdminMonitoringData(),
+      ]);
+    } catch {
+      // User dismissed or failed popup
+    } finally {
+      setIsConnectingGoogle(false);
+    }
+  };
 
   const handleAdminSyncAll = async () => {
     if (isSyncingAdminData) return;
     setIsSyncingAdminData(true);
     setAdminSyncDone(false);
     try {
-      await Promise.all([refreshCoreData(), refreshAdminMonitoringData()]);
+      await Promise.all([
+        refreshCoreData(),
+        onRefreshMonitoring ? onRefreshMonitoring() : refreshAdminMonitoringData(),
+      ]);
       setAdminSyncDone(true);
       setTimeout(() => setAdminSyncDone(false), 2500);
     } finally {
@@ -2048,7 +2087,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     if (isSyncingMonitoring) return;
     setIsSyncingMonitoring(true);
     try {
-      await refreshAdminMonitoringData();
+      if (onRefreshMonitoring) {
+        await onRefreshMonitoring();
+      } else {
+        await refreshAdminMonitoringData();
+      }
     } finally {
       setIsSyncingMonitoring(false);
     }
@@ -2075,7 +2118,24 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          {!firebaseUserEmail ? (
+            <button
+              type="button"
+              disabled={isConnectingGoogle}
+              onClick={handleConnectGoogleAdmin}
+              className="px-3.5 py-2 rounded-xl bg-amber-50 dark:bg-amber-950/60 hover:opacity-90 border border-amber-400 dark:border-amber-700 text-amber-900 dark:text-amber-200 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+              title="ភ្ជាប់គណនី Google Admin ដើម្បីអនុញ្ញាតឱ្យអាន និងរក្សាទុកទិន្នន័យលើ Firestore"
+            >
+              <Cloud className="w-3.5 h-3.5 shrink-0" />
+              <span>{isConnectingGoogle ? 'កំពុងភ្ជាប់...' : 'ភ្ជាប់ Google Admin'}</span>
+            </button>
+          ) : (
+            <span className="px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 text-xs font-semibold flex items-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate max-w-[160px]">{firebaseUserEmail}</span>
+            </span>
+          )}
           <button
             type="button"
             disabled={isSyncingAdminData}
@@ -5525,8 +5585,8 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           </div>
 
           {/* Active Online Presence */}
-          <div className="app-card rounded-2xl p-6 shadow-sm">
-            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div className="app-card rounded-2xl p-6 shadow-sm space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-moul text-base app-text-primary">
                 អ្នកកំពុង Online ក្នុងរង្វង់ ៥នាទីចុងក្រោយ ({toKhmerNum(presence.length)})
               </h2>
@@ -5558,13 +5618,31 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 ))
               )}
             </div>
+
+            {hasMorePresence && onLoadMorePresence && (
+              <div className="flex justify-center pt-1">
+                <button
+                  type="button"
+                  disabled={isLoadingMorePresence}
+                  onClick={onLoadMorePresence}
+                  className="px-4 py-2 rounded-xl app-subcard hover:opacity-85 disabled:opacity-60 app-text-primary border app-border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingMorePresence ? 'animate-spin' : ''}`} />
+                  <span>{isLoadingMorePresence ? 'កំពុងផ្ទុក...' : 'ផ្ទុកបន្ថែម ២០ ទៀត (Load More)'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Login History Table */}
           <div className="app-card rounded-2xl p-6 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <h2 className="font-moul text-base app-text-primary">
-                ប្រវត្តិនៃការ Login ({toKhmerNum(filteredLogins.length)})
+                ប្រវត្តិនៃការ Login ({toKhmerNum(filteredLogins.length)}
+                {typeof globalStats?.loginsCount === 'number' && globalStats.loginsCount > logins.length
+                  ? ` / សរុប ${toKhmerNum(globalStats.loginsCount)}`
+                  : ''}
+                )
               </h2>
 
               <div className="flex flex-wrap items-center gap-2">
@@ -5640,7 +5718,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y app-border font-mono">
-                    {filteredLogins.slice(0, 100).map((l) => {
+                    {filteredLogins.map((l) => {
                       const memberCount = logins.filter((x) => x.username === l.username).length;
                       return (
                         <tr key={l.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
@@ -5684,12 +5762,30 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </table>
               </div>
             )}
+
+            {hasMoreLogins && onLoadMoreLogins && (
+              <div className="flex justify-center pt-1">
+                <button
+                  type="button"
+                  disabled={isLoadingMoreLogins}
+                  onClick={onLoadMoreLogins}
+                  className="px-4 py-2 rounded-xl app-subcard hover:opacity-85 disabled:opacity-60 app-text-primary border app-border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingMoreLogins ? 'animate-spin' : ''}`} />
+                  <span>{isLoadingMoreLogins ? 'កំពុងផ្ទុក...' : 'ផ្ទុកបន្ថែម ២០ ទៀត (Load More)'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Feedbacks */}
-          <div className="app-card rounded-2xl p-6 shadow-sm">
-            <h2 className="font-moul text-base app-text-primary mb-4">
-              មតិយោបល់ពីសមាជិក ({toKhmerNum(feedbacks.length)})
+          <div className="app-card rounded-2xl p-6 shadow-sm space-y-4">
+            <h2 className="font-moul text-base app-text-primary">
+              មតិយោបល់ពីសមាជិក ({toKhmerNum(feedbacks.length)}
+              {typeof globalStats?.feedbacksCount === 'number' && globalStats.feedbacksCount > feedbacks.length
+                ? ` / សរុប ${toKhmerNum(globalStats.feedbacksCount)}`
+                : ''}
+              )
             </h2>
 
             <div className="space-y-3 max-h-72 overflow-y-auto">
@@ -5709,6 +5805,20 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 ))
               )}
             </div>
+
+            {hasMoreFeedbacks && onLoadMoreFeedbacks && (
+              <div className="flex justify-center pt-1">
+                <button
+                  type="button"
+                  disabled={isLoadingMoreFeedbacks}
+                  onClick={onLoadMoreFeedbacks}
+                  className="px-4 py-2 rounded-xl app-subcard hover:opacity-85 disabled:opacity-60 app-text-primary border app-border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingMoreFeedbacks ? 'animate-spin' : ''}`} />
+                  <span>{isLoadingMoreFeedbacks ? 'កំពុងផ្ទុក...' : 'ផ្ទុកបន្ថែម ២០ ទៀត (Load More)'}</span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

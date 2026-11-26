@@ -5,12 +5,13 @@
       "description": "Quiz questions for exam prep in Khmer civil service",
       "type": "object",
       "properties": {
-        "subject": { "type": "string" },
-        "question": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "subject": { "type": "string", "maxLength": 200 },
+        "question": { "type": "string", "maxLength": 4000 },
         "type": { "type": "string", "enum": ["mcq", "short", "explanation"] },
         "options": { "type": "array" },
         "correct": { "type": "number" },
-        "answer": { "type": "string" },
+        "answer": { "type": "string", "maxLength": 8000 },
         "isActive": { "type": "boolean" },
         "order": { "type": "number" }
       },
@@ -21,7 +22,8 @@
       "description": "Category/Subject entity",
       "type": "object",
       "properties": {
-        "name": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
         "type": { "type": "string", "enum": ["mcq", "short", "explanation"] },
         "isActive": { "type": "boolean" },
         "order": { "type": "number" }
@@ -33,9 +35,11 @@
       "description": "User suggestions and feedback",
       "type": "object",
       "properties": {
-        "username": { "type": "string" },
-        "text": { "type": "string" },
-        "createdAt": { "type": "string" }
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 120 },
+        "text": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "uid": { "type": "string", "maxLength": 128 }
       },
       "required": ["username", "text"]
     },
@@ -44,8 +48,9 @@
       "description": "System broadcast announcement",
       "type": "object",
       "properties": {
-        "message": { "type": "string" },
-        "timestamp": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "message": { "type": "string", "maxLength": 1000 },
+        "timestamp": { "type": "string", "maxLength": 64 },
         "type": { "type": "string", "enum": ["info", "success", "warning"] }
       },
       "required": ["message", "timestamp"]
@@ -55,10 +60,12 @@
       "description": "Access log entry",
       "type": "object",
       "properties": {
-        "username": { "type": "string" },
-        "passwordUsed": { "type": "string" },
-        "timestamp": { "type": "string" },
-        "role": { "type": "string", "enum": ["user", "admin"] }
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 120 },
+        "passwordUsed": { "type": "string", "maxLength": 64 },
+        "timestamp": { "type": "string", "maxLength": 64 },
+        "role": { "type": "string", "enum": ["user", "admin"] },
+        "uid": { "type": "string", "maxLength": 128 }
       },
       "required": ["username", "timestamp", "role"]
     },
@@ -67,9 +74,11 @@
       "description": "Real-time user heartbeat",
       "type": "object",
       "properties": {
-        "username": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 120 },
         "role": { "type": "string", "enum": ["user", "admin"] },
-        "lastSeen": { "type": "string" }
+        "lastSeen": { "type": "string", "maxLength": 64 },
+        "uid": { "type": "string", "maxLength": 128 }
       },
       "required": ["username", "role", "lastSeen"]
     },
@@ -78,16 +87,18 @@
       "description": "Registered paid user account with permanent access",
       "type": "object",
       "properties": {
-        "username": { "type": "string" },
-        "phoneNumber": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 120 },
+        "phoneNumber": { "type": "string", "maxLength": 64 },
         "amount": { "type": "number" },
-        "currency": { "type": "string" },
-        "paidAt": { "type": "string" },
+        "currency": { "type": "string", "maxLength": 16 },
+        "paidAt": { "type": "string", "maxLength": 64 },
         "status": { "type": "string", "enum": ["active", "pending", "revoked"] },
         "permanentAccess": { "type": "boolean" },
-        "transactionRef": { "type": "string" },
-        "method": { "type": "string" },
-        "note": { "type": "string" }
+        "transactionRef": { "type": "string", "maxLength": 120 },
+        "method": { "type": "string", "maxLength": 64 },
+        "note": { "type": "string", "maxLength": 500 },
+        "uid": { "type": "string", "maxLength": 128 }
       },
       "required": ["username", "amount", "currency", "paidAt", "status", "permanentAccess"]
     },
@@ -107,6 +118,19 @@
         "updatedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["command", "descriptionKh", "title", "body", "actions"]
+    },
+    "GlobalStats": {
+      "title": "GlobalStats",
+      "description": "Aggregate document counters to avoid full-collection reads",
+      "type": "object",
+      "properties": {
+        "questionsCount": { "type": "number" },
+        "subjectsCount": { "type": "number" },
+        "loginsCount": { "type": "number" },
+        "feedbacksCount": { "type": "number" },
+        "notificationsCount": { "type": "number" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      }
     }
   },
   "firestore": {
@@ -141,6 +165,10 @@
     "/bot_commands/{commandId}": {
       "schema": "BotCommandConfig",
       "description": "Customized Command Bot messages, menu descriptions, and action buttons"
+    },
+    "/stats/{statId}": {
+      "schema": "GlobalStats",
+      "description": "Aggregated counts summary document"
     }
   }
 }

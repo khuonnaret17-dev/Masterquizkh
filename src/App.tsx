@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig, QuizContext } from './types';
+import React, { useState, useEffect, useCallback } from 'react';
+import { User as FirebaseUser } from 'firebase/auth';
+import { QueryDocumentSnapshot, DocumentData } from 'firebase/firestore';
+import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig, QuizContext, GlobalStats } from './types';
 import { LandingPage } from './components/LandingPage';
 import { Navbar } from './components/Navbar';
 import { PlaySection } from './components/PlaySection';
@@ -9,6 +11,7 @@ import { FloatingMessengerWidget } from './components/FloatingMessengerWidget';
 import { ThemeSelectorModal } from './components/ThemeSelectorModal';
 import { getStoredTheme } from './services/theme';
 import {
+  subscribeAuthState,
   subscribeQuestions,
   subscribeSubjects,
   subscribeNotifications,
@@ -16,7 +19,12 @@ import {
   subscribePresence,
   subscribeFeedbacks,
   subscribeBotCommands,
+  subscribeGlobalStats,
   fetchOnlineCount,
+  fetchLoginsPage,
+  fetchFeedbacksPage,
+  fetchPresencePage,
+  refreshAdminMonitoringData,
   updatePresenceHeartbeat,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
@@ -51,7 +59,15 @@ export default function App() {
     syncTelegramMiniAppTheme();
   }, [currentTheme]);
 
-  // Session State
+  // Firebase Auth & Session State
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  useEffect(() => {
+    const unsubAuth = subscribeAuthState((user) => {
+      setFirebaseUser(user);
+    });
+    return () => unsubAuth();
+  }, []);
+
   const [session, setSession] = useState<UserSession | null>(() => {
     try {
       const saved = localStorage.getItem('master_pro_quiz_session');
@@ -75,20 +91,35 @@ export default function App() {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [globalStats, setGlobalStats] = useState<GlobalStats>({});
   const [logins, setLogins] = useState<LoginRecord[]>([]);
+  const [loginsCursor, setLoginsCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMoreLogins, setHasMoreLogins] = useState(false);
+  const [isLoadingMoreLogins, setIsLoadingMoreLogins] = useState(false);
+
   const [presence, setPresence] = useState<PresenceRecord[]>([]);
+  const [presenceCursor, setPresenceCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMorePresence, setHasMorePresence] = useState(false);
+  const [isLoadingMorePresence, setIsLoadingMorePresence] = useState(false);
+
   const [onlineCount, setOnlineCount] = useState<number>(1);
   const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
+  const [feedbacksCursor, setFeedbacksCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [hasMoreFeedbacks, setHasMoreFeedbacks] = useState(false);
+  const [isLoadingMoreFeedbacks, setIsLoadingMoreFeedbacks] = useState(false);
+
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
 
-  // Core data subscriptions: only attach AFTER user logs in to prevent unauthenticated DB reads
+  // Core data subscriptions: only attach AFTER user logs in (re-sync cleanly on Firebase Auth sign-in)
   const isLoggedIn = Boolean(session);
+  const firebaseUid = firebaseUser?.uid || '';
   useEffect(() => {
     if (!isLoggedIn) return;
 
     const unsubQ = subscribeQuestions(setQuestions);
     const unsubSub = subscribeSubjects(setSubjects);
     const unsubNotif = subscribeNotifications(setNotifications);
+    const unsubStats = subscribeGlobalStats(setGlobalStats);
     const unsubBot = subscribeBotCommands((cmds) => {
       setBotCommands(cmds);
       if (Object.keys(cmds).length > 0) {
@@ -100,12 +131,38 @@ export default function App() {
       unsubQ();
       unsubSub();
       unsubNotif();
+      unsubStats();
       unsubBot();
     };
-  }, [isLoggedIn]);
+  }, [isLoggedIn, firebaseUid]);
 
-  // Admin-only collections (logins, presence list, feedbacks): only load when Admin tab is active
+  // Admin-only paginated collections (20 per page + startAfter): only load when Admin tab is active
   const isAdminPanelActive = session?.role === 'admin' && activeTab === 'admin';
+
+  const loadInitialMonitoringPages = useCallback(async () => {
+    const [logPage, presPage, fbPage] = await Promise.all([
+      fetchLoginsPage(null, false),
+      fetchPresencePage(null, false),
+      fetchFeedbacksPage(null, false),
+    ]);
+    if (logPage.items.length > 0) {
+      setLogins(logPage.items);
+      setLoginsCursor(logPage.lastDoc);
+      setHasMoreLogins(logPage.hasMore);
+    }
+    if (presPage.items.length > 0) {
+      setPresence(presPage.items);
+      setPresenceCursor(presPage.lastDoc);
+      setHasMorePresence(presPage.hasMore);
+      setOnlineCount(Math.max(1, presPage.items.length));
+    }
+    if (fbPage.items.length > 0) {
+      setFeedbacks(fbPage.items);
+      setFeedbacksCursor(fbPage.lastDoc);
+      setHasMoreFeedbacks(fbPage.hasMore);
+    }
+  }, []);
+
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -126,28 +183,101 @@ export default function App() {
     });
     const unsubFb = subscribeFeedbacks(setFeedbacks);
 
+    void loadInitialMonitoringPages();
+
     return () => {
       unsubLog();
       unsubPres();
       unsubFb();
     };
-  }, [isLoggedIn, isAdminPanelActive]);
+  }, [isLoggedIn, isAdminPanelActive, firebaseUid, loadInitialMonitoringPages]);
 
-  // Real-time 5-minute Presence Heartbeat (only when tab is visible)
+  const handleLoadMoreLogins = useCallback(async () => {
+    if (isLoadingMoreLogins || !hasMoreLogins || !loginsCursor) return;
+    setIsLoadingMoreLogins(true);
+    try {
+      const page = await fetchLoginsPage(loginsCursor, true);
+      setLogins((prev) => {
+        const seen = new Set(prev.map((x) => x.id));
+        const additions = page.items.filter((x) => !seen.has(x.id));
+        return [...prev, ...additions];
+      });
+      setLoginsCursor(page.lastDoc);
+      setHasMoreLogins(page.hasMore);
+    } finally {
+      setIsLoadingMoreLogins(false);
+    }
+  }, [isLoadingMoreLogins, hasMoreLogins, loginsCursor]);
+
+  const handleLoadMorePresence = useCallback(async () => {
+    if (isLoadingMorePresence || !hasMorePresence || !presenceCursor) return;
+    setIsLoadingMorePresence(true);
+    try {
+      const page = await fetchPresencePage(presenceCursor, true);
+      setPresence((prev) => {
+        const seen = new Set(prev.map((x) => x.id));
+        const additions = page.items.filter((x) => !seen.has(x.id));
+        return [...prev, ...additions];
+      });
+      setPresenceCursor(page.lastDoc);
+      setHasMorePresence(page.hasMore);
+    } finally {
+      setIsLoadingMorePresence(false);
+    }
+  }, [isLoadingMorePresence, hasMorePresence, presenceCursor]);
+
+  const handleLoadMoreFeedbacks = useCallback(async () => {
+    if (isLoadingMoreFeedbacks || !hasMoreFeedbacks || !feedbacksCursor) return;
+    setIsLoadingMoreFeedbacks(true);
+    try {
+      const page = await fetchFeedbacksPage(feedbacksCursor, true);
+      setFeedbacks((prev) => {
+        const seen = new Set(prev.map((x) => x.id));
+        const additions = page.items.filter((x) => !seen.has(x.id));
+        return [...prev, ...additions];
+      });
+      setFeedbacksCursor(page.lastDoc);
+      setHasMoreFeedbacks(page.hasMore);
+    } finally {
+      setIsLoadingMoreFeedbacks(false);
+    }
+  }, [isLoadingMoreFeedbacks, hasMoreFeedbacks, feedbacksCursor]);
+
+  const handleRefreshMonitoring = useCallback(async () => {
+    await refreshAdminMonitoringData();
+    const [logPage, presPage, fbPage] = await Promise.all([
+      fetchLoginsPage(null, false),
+      fetchPresencePage(null, false),
+      fetchFeedbacksPage(null, false),
+    ]);
+    setLogins(logPage.items);
+    setLoginsCursor(logPage.lastDoc);
+    setHasMoreLogins(logPage.hasMore);
+    setPresence(presPage.items);
+    setPresenceCursor(presPage.lastDoc);
+    setHasMorePresence(presPage.hasMore);
+    setFeedbacks(fbPage.items);
+    setFeedbacksCursor(fbPage.lastDoc);
+    setHasMoreFeedbacks(fbPage.hasMore);
+  }, []);
+
+  // Real-time 5-minute Presence Heartbeat (primitive dependencies prevent re-render/loop)
+  const sessionUsername = session?.username || '';
+  const sessionRole = session?.role;
   useEffect(() => {
-    if (!session) return;
+    if (!sessionUsername || !sessionRole) return;
 
-    updatePresenceHeartbeat(session.username, session.role);
+    updatePresenceHeartbeat(sessionUsername, sessionRole);
 
     const interval = setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
-      updatePresenceHeartbeat(session.username, session.role);
+      updatePresenceHeartbeat(sessionUsername, sessionRole);
     }, 300000);
 
     return () => clearInterval(interval);
-  }, [session]);
+  }, [sessionUsername, sessionRole, firebaseUid]);
 
   const handleLoginSuccess = (newSession: UserSession) => {
     setSession(newSession);
@@ -235,7 +365,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!session) return;
+    if (!sessionUsername || !sessionRole) return;
     if (activeQuizQuestions) {
       return setTelegramBackButton(true, () => {
         setActiveQuizQuestions(null);
@@ -243,15 +373,20 @@ export default function App() {
         setActiveQuizContext(null);
       });
     }
-    if (activeTab === 'admin' && session.role === 'admin') {
+    if (activeTab === 'admin' && sessionRole === 'admin') {
       return setTelegramBackButton(true, () => setActiveTab('play'));
     }
     return setTelegramBackButton(false);
-  }, [session, activeQuizQuestions, activeTab]);
+  }, [sessionUsername, sessionRole, activeQuizQuestions, activeTab]);
 
   // If not authenticated, show royal landing page with compact Mini App header & role selection
   if (!session) {
-    return <LandingPage onLoginSuccess={handleLoginSuccess} />;
+    return (
+      <LandingPage
+        onLoginSuccess={handleLoginSuccess}
+        firebaseUserEmail={firebaseUser?.email || null}
+      />
+    );
   }
 
   return (
@@ -274,6 +409,7 @@ export default function App() {
         canGoBack={Boolean(activeQuizQuestions)}
         onBack={activeQuizQuestions ? handleExitQuiz : undefined}
         pageTitle={activeQuizQuestions ? activeQuizTitle : undefined}
+        firebaseUserEmail={firebaseUser?.email || null}
       />
 
       {/* Main Content Area */}
@@ -299,6 +435,18 @@ export default function App() {
             feedbacks={feedbacks}
             notifications={notifications}
             botCommands={botCommands}
+            globalStats={globalStats}
+            firebaseUserEmail={firebaseUser?.email || null}
+            hasMoreLogins={hasMoreLogins}
+            isLoadingMoreLogins={isLoadingMoreLogins}
+            onLoadMoreLogins={handleLoadMoreLogins}
+            hasMorePresence={hasMorePresence}
+            isLoadingMorePresence={isLoadingMorePresence}
+            onLoadMorePresence={handleLoadMorePresence}
+            hasMoreFeedbacks={hasMoreFeedbacks}
+            isLoadingMoreFeedbacks={isLoadingMoreFeedbacks}
+            onLoadMoreFeedbacks={handleLoadMoreFeedbacks}
+            onRefreshMonitoring={handleRefreshMonitoring}
           />
         ) : (
           <PlaySection
@@ -306,6 +454,7 @@ export default function App() {
             subjects={subjects}
             session={session}
             onStartQuiz={handleStartQuiz}
+            globalStats={globalStats}
           />
         )}
       </main>

@@ -14,13 +14,15 @@ import {
   Bell,
   ArrowLeft,
   RefreshCw,
+  Cloud,
 } from 'lucide-react';
 import { UserSession, AppThemeId } from '../types';
 import { toKhmerNum } from '../utils/khmer';
 import { APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser } from '../services/telegramWebApp';
-import { refreshCoreData, fetchOnlineCount } from '../services/firebase';
+import { refreshCoreData, fetchOnlineCount, signInWithGoogle, signOutFirebase } from '../services/firebase';
 import { KhmerLatticeBar, KhmerLotusCrest } from './KhmerOrnaments';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface NavbarProps {
   session: UserSession;
@@ -36,6 +38,7 @@ interface NavbarProps {
   canGoBack?: boolean;
   onBack?: () => void;
   pageTitle?: string;
+  firebaseUserEmail?: string | null;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -52,10 +55,12 @@ export const Navbar: React.FC<NavbarProps> = ({
   canGoBack = false,
   onBack,
   pageTitle,
+  firebaseUserEmail = null,
 }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncDone, setSyncDone] = useState(false);
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const currentThemeConfig = APP_THEMES.find((t) => t.id === currentTheme) || APP_THEMES[0];
@@ -101,6 +106,23 @@ export const Navbar: React.FC<NavbarProps> = ({
     }
   };
 
+  const handleToggleGoogleAuth = async () => {
+    if (isAuthBusy) return;
+    setIsAuthBusy(true);
+    try {
+      if (firebaseUserEmail) {
+        await signOutFirebase();
+      } else {
+        await signInWithGoogle();
+        await refreshCoreData();
+      }
+    } catch {
+      // User dismissed popup or auth failed
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
   return (
     <nav className="sticky top-0 z-40 app-nav backdrop-blur-md border-b app-border shadow-sm tg-safe-top tg-safe-x">
       <KhmerLatticeBar />
@@ -126,9 +148,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <div className="p-0.5 rounded-full border border-[var(--theme-gold)]/75 bg-[var(--theme-bg-surface)] shrink-0">
                 <img
-                  src="https://i.postimg.cc/0ygmLdvR/3QCM_Ep4.png"
+                  src="/app-logo.png"
                   alt="Master Quiz KH Logo"
-                  referrerPolicy="no-referrer"
                   className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover"
                 />
               </div>
@@ -333,6 +354,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                         {!isMuted ? 'កំពុងបើក' : 'បានបិទ'}
                       </span>
                     </button>
+
+                    <PWAInstallButton
+                      variant="menu"
+                      onAfterTrigger={() => setIsMenuOpen(false)}
+                    />
                   </div>
 
                   {/* Section 3: Communication & Sync */}
@@ -365,6 +391,35 @@ export const Navbar: React.FC<NavbarProps> = ({
                       </span>
                       <span className="text-xs font-semibold app-text-secondary">
                         {isSyncing ? 'កំពុងទាញ...' : syncDone ? 'រួចរាល់ ✓' : 'Sync'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isAuthBusy}
+                      onClick={handleToggleGoogleAuth}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-sm font-medium app-text-primary hover:bg-[var(--theme-bg-hover)] disabled:opacity-60 transition cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2.5 min-w-0">
+                        <Cloud
+                          className={`w-4 h-4 shrink-0 ${
+                            firebaseUserEmail
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'app-text-muted'
+                          }`}
+                        />
+                        <span className="truncate">
+                          {firebaseUserEmail ? firebaseUserEmail : 'ភ្ជាប់ Google Cloud Sync'}
+                        </span>
+                      </span>
+                      <span
+                        className={`text-xs font-bold shrink-0 ${
+                          firebaseUserEmail
+                            ? 'text-emerald-700 dark:text-emerald-300'
+                            : 'khmer-accent-text'
+                        }`}
+                      >
+                        {isAuthBusy ? '...' : firebaseUserEmail ? 'ផ្ដាច់' : 'ភ្ជាប់'}
                       </span>
                     </button>
                   </div>

@@ -27,6 +27,7 @@ export interface Feedback {
   username: string;
   text: string;
   createdAt: string;
+  uid?: string;
 }
 
 export interface AppNotification {
@@ -42,6 +43,7 @@ export interface LoginRecord {
   passwordUsed: string;
   timestamp: string;
   role: 'user' | 'admin';
+  uid?: string;
 }
 
 export interface PresenceRecord {
@@ -49,6 +51,7 @@ export interface PresenceRecord {
   username: string;
   role: 'user' | 'admin';
   lastSeen: string;
+  uid?: string;
 }
 
 export interface UserSession {
@@ -73,6 +76,16 @@ export interface PaidUser {
   transactionRef?: string;
   method?: string;
   note?: string;
+  uid?: string;
+}
+
+export interface GlobalStats {
+  questionsCount?: number;
+  subjectsCount?: number;
+  loginsCount?: number;
+  feedbacksCount?: number;
+  notificationsCount?: number;
+  updatedAt?: string;
 }
 
 export interface UserAnswerRecord {

@@ -12,7 +12,7 @@ import {
   ChevronDown,
   ChevronUp,
 } from 'lucide-react';
-import { Question, Subject, UserSession, QuizContext } from '../types';
+import { Question, Subject, UserSession, QuizContext, GlobalStats } from '../types';
 import { toKhmerNum, khmerAlphabetSort, shuffleArray, getOptionLabel } from '../utils/khmer';
 import { exportQuestionsToPDF } from '../services/pdfExport';
 import { KhmerCornerMotif, KhmerLotusCrest, KhmerLotusDivider } from './KhmerOrnaments';
@@ -22,6 +22,7 @@ interface PlaySectionProps {
   subjects: Subject[];
   session: UserSession;
   onStartQuiz: (quizQuestions: Question[], title: string, context?: QuizContext) => void;
+  globalStats?: GlobalStats;
 }
 
 export const PlaySection: React.FC<PlaySectionProps> = ({
@@ -29,6 +30,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
   subjects,
   session,
   onStartQuiz,
+  globalStats,
 }) => {
   const [activeTab, setActiveTab] = useState<'subject' | 'mixed' | 'dictionary'>('subject');
 
@@ -208,14 +210,14 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
           <div className="flex items-center justify-center gap-3 shrink-0">
             <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
               <span className="block text-lg sm:text-2xl font-bold khmer-accent-text font-moul tabular-nums">
-                {toKhmerNum(questions.length)}
+                {toKhmerNum(Math.max(questions.length, globalStats?.questionsCount || 0))}
               </span>
               <span className="text-xs app-text-secondary font-semibold">សំណួរសរុប</span>
             </div>
 
             <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
               <span className="block text-lg sm:text-2xl font-bold khmer-gold-text font-moul tabular-nums">
-                {toKhmerNum(activeSubjects.length)}
+                {toKhmerNum(Math.max(activeSubjects.length, globalStats?.subjectsCount || 0))}
               </span>
               <span className="text-xs app-text-secondary font-semibold">មុខវិជ្ជា</span>
             </div>

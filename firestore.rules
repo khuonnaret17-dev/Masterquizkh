@@ -1,40 +1,120 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /questions/{questionId} {
-      allow read, write: if true;
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
     }
 
-    match /subjects/{subjectId} {
-      allow read, write: if true;
+    // ---------------- Hardened Global Helpers ----------------
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    match /feedbacks/{feedbackId} {
-      allow read, write: if true;
+    function incoming() {
+      return request.resource.data;
     }
 
-    match /notifications/{notificationId} {
-      allow read, write: if true;
+    function existing() {
+      return resource.data;
     }
 
-    match /logins/{loginId} {
-      allow read, write: if true;
+    function isSignedIn() {
+      return request.auth != null;
     }
 
-    match /presence/{presenceId} {
-      allow read, write: if true;
+    function isAdmin() {
+      return isSignedIn() && (
+        (request.auth.token.email == 'reaksmey8114@gmail.com' && request.auth.token.email_verified == true)
+        || exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
     }
 
-    match /paid_users/{paidUserId} {
-      allow read, write: if true;
+    // Enforce maximum 20 items per list query
+    function isWithinQueryLimit() {
+      return request.query.limit != null && request.query.limit >= 1 && request.query.limit <= 20;
     }
 
-    match /test/{testId} {
-      allow read, write: if true;
+    // ---------------- Validation Blueprints ----------------
+    function isValidQuestion(data) {
+      return data.keys().hasAll(['subject', 'question', 'type'])
+        && data.keys().hasOnly(['id', 'subject', 'question', 'type', 'options', 'correct', 'answer', 'isActive', 'order'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 200
+        && data.question is string && data.question.size() >= 1 && data.question.size() <= 4000
+        && data.type in ['mcq', 'short', 'explanation']
+        && (!('options' in data) || (data.options is list && data.options.size() <= 10 && (data.options.size() == 0 || data.options[0] is string)))
+        && (!('correct' in data) || (data.correct is number && data.correct >= 0 && data.correct < 10))
+        && (!('answer' in data) || (data.answer is string && data.answer.size() <= 8000))
+        && (!('isActive' in data) || data.isActive is bool)
+        && (!('order' in data) || data.order is number);
     }
 
-    function isValidBotCmdId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    function isValidSubject(data) {
+      return data.keys().hasAll(['name', 'type'])
+        && data.keys().hasOnly(['id', 'name', 'type', 'isActive', 'order'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 200
+        && data.type in ['mcq', 'short', 'explanation']
+        && (!('isActive' in data) || data.isActive is bool)
+        && (!('order' in data) || data.order is number);
+    }
+
+    function isValidFeedback(data) {
+      return data.keys().hasAll(['username', 'text', 'createdAt'])
+        && data.keys().hasOnly(['id', 'username', 'text', 'createdAt', 'uid'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.username is string && data.username.size() >= 1 && data.username.size() <= 120
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 2000
+        && data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 64
+        && (!('uid' in data) || (data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128));
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['message', 'timestamp'])
+        && data.keys().hasOnly(['id', 'message', 'timestamp', 'type'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 1000
+        && data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 64
+        && (!('type' in data) || data.type in ['info', 'success', 'warning']);
+    }
+
+    function isValidLoginRecord(data) {
+      return data.keys().hasAll(['username', 'timestamp', 'role'])
+        && data.keys().hasOnly(['id', 'username', 'passwordUsed', 'timestamp', 'role', 'uid'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.username is string && data.username.size() >= 1 && data.username.size() <= 120
+        && (!('passwordUsed' in data) || (data.passwordUsed is string && data.passwordUsed.size() <= 64))
+        && data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 64
+        && data.role in ['user', 'admin']
+        && (!('uid' in data) || (data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128));
+    }
+
+    function isValidPresenceRecord(data) {
+      return data.keys().hasAll(['username', 'role', 'lastSeen'])
+        && data.keys().hasOnly(['id', 'username', 'role', 'lastSeen', 'uid'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.username is string && data.username.size() >= 1 && data.username.size() <= 120
+        && data.role in ['user', 'admin']
+        && data.lastSeen is string && data.lastSeen.size() >= 1 && data.lastSeen.size() <= 64
+        && (!('uid' in data) || (data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128));
+    }
+
+    function isValidPaidUser(data) {
+      return data.keys().hasAll(['username', 'amount', 'currency', 'paidAt', 'status', 'permanentAccess'])
+        && data.keys().hasOnly(['id', 'username', 'phoneNumber', 'amount', 'currency', 'paidAt', 'status', 'permanentAccess', 'transactionRef', 'method', 'note', 'uid'])
+        && (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128))
+        && data.username is string && data.username.size() >= 1 && data.username.size() <= 120
+        && (!('phoneNumber' in data) || (data.phoneNumber is string && data.phoneNumber.size() <= 64))
+        && data.amount is number && data.amount >= 0
+        && data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16
+        && data.paidAt is string && data.paidAt.size() >= 1 && data.paidAt.size() <= 64
+        && data.status in ['active', 'pending', 'revoked']
+        && data.permanentAccess is bool
+        && (!('transactionRef' in data) || (data.transactionRef is string && data.transactionRef.size() <= 120))
+        && (!('method' in data) || (data.method is string && data.method.size() <= 64))
+        && (!('note' in data) || (data.note is string && data.note.size() <= 500))
+        && (!('uid' in data) || (data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128));
     }
 
     function isValidBotCommand(data) {
@@ -51,15 +131,108 @@ service cloud.firestore {
         && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
-    match /bot_commands/{commandId} {
-      allow read: if true;
-      allow create, update: if isValidBotCmdId(commandId) && isValidBotCommand(request.resource.data);
-      allow delete: if isValidBotCmdId(commandId);
+    function isValidGlobalStats(data) {
+      return data.keys().hasOnly(['questionsCount', 'subjectsCount', 'loginsCount', 'feedbacksCount', 'notificationsCount', 'updatedAt'])
+        && (!('questionsCount' in data) || (data.questionsCount is number && data.questionsCount >= 0))
+        && (!('subjectsCount' in data) || (data.subjectsCount is number && data.subjectsCount >= 0))
+        && (!('loginsCount' in data) || (data.loginsCount is number && data.loginsCount >= 0))
+        && (!('feedbacksCount' in data) || (data.feedbacksCount is number && data.feedbacksCount >= 0))
+        && (!('notificationsCount' in data) || (data.notificationsCount is number && data.notificationsCount >= 0))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
-    // Default deny for unmatched collections
-    match /{document=**} {
-      allow read, write: if false;
+    // ---------------- Collection Match Blocks ----------------
+    match /questions/{questionId} {
+      allow get: if isSignedIn() && isValidId(questionId);
+      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow create: if isAdmin() && isValidId(questionId) && isValidQuestion(incoming());
+      allow update: if isAdmin() && isValidId(questionId) && isValidQuestion(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['subject', 'question', 'type', 'options', 'correct', 'answer', 'isActive', 'order']);
+      allow delete: if isAdmin() && isValidId(questionId);
+    }
+
+    match /subjects/{subjectId} {
+      allow get: if isSignedIn() && isValidId(subjectId);
+      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow create: if isAdmin() && isValidId(subjectId) && isValidSubject(incoming());
+      allow update: if isAdmin() && isValidId(subjectId) && isValidSubject(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'type', 'isActive', 'order']);
+      allow delete: if isAdmin() && isValidId(subjectId);
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId);
+      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow create: if isAdmin() && isValidId(notificationId) && isValidNotification(incoming());
+      allow update: if isAdmin() && isValidId(notificationId) && isValidNotification(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['message', 'timestamp', 'type']);
+      allow delete: if isAdmin() && isValidId(notificationId);
+    }
+
+    match /bot_commands/{commandId} {
+      allow get: if isSignedIn() && isValidId(commandId);
+      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow create: if isAdmin() && isValidId(commandId) && isValidBotCommand(incoming());
+      allow update: if isAdmin() && isValidId(commandId) && isValidBotCommand(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['command', 'titleKh', 'descriptionKh', 'title', 'body', 'imageUrl', 'imageAlt', 'actions', 'updatedAt']);
+      allow delete: if isAdmin() && isValidId(commandId);
+    }
+
+    match /feedbacks/{feedbackId} {
+      allow get: if isSignedIn() && isValidId(feedbackId) && (isAdmin() || existing().uid == request.auth.uid);
+      allow list: if isSignedIn() && isWithinQueryLimit() && (isAdmin() || existing().uid == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(feedbackId) && isValidFeedback(incoming())
+        && (isAdmin() || incoming().uid == request.auth.uid);
+      allow update: if isAdmin() && isValidId(feedbackId) && isValidFeedback(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['text']);
+      allow delete: if isAdmin() && isValidId(feedbackId);
+    }
+
+    match /logins/{loginId} {
+      allow get: if isSignedIn() && isValidId(loginId) && (isAdmin() || existing().uid == request.auth.uid);
+      allow list: if isSignedIn() && isWithinQueryLimit() && (isAdmin() || existing().uid == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(loginId) && isValidLoginRecord(incoming())
+        && (isAdmin() || incoming().uid == request.auth.uid);
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(loginId);
+    }
+
+    match /presence/{presenceId} {
+      allow get: if isSignedIn() && isValidId(presenceId);
+      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow create: if isSignedIn() && isValidId(presenceId) && isValidPresenceRecord(incoming())
+        && (isAdmin() || incoming().uid == request.auth.uid);
+      allow update: if isSignedIn() && isValidId(presenceId) && isValidPresenceRecord(incoming())
+        && (isAdmin() || incoming().uid == request.auth.uid)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['id', 'username', 'role', 'lastSeen', 'uid']);
+      allow delete: if isAdmin() && isValidId(presenceId);
+    }
+
+    match /paid_users/{paidUserId} {
+      allow get: if isSignedIn() && isValidId(paidUserId) && (isAdmin() || existing().uid == request.auth.uid);
+      allow list: if isSignedIn() && isWithinQueryLimit() && (isAdmin() || existing().uid == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(paidUserId) && isValidPaidUser(incoming())
+        && (isAdmin() || (incoming().uid == request.auth.uid && incoming().status == 'pending' && incoming().permanentAccess == false));
+      allow update: if isAdmin() && isValidId(paidUserId) && isValidPaidUser(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'permanentAccess', 'note', 'phoneNumber', 'transactionRef']);
+      allow delete: if isAdmin() && isValidId(paidUserId);
+    }
+
+    match /stats/{statId} {
+      allow get: if isSignedIn() && isValidId(statId);
+      allow list: if false;
+      allow create, update: if isSignedIn() && isValidId(statId) && isValidGlobalStats(incoming());
+      allow delete: if false;
+    }
+
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && (request.auth.uid == adminId || isAdmin());
+      allow list, write: if false;
+    }
+
+    match /test/{testId} {
+      allow get: if isSignedIn() && isValidId(testId);
+      allow list, write: if false;
     }
   }
 }
