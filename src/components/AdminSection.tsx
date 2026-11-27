@@ -55,7 +55,6 @@ import {
   addQuestion,
   addQuestionsBatch,
   updateQuestion,
-  renameQuestionsSubject,
   deleteQuestion,
   deleteQuestionsBatch,
   swapQuestions,
@@ -72,15 +71,11 @@ import {
   saveBotCommandConfig,
   resetBotCommandConfig,
   resetAllBotCommands,
+  fetchQuestionsCached,
+  syncGlobalStatsExact,
   refreshCoreData,
   refreshAdminMonitoringData,
   signInWithGoogle,
-  migrateAllFirebaseToSupabase,
-  exportAllFirebaseDataAsJson,
-  importBackupJsonToSupabase,
-  fetchDbMode,
-  setDbMode,
-  DbModeType,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
@@ -234,6 +229,70 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [isReorderingSubjects, setIsReorderingSubjects] = useState(false);
   const [draggedSubjectIndex, setDraggedSubjectIndex] = useState<number | null>(null);
   const [dragOverSubjectIndex, setDragOverSubjectIndex] = useState<number | null>(null);
+  const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
+  const [dedupStatusMsg, setDedupStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
+
+  const normalizeDedupText = useCallback(
+    (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' '),
+    []
+  );
+
+  const makeQuestionDedupKey = useCallback(
+    (subjectName: string, questionText: string) =>
+      `${normalizeDedupText(subjectName)}|||${normalizeDedupText(questionText)}`,
+    [normalizeDedupText]
+  );
+
+  const duplicateAnalysis = useMemo(() => {
+    const extractTs = (id?: string) => {
+      const m = id?.match(/^q-(\d+)-/);
+      return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+    };
+
+    const groups = new Map<string, Question[]>();
+    for (const q of questions) {
+      const key = makeQuestionDedupKey(q.subject || '', q.question || '');
+      const list = groups.get(key);
+      if (list) {
+        list.push(q);
+      } else {
+        groups.set(key, [q]);
+      }
+    }
+
+    const duplicateIds: string[] = [];
+    let duplicateGroupCount = 0;
+    for (const list of groups.values()) {
+      if (list.length <= 1) continue;
+      duplicateGroupCount += 1;
+      const sorted = [...list].sort(
+        (a, b) => extractTs(a.id) - extractTs(b.id) || (a.order ?? 0) - (b.order ?? 0)
+      );
+      for (const extra of sorted.slice(1)) {
+        if (extra.id) duplicateIds.push(extra.id);
+      }
+    }
+
+    const activeSubjectKeys = new Set(subjects.map((s) => normalizeDedupText(s.name || '')));
+    const orphanIds: string[] = [];
+    const orphanSubjects = new Set<string>();
+    for (const q of questions) {
+      const subName = (q.subject || '').trim();
+      if (!activeSubjectKeys.has(normalizeDedupText(subName))) {
+        if (q.id) orphanIds.push(q.id);
+        if (subName) orphanSubjects.add(subName);
+      }
+    }
+
+    return {
+      totalCount: questions.length,
+      uniqueCount: groups.size,
+      duplicateGroupCount,
+      duplicateIds,
+      orphanIds,
+      orphanSubjects: Array.from(orphanSubjects),
+    };
+  }, [questions, subjects, makeQuestionDedupKey, normalizeDedupText]);
 
   useEffect(() => {
     if (subjects.length <= 1) {
@@ -304,57 +363,6 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [isExportingPDF, setIsExportingPDF] = useState(false);
   const [pdfProgress, setPdfProgress] = useState<{ current: number; total: number } | null>(null);
   const [exportStatusMsg, setExportStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
-
-  const [isMigratingDb, setIsMigratingDb] = useState(false);
-  const [migrationProgressText, setMigrationProgressText] = useState('');
-  const [migrationStatusMsg, setMigrationStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
-  const [schemaSqlPreview, setSchemaSqlPreview] = useState<string | null>(null);
-  const [dbMode, setDbModeState] = useState<DbModeType>('dual');
-  const [isChangingMode, setIsChangingMode] = useState(false);
-  const backupImportFileRef = useRef<HTMLInputElement | null>(null);
-
-  useEffect(() => {
-    void fetchDbMode().then((info) => {
-      if (info?.mode) setDbModeState(info.mode);
-    }).catch(() => {});
-
-    const handleModeChanged = (e: Event) => {
-      const next = (e as CustomEvent<DbModeType>).detail;
-      if (next === 'dual' || next === 'supabase' || next === 'firestore') {
-        setDbModeState(next);
-      }
-    };
-    window.addEventListener('mpq-db-mode-changed', handleModeChanged);
-    return () => {
-      window.removeEventListener('mpq-db-mode-changed', handleModeChanged);
-    };
-  }, []);
-
-  const handleSelectDbMode = async (mode: DbModeType) => {
-    if (isChangingMode || dbMode === mode) return;
-    setIsChangingMode(true);
-    setMigrationStatusMsg(null);
-    try {
-      await setDbMode(mode);
-      setDbModeState(mode);
-      const modeNames: Record<DbModeType, string> = {
-        dual: 'ដំណើរការទ្វេរដង (Dual-Sync ទាំង Supabase និង Firebase)',
-        supabase: 'ប្រើប្រាស់ Supabase ទាំងស្រុង',
-        firestore: 'ប្រើប្រាស់ Firebase (Firestore) ទាំងស្រុង',
-      };
-      setMigrationStatusMsg({
-        text: `បានប្ដូររបៀប Database ទៅជា៖ ${modeNames[mode]} ជោគជ័យ!`,
-        success: true,
-      });
-    } catch (err: any) {
-      setMigrationStatusMsg({
-        text: err?.message || 'បរាជ័យក្នុងការប្ដូររបៀប Database',
-        success: false,
-      });
-    } finally {
-      setIsChangingMode(false);
-    }
-  };
 
   useEffect(() => {
     try {
@@ -770,20 +778,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [editQuestionOptions, setEditQuestionOptions] = useState<string[]>(['', '', '', '']);
   const [editQuestionCorrect, setEditQuestionCorrect] = useState<number>(0);
   const [editQuestionAnswer, setEditQuestionAnswer] = useState('');
-  const [isSavingQuestionEdit, setIsSavingQuestionEdit] = useState(false);
-  const [editQuestionError, setEditQuestionError] = useState<string | null>(null);
 
   // Subject Edit Modal State
   const [editingSubject, setEditingSubject] = useState<Subject | null>(null);
   const [editSubjectName, setEditSubjectName] = useState('');
   const [editSubjectType, setEditSubjectType] = useState<QuestionType>('mcq');
   const [editSubjectIsActive, setEditSubjectIsActive] = useState<boolean>(true);
-  const [isSavingSubjectEdit, setIsSavingSubjectEdit] = useState(false);
-  const [editSubjectError, setEditSubjectError] = useState<string | null>(null);
 
   // Open & save handlers for editing questions
   const handleOpenEditQuestionModal = (q: Question) => {
-    setEditQuestionError(null);
     setEditingQuestion(q);
     setEditQuestionSubject(q.subject || subjects[0]?.name || '');
     setEditQuestionText(q.question || '');
@@ -799,7 +802,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
   const handleSaveQuestionEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingQuestion || !editingQuestion.id || isSavingQuestionEdit) return;
+    if (!editingQuestion || !editingQuestion.id) return;
     if (!editQuestionText.trim()) return;
 
     const updates: Partial<Question> = {
@@ -811,21 +814,12 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       answer: editQuestionAnswer.trim() || undefined,
     };
 
-    setIsSavingQuestionEdit(true);
-    setEditQuestionError(null);
-    try {
-      await updateQuestion(editingQuestion.id, updates);
-      setEditingQuestion(null);
-    } catch (err: any) {
-      setEditQuestionError(err?.message || 'បរាជ័យក្នុងការរក្សាទុកការកែប្រែសំណួរ!');
-    } finally {
-      setIsSavingQuestionEdit(false);
-    }
+    await updateQuestion(editingQuestion.id, updates);
+    setEditingQuestion(null);
   };
 
   // Open & save handlers for editing subjects
   const handleOpenEditSubjectModal = (sub: Subject) => {
-    setEditSubjectError(null);
     setEditingSubject(sub);
     setEditSubjectName(sub.name);
     setEditSubjectType(sub.type);
@@ -834,53 +828,27 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
   const handleSaveSubjectEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingSubject || !editingSubject.id || isSavingSubjectEdit) return;
+    if (!editingSubject || !editingSubject.id) return;
     const newName = editSubjectName.trim();
     if (!newName) return;
 
     const oldName = editingSubject.name;
-    setIsSavingSubjectEdit(true);
-    setEditSubjectError(null);
-    try {
-      await updateSubject(editingSubject.id, {
-        name: newName,
-        type: editSubjectType,
-        isActive: editSubjectIsActive,
-      });
+    await updateSubject(editingSubject.id, {
+      name: newName,
+      type: editSubjectType,
+      isActive: editSubjectIsActive,
+    });
 
-      if (oldName !== newName) {
-        const matchingQuestions = questions.filter((q) => q.subject === oldName);
-        if (matchingQuestions.length > 0) {
-          await renameQuestionsSubject(oldName, newName, matchingQuestions);
+    if (oldName !== newName) {
+      const matchingQuestions = questions.filter((q) => q.subject === oldName);
+      for (const q of matchingQuestions) {
+        if (q.id) {
+          await updateQuestion(q.id, { subject: newName });
         }
       }
-
-      setEditingSubject(null);
-    } catch (err: any) {
-      setEditSubjectError(err?.message || 'បរាជ័យក្នុងការរក្សាទុកការកែប្រែមុខវិជ្ជា!');
-    } finally {
-      setIsSavingSubjectEdit(false);
     }
-  };
 
-  const handleToggleSubjectActive = async (sub: Subject) => {
-    if (!sub.id) return;
-    setSubjectOrderStatusMsg(null);
-    try {
-      const nextActive = sub.isActive === false;
-      await updateSubject(sub.id, { isActive: nextActive });
-      setSubjectOrderStatusMsg({
-        text: nextActive
-          ? `បានបើកដំណើរការមុខវិជ្ជា "${sub.name}" ជោគជ័យ!`
-          : `បានបិទមុខវិជ្ជា "${sub.name}" ជាបណ្ដោះអាសន្ន!`,
-        success: true,
-      });
-    } catch (err: any) {
-      setSubjectOrderStatusMsg({
-        text: err?.message || `បរាជ័យក្នុងការកែប្រែស្ថានភាពមុខវិជ្ជា "${sub.name}"!`,
-        success: false,
-      });
-    }
+    setEditingSubject(null);
   };
 
   // In-App Confirmation Dialog State (avoids iframe window.confirm blocking)
@@ -891,8 +859,6 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     subMessage?: string;
     onConfirm: () => Promise<void> | void;
   } | null>(null);
-  const [isConfirmDeleting, setIsConfirmDeleting] = useState(false);
-  const [deleteConfirmError, setDeleteConfirmError] = useState<string | null>(null);
 
   const handleDeleteSubjectClick = (sub: Subject) => {
     const matchingQuestions = questions.filter((q) => q.subject === sub.name);
@@ -901,11 +867,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       isOpen: true,
       title: `លុបមុខវិជ្ជា "${sub.name}"`,
       message: `តើអ្នកពិតជាចង់លុបមុខវិជ្ជា "${sub.name}"${countStr} មែនទេ?`,
-      subMessage: 'ការលុបនេះនឹងលុបចេញពីប្រព័ន្ធទាំងស្រុង (ទាំង Firebase និង Supabase) និងមិនអាចត្រឡប់វិញបានទេ។',
+      subMessage: 'ការលុបនេះនឹងលុបចេញពីប្រព័ន្ធទាំងស្រុង និងមិនអាចត្រឡប់វិញបានទេ។',
       onConfirm: async () => {
-        const matchingIds = matchingQuestions.map((q) => q.id).filter(Boolean) as string[];
-        if (matchingIds.length > 0) {
-          await deleteQuestionsBatch(matchingIds);
+        const idsToDelete = matchingQuestions.map((q) => q.id).filter((id): id is string => Boolean(id));
+        if (idsToDelete.length > 0) {
+          await deleteQuestionsBatch(idsToDelete);
         }
         await deleteSubject(sub.id);
         if (selectedSubjectToManage === sub.name) {
@@ -940,11 +906,101 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       isOpen: true,
       title: `លុបសំណួរទាំងអស់ក្នុងមុខវិជ្ជា "${subjectName}"`,
       message: `តើអ្នកពិតជាចង់លុបសំណួរទាំង ${toKhmerNum(filtered.length)} សំណួរ មែនទេ?`,
-      subMessage: 'រាល់សំណួរ និងចម្លើយទាំងអស់ក្នុងមុខវិជ្ជានេះនឹងត្រូវបានលុបចេញពីប្រព័ន្ធ (ទាំង Firebase និង Supabase)។',
+      subMessage: 'រាល់សំណួរ និងចម្លើយទាំងអស់ក្នុងមុខវិជ្ជានេះនឹងត្រូវបានលុបចេញពីប្រព័ន្ធ។',
       onConfirm: async () => {
-        const ids = filtered.map((q) => q.id).filter(Boolean) as string[];
-        if (ids.length > 0) {
-          await deleteQuestionsBatch(ids);
+        const idsToDelete = filtered.map((q) => q.id).filter((id): id is string => Boolean(id));
+        if (idsToDelete.length > 0) {
+          await deleteQuestionsBatch(idsToDelete);
+        }
+      },
+    });
+  };
+
+  const handleCleanupDuplicateQuestionsClick = () => {
+    if (duplicateAnalysis.duplicateIds.length === 0 || isCleaningDuplicates) return;
+    setDeleteConfirmDialog({
+      isOpen: true,
+      title: 'លុបសំណួរជាន់គ្នាទាំងអស់',
+      message: `រកឃើញសំណួរជាន់គ្នាចំនួន ${toKhmerNum(duplicateAnalysis.duplicateIds.length)} សំណួរ (${toKhmerNum(duplicateAnalysis.duplicateGroupCount)} ក្រុម)។ តើអ្នកចង់លុបច្បាប់ចម្លងលើសទាំងនេះចេញពី Database មែនទេ?`,
+      subMessage: `ប្រព័ន្ធនឹងរក្សាទុកសំណួរដើម ១ ច្បាប់សម្រាប់សំណួរនីមួយៗ (នៅសល់ ${toKhmerNum(duplicateAnalysis.uniqueCount)} សំណួរស្អាត) និងកែតម្រូវចំនួនស្ថិតិឡើងវិញដោយស្វ័យប្រវត្តិ។`,
+      onConfirm: async () => {
+        setIsCleaningDuplicates(true);
+        setDedupStatusMsg(null);
+        try {
+          const latestQuestions = await fetchQuestionsCached(true).catch(() => questions);
+          const sourceList = latestQuestions.length > 0 ? latestQuestions : questions;
+          const extractTs = (id?: string) => {
+            const m = id?.match(/^q-(\d+)-/);
+            return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+          };
+          const groups = new Map<string, Question[]>();
+          for (const q of sourceList) {
+            const key = makeQuestionDedupKey(q.subject || '', q.question || '');
+            const list = groups.get(key);
+            if (list) list.push(q);
+            else groups.set(key, [q]);
+          }
+          const idsToDelete: string[] = [];
+          for (const list of groups.values()) {
+            if (list.length <= 1) continue;
+            const sorted = [...list].sort(
+              (a, b) => extractTs(a.id) - extractTs(b.id) || (a.order ?? 0) - (b.order ?? 0)
+            );
+            for (const extra of sorted.slice(1)) {
+              if (extra.id) idsToDelete.push(extra.id);
+            }
+          }
+          const deletedCount = await deleteQuestionsBatch(idsToDelete);
+          const remainingCount = Math.max(0, sourceList.length - deletedCount);
+          await syncGlobalStatsExact({
+            questionsCount: remainingCount,
+            subjectsCount: subjects.length,
+          });
+          setDedupStatusMsg({
+            text: `បានលុបសំណួរជាន់គ្នាចំនួន ${toKhmerNum(deletedCount)} ចេញពី Database រួចរាល់! នៅសល់ ${toKhmerNum(remainingCount)} សំណួរ។`,
+            success: true,
+          });
+        } catch (err: any) {
+          setDedupStatusMsg({
+            text: err?.message || 'បរាជ័យក្នុងការលុបសំណួរជាន់គ្នា! សូមប្រាកដថាអ្នកបានភ្ជាប់គណនី Google Admin។',
+            success: false,
+          });
+        } finally {
+          setIsCleaningDuplicates(false);
+        }
+      },
+    });
+  };
+
+  const handleCleanupOrphanQuestionsClick = () => {
+    if (duplicateAnalysis.orphanIds.length === 0 || isCleaningDuplicates) return;
+    const subjectPreview = duplicateAnalysis.orphanSubjects.slice(0, 2).join(', ');
+    setDeleteConfirmDialog({
+      isOpen: true,
+      title: 'លុបសំណួរដែលគ្មានមុខវិជ្ជា (Orphaned)',
+      message: `តើអ្នកពិតជាចង់លុបសំណួរចំនួន ${toKhmerNum(duplicateAnalysis.orphanIds.length)} ដែលស្ថិតក្នុងមុខវិជ្ជាដែលបានលុប (${subjectPreview || 'មិនមានក្នុងបញ្ជីមុខវិជ្ជា'}) មែនទេ?`,
+      subMessage: 'សំណួរទាំងនេះមិនមានមុខវិជ្ជានៅក្នុងបញ្ជីមុខវិជ្ជាបច្ចុប្បន្នទេ។',
+      onConfirm: async () => {
+        setIsCleaningDuplicates(true);
+        setDedupStatusMsg(null);
+        try {
+          const deletedCount = await deleteQuestionsBatch(duplicateAnalysis.orphanIds);
+          const remainingCount = Math.max(0, questions.length - deletedCount);
+          await syncGlobalStatsExact({
+            questionsCount: remainingCount,
+            subjectsCount: subjects.length,
+          });
+          setDedupStatusMsg({
+            text: `បានលុបសំណួរគ្មានមុខវិជ្ជាចំនួន ${toKhmerNum(deletedCount)} ចេញពីប្រព័ន្ធរួចរាល់!`,
+            success: true,
+          });
+        } catch (err: any) {
+          setDedupStatusMsg({
+            text: err?.message || 'បរាជ័យក្នុងការលុបសំណួរគ្មានមុខវិជ្ជា!',
+            success: false,
+          });
+        } finally {
+          setIsCleaningDuplicates(false);
         }
       },
     });
@@ -963,6 +1019,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
     if (!singleQuestionText.trim()) {
       setSingleStatusMsg({ text: 'សូមបញ្ចូលអត្ថបទសំណួរ!', success: false });
+      return;
+    }
+
+    const newDedupKey = makeQuestionDedupKey(finalSubject, singleQuestionText);
+    if (questions.some((q) => makeQuestionDedupKey(q.subject || '', q.question || '') === newDedupKey)) {
+      setSingleStatusMsg({
+        text: `សំណួរនេះមានរួចហើយនៅក្នុងមុខវិជ្ជា "${finalSubject}" (បានរំលងដើម្បីកុំឱ្យជាន់គ្នា)!`,
+        success: false,
+      });
       return;
     }
 
@@ -1009,6 +1074,13 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     setIsSavingBulkQuestions(true);
     setBulkStatusMsg(null);
     try {
+      const latestQuestions =
+        questions.length > 0 ? questions : await fetchQuestionsCached(false).catch(() => questions);
+      const existingQuestionKeys = new Set(
+        latestQuestions.map((item) => makeQuestionDedupKey(item.subject || '', item.question || ''))
+      );
+      const batchSeenKeys = new Set<string>();
+
       const fallbackSubject = (newBulkSubjectName.trim() || bulkSubject || (subjects[0]?.name ?? 'ចំណេះដឹងទូទៅ')).trim();
       const normalizedQuestions: Omit<Question, 'id'>[] = [];
       const countOffsetBySubject: Record<string, number> = {};
@@ -1017,39 +1089,60 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         existingSubjectMap.set(s.name.trim().toLowerCase(), s.name);
       }
 
-      let nextSubjectOrder = getNextSubjectOrder();
-      let createdSubjectsCount = 0;
-
-      // Ensure all referenced subjects exist in Firestore first
-      for (const q of generatedPreview) {
-        const rawSub = (q.subject || fallbackSubject).trim() || fallbackSubject;
-        const lowerKey = rawSub.toLowerCase();
-        if (!existingSubjectMap.has(lowerKey)) {
-          const meta = parsedSubjectMetaMap[rawSub];
-          await addSubject({
-            name: rawSub,
-            type: meta?.type || q.type || 'mcq',
-            isActive: meta?.isActive ?? true,
-            order: nextSubjectOrder++,
-          });
-          existingSubjectMap.set(lowerKey, rawSub);
-          createdSubjectsCount++;
-        }
-      }
+      // First pass: filter out questions that already exist in Firestore or repeat inside the batch
+      const nonDuplicatePreview: { q: Question; canonicalSubject: string }[] = [];
+      let skippedDuplicateCount = 0;
 
       for (const q of generatedPreview) {
         const rawSub = (q.subject || fallbackSubject).trim() || fallbackSubject;
         const canonicalSubject = existingSubjectMap.get(rawSub.toLowerCase()) || rawSub;
-
-        if (countOffsetBySubject[canonicalSubject] === undefined) {
-          countOffsetBySubject[canonicalSubject] = questions.filter((item) => item.subject === canonicalSubject).length;
+        const dedupKey = makeQuestionDedupKey(canonicalSubject, q.question || '');
+        if (existingQuestionKeys.has(dedupKey) || batchSeenKeys.has(dedupKey)) {
+          skippedDuplicateCount += 1;
+          continue;
         }
-        countOffsetBySubject[canonicalSubject] += 1;
+        batchSeenKeys.add(dedupKey);
+        nonDuplicatePreview.push({ q, canonicalSubject });
+      }
+
+      if (nonDuplicatePreview.length === 0) {
+        setBulkStatusMsg({
+          text: `សំណួរទាំងអស់ (${toKhmerNum(skippedDuplicateCount)}) មានរួចហើយនៅក្នុងប្រព័ន្ធ! ប្រព័ន្ធបានរំលងដើម្បីការពារការជាន់ទិន្នន័យ។`,
+          success: false,
+        });
+        return;
+      }
+
+      let nextSubjectOrder = getNextSubjectOrder();
+      let createdSubjectsCount = 0;
+
+      // Ensure all referenced subjects for NEW questions exist in Firestore first
+      for (const { q, canonicalSubject } of nonDuplicatePreview) {
+        const lowerKey = canonicalSubject.toLowerCase();
+        if (!existingSubjectMap.has(lowerKey)) {
+          const meta = parsedSubjectMetaMap[canonicalSubject];
+          await addSubject({
+            name: canonicalSubject,
+            type: meta?.type || q.type || 'mcq',
+            isActive: meta?.isActive ?? true,
+            order: nextSubjectOrder++,
+          });
+          existingSubjectMap.set(lowerKey, canonicalSubject);
+          createdSubjectsCount++;
+        }
+      }
+
+      for (const { q, canonicalSubject } of nonDuplicatePreview) {
+        const resolvedSub = existingSubjectMap.get(canonicalSubject.toLowerCase()) || canonicalSubject;
+        if (countOffsetBySubject[resolvedSub] === undefined) {
+          countOffsetBySubject[resolvedSub] = latestQuestions.filter((item) => item.subject === resolvedSub).length;
+        }
+        countOffsetBySubject[resolvedSub] += 1;
 
         normalizedQuestions.push({
           ...q,
-          subject: canonicalSubject,
-          order: countOffsetBySubject[canonicalSubject],
+          subject: resolvedSub,
+          order: countOffsetBySubject[resolvedSub],
         });
       }
 
@@ -1062,9 +1155,13 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           : `ទៅក្នុង ${toKhmerNum(touchedSubjectsCount)} មុខវិជ្ជា`;
       const newSubNote =
         createdSubjectsCount > 0 ? ` (និងបង្កើតមុខវិជ្ជាថ្មី ${toKhmerNum(createdSubjectsCount)})` : '';
+      const skippedDupNote =
+        skippedDuplicateCount > 0
+          ? ` · បានរំលងសំណួរជាន់គ្នា ${toKhmerNum(skippedDuplicateCount)}`
+          : '';
 
       setBulkStatusMsg({
-        text: `បានរក្សាទុក ${toKhmerNum(normalizedQuestions.length)} សំណួរ${subjectSummary}${newSubNote} ជោគជ័យ!`,
+        text: `បានរក្សាទុក ${toKhmerNum(normalizedQuestions.length)} សំណួរថ្មី${subjectSummary}${newSubNote}${skippedDupNote} ជោគជ័យ!`,
         success: true,
       });
       setGeneratedPreview([]);
@@ -2020,149 +2117,6 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     });
   };
 
-  const formatImportedSummaryKh = (imported: Record<string, number>) => {
-    const labels: Record<string, string> = {
-      subjects: 'មុខវិជ្ជា',
-      questions: 'សំណួរ',
-      notifications: 'ដំណឹង',
-      botCommands: 'Bot Commands',
-      paidUsers: 'សមាជិក VIP',
-      feedbacks: 'មតិយោបល់',
-      logins: 'ប្រវត្តិ Login',
-      presence: 'វត្តមាន',
-    };
-    return Object.entries(imported)
-      .filter(([, count]) => Number(count) > 0)
-      .map(([key, count]) => `${labels[key] || key}: ${toKhmerNum(Number(count))}`)
-      .join(' · ');
-  };
-
-  const handleMigrateAllToSupabase = async () => {
-    if (isMigratingDb) return;
-    setIsMigratingDb(true);
-    setMigrationStatusMsg(null);
-    setMigrationProgressText('កំពុងរៀបចំទាញទិន្នន័យទាំងអស់...');
-    try {
-      const result = await migrateAllFirebaseToSupabase((msg) => setMigrationProgressText(msg));
-      const summary = formatImportedSummaryKh(result.imported);
-      const warnNote =
-        result.warnings.length > 0
-          ? ` (កំណត់ចំណាំ៖ ទិន្នន័យខ្លះប្រើ Cache ដោយសារ Firebase ជាប់ដែនកំណត់)`
-          : '';
-      setMigrationStatusMsg({
-        text: `ផ្ទេរទិន្នន័យទៅ Supabase ជោគជ័យ! (${summary || `សរុប ${toKhmerNum(result.totalRecords)}`})${warnNote}`,
-        success: true,
-      });
-    } catch (err: any) {
-      setMigrationStatusMsg({
-        text: err?.message || 'បរាជ័យក្នុងការផ្ទេរទិន្នន័យទៅ Supabase',
-        success: false,
-      });
-    } finally {
-      setIsMigratingDb(false);
-      setMigrationProgressText('');
-    }
-  };
-
-  const handleExportFullBackupJson = async () => {
-    if (isMigratingDb) return;
-    setIsMigratingDb(true);
-    setMigrationStatusMsg(null);
-    setMigrationProgressText('កំពុងប្រមូលទិន្នន័យទាំងអស់ជាឯកសារ Backup...');
-    try {
-      const res = await exportAllFirebaseDataAsJson((msg) => setMigrationProgressText(msg));
-      setMigrationStatusMsg({
-        text: `បានទាញយកឯកសារ Backup ទាំងអស់ (${res.filename} · សរុប ${toKhmerNum(res.totalRecords)} ទិន្នន័យ) ជោគជ័យ!`,
-        success: true,
-      });
-    } catch (err: any) {
-      setMigrationStatusMsg({
-        text: err?.message || 'បរាជ័យក្នុងការទាញយក Backup JSON',
-        success: false,
-      });
-    } finally {
-      setIsMigratingDb(false);
-      setMigrationProgressText('');
-    }
-  };
-
-  const handleImportFullBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file || isMigratingDb) return;
-
-    setIsMigratingDb(true);
-    setMigrationStatusMsg(null);
-    setMigrationProgressText('កំពុងអានឯកសារ Backup...');
-    try {
-      const rawText = await file.text();
-      const res = await importBackupJsonToSupabase(rawText, (msg) => setMigrationProgressText(msg));
-      const summary = formatImportedSummaryKh(res.imported);
-      setMigrationStatusMsg({
-        text: `បញ្ចូលទិន្នន័យពី Backup ទៅ Supabase ជោគជ័យ! (${summary || `សរុប ${toKhmerNum(res.totalRecords)}`})`,
-        success: true,
-      });
-    } catch (err: any) {
-      setMigrationStatusMsg({
-        text: err?.message || 'បរាជ័យក្នុងការបញ្ចូលឯកសារ Backup ទៅ Supabase',
-        success: false,
-      });
-    } finally {
-      setIsMigratingDb(false);
-      setMigrationProgressText('');
-    }
-  };
-
-  const copyTextSafe = async (text: string): Promise<boolean> => {
-    try {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        await navigator.clipboard.writeText(text);
-        return true;
-      }
-    } catch {
-      // Fallback for restricted iframes / Safari
-    }
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.setAttribute('readonly', '');
-      ta.style.position = 'fixed';
-      ta.style.left = '-9999px';
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      const copied = document.execCommand('copy');
-      document.body.removeChild(ta);
-      return copied;
-    } catch {
-      return false;
-    }
-  };
-
-  const handleCopySupabaseSchemaSql = async () => {
-    setMigrationStatusMsg(null);
-    try {
-      const res = await fetch('/api/db/schema-sql?raw=1', { cache: 'no-store' });
-      const rawSql = await res.text();
-      if (!res.ok || !rawSql.includes('CREATE TABLE') || rawSql.trim().startsWith('{')) {
-        throw new Error('មិនអាចទាញយកកូដ SQL បានទេ');
-      }
-      setSchemaSqlPreview(rawSql);
-      const copied = await copyTextSafe(rawSql);
-      setMigrationStatusMsg({
-        text: copied
-          ? 'បានចម្លង SQL (CREATE TABLE...) រួចរាល់! សូមលុបកូដចាស់ក្នុង Supabase SQL Editor រួច Paste និងចុច Run។'
-          : 'សូមចុច Select All & Copy កូដ SQL ខាងក្រោម (កុំ Paste ឯកសារ .json) ទៅ Run ក្នុង Supabase → SQL Editor។',
-        success: true,
-      });
-    } catch (err: any) {
-      setMigrationStatusMsg({
-        text: err?.message || 'មិនអាចចម្លង SQL បានទេ — សូមបើកឯកសារ supabase/schema.sql ដោយផ្ទាល់។',
-        success: false,
-      });
-    }
-  };
-
   const [broadcastStatusMsg, setBroadcastStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
 
@@ -2920,11 +2874,28 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           </div>
 
           {generatedPreview.length > 0 && (() => {
+            const fallbackSub = (newBulkSubjectName.trim() || bulkSubject || 'មិនទាន់កំណត់').trim();
+            const existingKeys = new Set(
+              questions.map((item) => makeQuestionDedupKey(item.subject || '', item.question || ''))
+            );
+            const previewSeen = new Set<string>();
+            let previewDupCount = 0;
+            for (const q of generatedPreview) {
+              const sub = (q.subject || fallbackSub).trim();
+              const k = makeQuestionDedupKey(sub, q.question || '');
+              if (existingKeys.has(k) || previewSeen.has(k)) {
+                previewDupCount += 1;
+              } else {
+                previewSeen.add(k);
+              }
+            }
+            const previewNewCount = generatedPreview.length - previewDupCount;
+
             const previewSubjects = Array.from(
               new Set(
                 generatedPreview.map(
                   (q) =>
-                    (q.subject || newBulkSubjectName.trim() || bulkSubject || 'មិនទាន់កំណត់').trim()
+                    (q.subject || fallbackSub).trim()
                 )
               )
             );
@@ -2950,6 +2921,14 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                       {missingSubjectsCount > 0 &&
                         ` (នឹងបង្កើតមុខវិជ្ជាថ្មី ${toKhmerNum(missingSubjectsCount)} ដោយស្វ័យប្រវត្តិ)`}
                     </p>
+                    {previewDupCount > 0 && (
+                      <p className="text-xs sm:text-sm font-semibold text-amber-700 dark:text-amber-300 mt-1.5 flex items-center gap-1.5">
+                        <AlertCircle className="w-4 h-4 shrink-0" />
+                        <span>
+                          រកឃើញសំណួរជាន់គ្នា {toKhmerNum(previewDupCount)} (នឹងរំលងដោយស្វ័យប្រវត្តិ · រក្សាទុកតែសំណួរថ្មី {toKhmerNum(previewNewCount)})
+                        </span>
+                      </p>
+                    )}
                   </div>
 
                   <button
@@ -3289,7 +3268,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                           <td className="py-3 px-3 whitespace-nowrap">
                             <button
                               type="button"
-                              onClick={() => void handleToggleSubjectActive(sub)}
+                              onClick={() => updateSubject(sub.id, { isActive: !sub.isActive })}
                               className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer whitespace-nowrap ${
                                 sub.isActive !== false
                                   ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-200 border border-emerald-400 dark:border-emerald-700'
@@ -3350,6 +3329,86 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </tbody>
               </table>
             </div>
+          </div>
+
+          {/* Duplicate & Orphaned Data Scanner / Cleanup */}
+          <div className="app-card rounded-2xl p-6 shadow-sm">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h2 className="font-moul text-base app-text-primary flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-amber-500 shrink-0" />
+                  <span>ត្រួតពិនិត្យ និងសម្អាតទិន្នន័យជាន់គ្នា</span>
+                </h2>
+                <p className="text-sm app-text-secondary mt-1">
+                  សរុបក្នុងប្រព័ន្ធ៖ <strong className="app-text-primary">{toKhmerNum(duplicateAnalysis.totalCount)}</strong> សំណួរ ·
+                  សំណួរមិនជាន់គ្នា៖ <strong className="text-emerald-700 dark:text-emerald-300">{toKhmerNum(duplicateAnalysis.uniqueCount)}</strong> ·
+                  ជាន់គ្នាលើស៖{' '}
+                  <strong className={duplicateAnalysis.duplicateIds.length > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-300'}>
+                    {toKhmerNum(duplicateAnalysis.duplicateIds.length)}
+                  </strong>
+                  {duplicateAnalysis.orphanIds.length > 0 && (
+                    <>
+                      {' '}· គ្មានមុខវិជ្ជា៖{' '}
+                      <strong className="text-amber-700 dark:text-amber-300">
+                        {toKhmerNum(duplicateAnalysis.orphanIds.length)}
+                      </strong>
+                    </>
+                  )}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                {duplicateAnalysis.duplicateIds.length > 0 ? (
+                  <button
+                    type="button"
+                    disabled={isCleaningDuplicates}
+                    onClick={handleCleanupDuplicateQuestionsClick}
+                    className="px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white font-bold text-xs sm:text-sm flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    {isCleaningDuplicates ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-4 h-4" />
+                    )}
+                    <span>លុបសំណួរជាន់គ្នា ({toKhmerNum(duplicateAnalysis.duplicateIds.length)})</span>
+                  </button>
+                ) : (
+                  <span className="px-3.5 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-200 border border-emerald-400 dark:border-emerald-700 text-xs font-bold inline-flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>មិនមានសំណួរជាន់គ្នាទេ</span>
+                  </span>
+                )}
+
+                {duplicateAnalysis.orphanIds.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={isCleaningDuplicates}
+                    onClick={handleCleanupOrphanQuestionsClick}
+                    className="px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white font-bold text-xs sm:text-sm flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>លុបសំណួរគ្មានមុខវិជ្ជា ({toKhmerNum(duplicateAnalysis.orphanIds.length)})</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {dedupStatusMsg && (
+              <div
+                className={`mt-4 p-3.5 rounded-xl text-sm flex items-center gap-2 border ${
+                  dedupStatusMsg.success
+                    ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 dark:border-emerald-700 text-emerald-900 dark:text-emerald-200'
+                    : 'bg-red-50 dark:bg-red-950/60 border-red-400 dark:border-red-700 text-red-900 dark:text-red-200'
+                }`}
+              >
+                {dedupStatusMsg.success ? (
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                )}
+                <span>{dedupStatusMsg.text}</span>
+              </div>
+            )}
           </div>
 
           {/* Question List & Swap Tool */}
@@ -4211,178 +4270,6 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                     <Download className="w-4 h-4 shrink-0" />
                     <span>Export JSON ទាំងអស់ ({toKhmerNum(questions.length)} សំណួរ)</span>
                   </button>
-                </div>
-
-                {/* Full Firebase -> Supabase Migration & Full Backup Section */}
-                <div className="pt-4 mt-4 border-t app-border space-y-4">
-                  {/* Database Mode Selector Card */}
-                  <div className="p-4 rounded-2xl app-subcard border app-border space-y-3">
-                    <div>
-                      <h4 className="font-bold text-sm app-text-primary flex items-center gap-2">
-                        <Layers className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
-                        <span>ជ្រើសរើសរបៀបដំណើរការ Database (Backend Mode)</span>
-                      </h4>
-                      <p className="text-xs app-text-muted mt-1 leading-relaxed">
-                        អ្នកអាចកំណត់ឱ្យប្រព័ន្ធដំណើរការលើ Supabase, Firebase (Firestore) ឬដំណើរការទ្វេរដងព្រមគ្នា (Dual-Sync)។ រាល់ការលុប ឬបន្ថែមទិន្នន័យ នឹងធ្វើសមកាលកម្មទាំង Firebase និង Supabase ដោយស្វ័យប្រវត្តិ។
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      {[
-                        { id: 'dual', label: 'Dual-Sync (ទាំងពីរ)' },
-                        { id: 'supabase', label: 'Supabase ទាំងស្រុង' },
-                        { id: 'firestore', label: 'Firebase ទាំងស្រុង' },
-                      ].map((item) => {
-                        const isActive = dbMode === item.id;
-                        return (
-                          <button
-                            type="button"
-                            key={item.id}
-                            disabled={isChangingMode}
-                            onClick={() => handleSelectDbMode(item.id as DbModeType)}
-                            className={`py-2.5 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 ${
-                              isActive
-                                ? 'khmer-btn-crimson shadow-sm'
-                                : 'app-subcard hover:opacity-85 app-text-primary border app-border'
-                            }`}
-                          >
-                            {isActive && <Check className="w-3.5 h-3.5 shrink-0" />}
-                            <span>{item.label}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div>
-                    <h4 className="font-bold text-sm app-text-primary flex items-center gap-2">
-                      <Cloud className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                      <span>ផ្ទេរ និងបម្រុងទុកទិន្នន័យទាំងអស់ (Firebase ⇄ Supabase)</span>
-                    </h4>
-                    <p className="text-xs app-text-muted mt-1 leading-relaxed">
-                      ផ្ទេរមុខវិជ្ជា សំណួរ ដំណឹង សមាជិក VIP មតិយោបល់ ប្រវត្តិ Login និង Bot Commands ទាំងអស់ទៅ Supabase ឬទាញយកឯកសារ Backup ពេញលេញ (.json)។
-                    </p>
-                  </div>
-
-                  <input
-                    ref={backupImportFileRef}
-                    type="file"
-                    accept="application/json,.json"
-                    onChange={handleImportFullBackupFile}
-                    className="hidden"
-                  />
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                    <button
-                      type="button"
-                      onClick={handleMigrateAllToSupabase}
-                      disabled={isMigratingDb}
-                      className="w-full py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    >
-                      {isMigratingDb ? (
-                        <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
-                      ) : (
-                        <Cloud className="w-4 h-4 shrink-0" />
-                      )}
-                      <span>ផ្ទេរទិន្នន័យ Firebase → Supabase ទាំងអស់</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleCopySupabaseSchemaSql}
-                      disabled={isMigratingDb}
-                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    >
-                      <FileText className="w-4 h-4 shrink-0" />
-                      <span>ចម្លង SQL បង្កើតតារា (schema.sql)</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleExportFullBackupJson}
-                      disabled={isMigratingDb}
-                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    >
-                      <Download className="w-4 h-4 shrink-0" />
-                      <span>ទាញយក Backup ទាំងអស់ (.json)</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => backupImportFileRef.current?.click()}
-                      disabled={isMigratingDb}
-                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    >
-                      <Upload className="w-4 h-4 shrink-0" />
-                      <span>បញ្ចូល Backup ទៅ Supabase (.json)</span>
-                    </button>
-                  </div>
-
-                  {isMigratingDb && migrationProgressText && (
-                    <div className="px-3.5 py-2.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-xs flex items-center gap-2">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
-                      <span>{migrationProgressText}</span>
-                    </div>
-                  )}
-
-                  {migrationStatusMsg && (
-                    <div
-                      className={`px-3.5 py-2.5 rounded-xl text-xs font-medium flex items-start gap-2 border ${
-                        migrationStatusMsg.success
-                          ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
-                          : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200'
-                      }`}
-                    >
-                      {migrationStatusMsg.success ? (
-                        <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
-                      ) : (
-                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                      )}
-                      <span>{migrationStatusMsg.text}</span>
-                    </div>
-                  )}
-
-                  {schemaSqlPreview && (
-                    <div className="p-3 rounded-xl app-subcard border app-border space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold app-text-primary">
-                          កូដ SQL សម្រាប់ Supabase SQL Editor (ចាប់ផ្ដើមដោយ -- Master Quiz KH)
-                        </span>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              const ok = await copyTextSafe(schemaSqlPreview);
-                              if (ok) {
-                                setMigrationStatusMsg({
-                                  text: 'បានចម្លង SQL ម្ដងទៀតជោគជ័យ!',
-                                  success: true,
-                                });
-                              }
-                            }}
-                            className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold cursor-pointer"
-                          >
-                            ចម្លង SQL
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSchemaSqlPreview(null)}
-                            className="p-1 rounded-lg app-text-muted hover:opacity-80 cursor-pointer"
-                            title="បិទ"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                      <textarea
-                        readOnly
-                        value={schemaSqlPreview}
-                        onFocus={(e) => e.currentTarget.select()}
-                        rows={7}
-                        className="w-full p-2.5 rounded-lg app-input text-[11px] font-mono leading-relaxed"
-                      />
-                    </div>
-                  )}
                 </div>
               </div>
             </div>
@@ -6351,23 +6238,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 />
               </div>
 
-              {editQuestionError && (
-                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{editQuestionError}</span>
-                </div>
-              )}
-
               <div className="flex items-center justify-between pt-4 border-t app-border">
                 <button
                   type="button"
-                  disabled={isSavingQuestionEdit}
                   onClick={() => {
                     if (editingQuestion) {
                       handleDeleteQuestionClick(editingQuestion);
                     }
                   }}
-                  className="px-4 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Trash2 className="w-4 h-4" />
                   <span>លុបសំណួរនេះ</span>
@@ -6376,18 +6255,16 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    disabled={isSavingQuestionEdit}
                     onClick={() => setEditingQuestion(null)}
-                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
+                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
                   >
                     បោះបង់
                   </button>
                   <button
                     type="submit"
-                    disabled={isSavingQuestionEdit}
-                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition disabled:opacity-60 cursor-pointer"
+                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition cursor-pointer"
                   >
-                    {isSavingQuestionEdit ? 'កំពុងរក្សាទុក...' : 'រក្សាទុកការកែប្រែ'}
+                    រក្សាទុកការកែប្រែ
                   </button>
                 </div>
               </div>
@@ -6458,23 +6335,15 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </button>
               </div>
 
-              {editSubjectError && (
-                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{editSubjectError}</span>
-                </div>
-              )}
-
               <div className="flex items-center justify-between pt-4 border-t app-border">
                 <button
                   type="button"
-                  disabled={isSavingSubjectEdit}
                   onClick={() => {
                     if (editingSubject) {
                       handleDeleteSubjectClick(editingSubject);
                     }
                   }}
-                  className="px-3.5 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                  className="px-3.5 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Trash2 className="w-4 h-4" />
                   <span>លុបមុខវិជ្ជា</span>
@@ -6483,18 +6352,16 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    disabled={isSavingSubjectEdit}
                     onClick={() => setEditingSubject(null)}
-                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
+                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
                   >
                     បោះបង់
                   </button>
                   <button
                     type="submit"
-                    disabled={isSavingSubjectEdit}
-                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition disabled:opacity-60 cursor-pointer"
+                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition cursor-pointer"
                   >
-                    {isSavingSubjectEdit ? 'កំពុងរក្សាទុក...' : 'រក្សាទុក'}
+                    រក្សាទុក
                   </button>
                 </div>
               </div>
@@ -6834,45 +6701,25 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               </p>
             )}
 
-            {deleteConfirmError && (
-              <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center justify-center gap-2 mb-4">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span>{deleteConfirmError}</span>
-              </div>
-            )}
-
             <div className="flex items-center justify-center gap-3 mt-4">
               <button
                 type="button"
-                disabled={isConfirmDeleting}
-                onClick={() => {
-                  setDeleteConfirmError(null);
-                  setDeleteConfirmDialog(null);
-                }}
-                className="flex-1 py-2.5 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
+                onClick={() => setDeleteConfirmDialog(null)}
+                className="flex-1 py-2.5 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
               >
                 បោះបង់
               </button>
               <button
                 type="button"
-                disabled={isConfirmDeleting}
                 onClick={async () => {
-                  if (isConfirmDeleting) return;
-                  setIsConfirmDeleting(true);
-                  setDeleteConfirmError(null);
-                  try {
-                    await deleteConfirmDialog.onConfirm();
-                    setDeleteConfirmDialog(null);
-                  } catch (err: any) {
-                    setDeleteConfirmError(err?.message || 'បរាជ័យក្នុងការលុបទិន្នន័យលើ Server!');
-                  } finally {
-                    setIsConfirmDeleting(false);
-                  }
+                  const action = deleteConfirmDialog.onConfirm;
+                  setDeleteConfirmDialog(null);
+                  await action();
                 }}
-                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm transition flex items-center justify-center gap-1.5 disabled:opacity-60 cursor-pointer"
+                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm transition flex items-center justify-center gap-1.5 cursor-pointer"
               >
                 <Trash2 className="w-4 h-4" />
-                <span>{isConfirmDeleting ? 'កំពុងលុប...' : 'យល់ព្រមលុប'}</span>
+                <span>យល់ព្រមលុប</span>
               </button>
             </div>
           </div>

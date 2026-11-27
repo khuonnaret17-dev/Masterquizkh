@@ -5,86 +5,11 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { getApp, getApps, initializeApp } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
-import {
-  isSupabaseConfigured,
-  getSupabaseAdmin,
-  sbFetchAllQuestions,
-  sbFetchAllSubjects,
-  sbFetchNotifications,
-  sbFetchBotCommandsMap,
-  sbFetchOnlineCount,
-  sbFetchGlobalStats,
-  sbUpsertQuestions,
-  sbUpdateQuestion,
-  sbRenameQuestionsSubject,
-  sbDeleteQuestion,
-  sbDeleteQuestionsByIds,
-  sbUpsertSubjects,
-  sbUpdateSubject,
-  sbDeleteSubject,
-  sbUpsertNotification,
-  sbUpsertNotifications,
-  sbDeleteNotification,
-  sbDeleteNotificationsByIds,
-  sbSaveBotCommand,
-  sbUpsertBotCommandsMap,
-  sbDeleteBotCommand,
-  sbDeleteBotCommands,
-  sbFetchFeedbacksPage,
-  sbInsertFeedback,
-  sbUpsertFeedbacks,
-  sbFetchLoginsPage,
-  sbInsertLogin,
-  sbUpsertLogins,
-  sbDeleteLogin,
-  sbDeleteLoginsByIds,
-  sbFetchPresencePage,
-  sbUpsertPresence,
-  sbUpsertPresenceBatch,
-  sbFetchPaidUsersPage,
-  sbCheckIsUserPaid,
-  sbUpsertPaidUsers,
-  sbUpdatePaidUserStatus,
-  sbDeletePaidUser,
-  sbRefreshGlobalStatsRow,
-  getSupabasePublicConfig,
-  sbEnsureSubjectsFromQuestions,
-  startServerSupabaseRealtime,
-  broadcastSupabaseRealtime,
-} from './server/supabaseDb.ts';
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-dotenv.config({ path: path.resolve(__dirname, '.env'), override: true });
-dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true });
-
-try {
-  for (const envFile of [path.resolve(__dirname, '.env'), path.resolve(process.cwd(), '.env')]) {
-    if (fs.existsSync(envFile)) {
-      const lines = fs.readFileSync(envFile, 'utf8').split(/\r?\n/);
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          const k = trimmed.slice(0, eqIdx).trim();
-          let v = trimmed.slice(eqIdx + 1).trim();
-          if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-            v = v.slice(1, -1);
-          }
-          if (k && v && !process.env[k]) {
-            process.env[k] = v;
-          }
-        }
-      }
-    }
-  }
-} catch {
-  // Ignore fallback error
-}
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -1512,6 +1437,7 @@ async function fetchCollectionViaFirestoreRest(collectionName: string, authHeade
   }
   const { projectId, firestoreDatabaseId, apiKey } = serverFbConfig;
   const docs: any[] = [];
+  const seenIds = new Set<string>();
   let lastDocName = '';
   const maxPages = 500;
 
@@ -1554,11 +1480,13 @@ async function fetchCollectionViaFirestoreRest(collectionName: string, authHeade
       const d = row.document;
       const name = typeof d.name === 'string' ? d.name : '';
       const id = name ? name.split('/').pop() || '' : '';
+      if (name) lastDocName = name;
+      if (id && seenIds.has(id)) continue;
+      if (id) seenIds.add(id);
       docs.push({
         id,
         ...decodeFirestoreFields(d.fields || {}),
       });
-      if (name) lastDocName = name;
     }
 
     if (list.length < 20) {
@@ -1568,47 +1496,6 @@ async function fetchCollectionViaFirestoreRest(collectionName: string, authHeade
 
   return docs;
 }
-
-async function deleteDocumentViaFirestoreRest(
-  collectionName: string,
-  docId: string,
-  authHeader?: string
-): Promise<boolean> {
-  if (!serverFbConfig) return false;
-  try {
-    const { projectId, firestoreDatabaseId, apiKey } = serverFbConfig;
-    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(firestoreDatabaseId)}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}?key=${encodeURIComponent(apiKey)}`;
-    const headers: Record<string, string> = {};
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      headers['Authorization'] = authHeader;
-    }
-    const res = await fetch(url, { method: 'DELETE', headers });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function deleteDocumentsViaFirestoreRestBatch(
-  collectionName: string,
-  docIds: string[],
-  authHeader?: string
-): Promise<number> {
-  if (!serverFbConfig || docIds.length === 0) return 0;
-  let deleted = 0;
-  const CHUNK_SIZE = 25;
-  for (let i = 0; i < docIds.length; i += CHUNK_SIZE) {
-    const chunk = docIds.slice(i, i + CHUNK_SIZE);
-    const results = await Promise.allSettled(
-      chunk.map((id) => deleteDocumentViaFirestoreRest(collectionName, id, authHeader))
-    );
-    for (const res of results) {
-      if (res.status === 'fulfilled' && res.value) deleted++;
-    }
-  }
-  return deleted;
-}
-
 
 async function fetchActivePresenceCountViaRest(authHeader?: string): Promise<number> {
   if (!serverFbConfig) throw new Error('Firebase config unavailable on server');
@@ -1752,185 +1639,18 @@ function markQuotaCooldownIfNeeded(err: any) {
   }
 }
 
-// Database Mode Management (dual, supabase, firestore)
-type DbModeType = 'dual' | 'supabase' | 'firestore';
-const DB_MODE_FILE = path.resolve(__dirname, '.mpq_db_mode.json');
-
-function loadDbMode(): DbModeType {
-  try {
-    if (fs.existsSync(DB_MODE_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(DB_MODE_FILE, 'utf8'));
-      if (parsed?.mode === 'supabase' || parsed?.mode === 'firestore' || parsed?.mode === 'dual') {
-        return parsed.mode;
-      }
-    }
-  } catch {
-    // Ignore
-  }
-  return 'dual';
-}
-
-function saveDbMode(mode: DbModeType) {
-  try {
-    fs.writeFileSync(DB_MODE_FILE, JSON.stringify({ mode }), { mode: 0o600 });
-  } catch {
-    // Ignore
-  }
-}
-
-let currentDbMode: DbModeType = loadDbMode();
-
-function shouldUseSupabaseOnServer(): boolean {
-  return currentDbMode !== 'firestore' && isSupabaseConfigured();
-}
-
-// ---------------- Real-Time Event Hub (SSE + Supabase Realtime Bridge) ----------------
-export interface RealtimeBroadcastEvent {
-  scope:
-    | 'questions'
-    | 'subjects'
-    | 'notifications'
-    | 'bot_commands'
-    | 'feedbacks'
-    | 'logins'
-    | 'presence'
-    | 'paid_users'
-    | 'global_stats'
-    | 'db_mode'
-    | 'core';
-  action: 'upsert' | 'upsertMany' | 'delete' | 'deleteMany' | 'clear' | 'replace' | 'refresh';
-  id?: string;
-  ids?: string[];
-  item?: any;
-  items?: any[];
-  replace?: any;
-  mode?: DbModeType;
-  version: number;
-  source: 'server' | 'supabase' | 'firestore';
-  ts: number;
-}
-
-const SERVER_INSTANCE_ID = crypto.randomUUID();
-const sseClients = new Set<express.Response>();
-
-function broadcastSsePayload(eventName: string, payload: unknown) {
-  if (sseClients.size === 0) return;
-  const frame = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const client of Array.from(sseClients)) {
-    try {
-      client.write(frame);
-    } catch {
-      sseClients.delete(client);
-    }
-  }
-}
-
-function emitRealtimeChange(
-  event: Omit<RealtimeBroadcastEvent, 'version' | 'ts'> & { version?: number; skipSupabaseBroadcast?: boolean }
-) {
-  const fullEvent: RealtimeBroadcastEvent = {
-    scope: event.scope,
-    action: event.action,
-    ...(event.id !== undefined ? { id: event.id } : {}),
-    ...(event.ids !== undefined ? { ids: event.ids } : {}),
-    ...(event.item !== undefined ? { item: event.item } : {}),
-    ...(event.items !== undefined ? { items: event.items } : {}),
-    ...(event.replace !== undefined ? { replace: event.replace } : {}),
-    ...(event.mode !== undefined ? { mode: event.mode } : {}),
-    source: event.source,
-    version: event.version ?? serverCoreCache.version,
-    ts: Date.now(),
-  };
-
-  broadcastSsePayload('db_change', fullEvent);
-
-  if (!event.skipSupabaseBroadcast && isSupabaseConfigured()) {
-    void broadcastSupabaseRealtime({
-      ...fullEvent,
-      serverInstanceId: SERVER_INSTANCE_ID,
-    });
-  }
-}
-
-let onlineCountBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleBroadcastOnlineCount() {
-  if (onlineCountBroadcastTimer) return;
-  onlineCountBroadcastTimer = setTimeout(() => {
-    onlineCountBroadcastTimer = null;
-    if (sseClients.size === 0) return;
-    const onlineCount = Math.max(serverCoreCache.onlineCount?.count || 1, sseClients.size);
-    broadcastSsePayload('online_count', { onlineCount, ts: Date.now() });
-  }, 500);
-}
-
-// Keep-alive heartbeat for SSE clients (prevents proxy idle timeout)
-setInterval(() => {
-  if (sseClients.size === 0) return;
-  for (const client of Array.from(sseClients)) {
-    try {
-      client.write(`: ping ${Date.now()}\n\n`);
-    } catch {
-      sseClients.delete(client);
-    }
-  }
-}, 25000);
-
-app.get('/api/realtime/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
-
-  sseClients.add(res);
-
-  const initPayload = {
-    connected: true,
-    mode: currentDbMode,
-    backend: shouldUseSupabaseOnServer() ? 'supabase' : 'firestore',
-    version: serverCoreCache.version,
-    onlineCount: Math.max(serverCoreCache.onlineCount?.count || 1, sseClients.size),
-    ts: Date.now(),
-  };
-  try {
-    res.write(`event: connected\ndata: ${JSON.stringify(initPayload)}\n\n`);
-  } catch {
-    sseClients.delete(res);
-  }
-
-  scheduleBroadcastOnlineCount();
-
-  req.on('close', () => {
-    sseClients.delete(res);
-    scheduleBroadcastOnlineCount();
-  });
-});
-
-app.get('/api/db/realtime-config', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({
-    success: true,
-    mode: currentDbMode,
-    backend: shouldUseSupabaseOnServer() ? 'supabase' : 'firestore',
-    supabase: getSupabasePublicConfig(),
-    firestoreConfigured: Boolean(serverFbConfig?.projectId),
-    sseEndpoint: '/api/realtime/events',
-  });
-});
-
 async function getServerCachedQuestions(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
-  const usingSupabase = shouldUseSupabaseOnServer();
   if (
     !force &&
     serverCoreCache.questions &&
     serverCoreCache.questions.data.length > 0 &&
     (now - serverCoreCache.questions.fetchedAt < SERVER_CACHE_TTLS.questions ||
-      (!usingSupabase && now < serverCoreCache.quotaCooldownUntil))
+      now < serverCoreCache.quotaCooldownUntil)
   ) {
     return serverCoreCache.questions.data;
   }
-  if (!usingSupabase && now < serverCoreCache.quotaCooldownUntil) {
+  if (now < serverCoreCache.quotaCooldownUntil) {
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -1941,15 +1661,13 @@ async function getServerCachedQuestions(force = false, authHeader?: string): Pro
 
   const p = (async () => {
     try {
-      const raw = usingSupabase
-        ? await sbFetchAllQuestions()
-        : await fetchCollectionViaFirestoreRest('questions', authHeader);
+      const raw = await fetchCollectionViaFirestoreRest('questions', authHeader);
       raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       serverCoreCache.questions = { data: raw, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return raw;
     } catch (err: any) {
-      if (!usingSupabase) markQuotaCooldownIfNeeded(err);
+      markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.questions) {
         return serverCoreCache.questions.data;
       }
@@ -1963,17 +1681,16 @@ async function getServerCachedQuestions(force = false, authHeader?: string): Pro
 
 async function getServerCachedSubjects(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
-  const usingSupabase = shouldUseSupabaseOnServer();
   if (
     !force &&
     serverCoreCache.subjects &&
     serverCoreCache.subjects.data.length > 0 &&
     (now - serverCoreCache.subjects.fetchedAt < SERVER_CACHE_TTLS.subjects ||
-      (!usingSupabase && now < serverCoreCache.quotaCooldownUntil))
+      now < serverCoreCache.quotaCooldownUntil)
   ) {
     return serverCoreCache.subjects.data;
   }
-  if (!usingSupabase && now < serverCoreCache.quotaCooldownUntil) {
+  if (now < serverCoreCache.quotaCooldownUntil) {
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -1984,18 +1701,13 @@ async function getServerCachedSubjects(force = false, authHeader?: string): Prom
 
   const p = (async () => {
     try {
-      let raw = usingSupabase
-        ? await sbFetchAllSubjects()
-        : await fetchCollectionViaFirestoreRest('subjects', authHeader);
-      if (usingSupabase) {
-        raw = await sbEnsureSubjectsFromQuestions(serverCoreCache.questions?.data).catch(() => raw);
-      }
+      const raw = await fetchCollectionViaFirestoreRest('subjects', authHeader);
       raw.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       serverCoreCache.subjects = { data: raw, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return raw;
     } catch (err: any) {
-      if (!usingSupabase) markQuotaCooldownIfNeeded(err);
+      markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.subjects) {
         return serverCoreCache.subjects.data;
       }
@@ -2009,16 +1721,15 @@ async function getServerCachedSubjects(force = false, authHeader?: string): Prom
 
 async function getServerCachedNotifications(force = false, authHeader?: string): Promise<any[]> {
   const now = Date.now();
-  const usingSupabase = shouldUseSupabaseOnServer();
   if (
     !force &&
     serverCoreCache.notifications &&
     (now - serverCoreCache.notifications.fetchedAt < SERVER_CACHE_TTLS.notifications ||
-      (!usingSupabase && now < serverCoreCache.quotaCooldownUntil))
+      now < serverCoreCache.quotaCooldownUntil)
   ) {
     return serverCoreCache.notifications.data;
   }
-  if (!usingSupabase && now < serverCoreCache.quotaCooldownUntil) {
+  if (now < serverCoreCache.quotaCooldownUntil) {
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -2029,15 +1740,13 @@ async function getServerCachedNotifications(force = false, authHeader?: string):
 
   const p = (async () => {
     try {
-      const raw = usingSupabase
-        ? await sbFetchNotifications(50)
-        : await fetchCollectionViaFirestoreRest('notifications', authHeader);
+      const raw = await fetchCollectionViaFirestoreRest('notifications', authHeader);
       raw.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
-      serverCoreCache.notifications = { data: raw.slice(0, 50), fetchedAt: Date.now() };
+      serverCoreCache.notifications = { data: raw.slice(0, 20), fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return serverCoreCache.notifications.data;
     } catch (err: any) {
-      if (!usingSupabase) markQuotaCooldownIfNeeded(err);
+      markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.notifications) {
         return serverCoreCache.notifications.data;
       }
@@ -2051,16 +1760,15 @@ async function getServerCachedNotifications(force = false, authHeader?: string):
 
 async function getServerCachedBotCommands(force = false, authHeader?: string): Promise<Record<string, any>> {
   const now = Date.now();
-  const usingSupabase = shouldUseSupabaseOnServer();
   if (
     !force &&
     serverCoreCache.bot_commands &&
     (now - serverCoreCache.bot_commands.fetchedAt < SERVER_CACHE_TTLS.bot_commands ||
-      (!usingSupabase && now < serverCoreCache.quotaCooldownUntil))
+      now < serverCoreCache.quotaCooldownUntil)
   ) {
     return serverCoreCache.bot_commands.data;
   }
-  if (!usingSupabase && now < serverCoreCache.quotaCooldownUntil) {
+  if (now < serverCoreCache.quotaCooldownUntil) {
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -2071,25 +1779,18 @@ async function getServerCachedBotCommands(force = false, authHeader?: string): P
 
   const p = (async () => {
     try {
-      let map: Record<string, any> = {};
-      if (usingSupabase) {
-        map = await sbFetchBotCommandsMap();
-      } else {
-        const raw = await fetchCollectionViaFirestoreRest('bot_commands', authHeader);
-        for (const item of raw) {
-          if (item?.command) {
-            map[item.command] = item;
-          }
+      const raw = await fetchCollectionViaFirestoreRest('bot_commands', authHeader);
+      const map: Record<string, any> = {};
+      for (const item of raw) {
+        if (item?.command) {
+          map[item.command] = item;
         }
       }
       serverCoreCache.bot_commands = { data: map, fetchedAt: Date.now() };
-      if (Object.keys(map).length > 0) {
-        saveCustomBotTemplates(map);
-      }
       schedulePersistServerCoreCache();
       return map;
     } catch (err: any) {
-      if (!usingSupabase) markQuotaCooldownIfNeeded(err);
+      markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.bot_commands) {
         return serverCoreCache.bot_commands.data;
       }
@@ -2105,15 +1806,12 @@ app.get('/api/cache/core', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
     const now = Date.now();
-    const usingSupabase = shouldUseSupabaseOnServer();
-    const backend = usingSupabase ? 'supabase' : 'firestore';
     const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    const hasAdminToken = Boolean(typeof req.headers['x-admin-token'] === 'string' && req.headers['x-admin-token'].trim());
     const rawForce = req.query.force === '1';
-    const forceCooldownMs = authHeader || hasAdminToken ? 2000 : 10000;
+    const forceCooldownMs = authHeader ? 2000 : 10000;
     const allowForce =
       rawForce &&
-      (usingSupabase || now >= serverCoreCache.quotaCooldownUntil) &&
+      now >= serverCoreCache.quotaCooldownUntil &&
       now - serverCoreCache.lastForceAt > forceCooldownMs;
     if (allowForce) {
       serverCoreCache.lastForceAt = now;
@@ -2126,7 +1824,7 @@ app.get('/api/cache/core', async (req, res) => {
       Boolean(serverCoreCache.subjects?.data?.length) &&
       Boolean(serverCoreCache.notifications) &&
       Boolean(serverCoreCache.bot_commands) &&
-      ((!usingSupabase && now < serverCoreCache.quotaCooldownUntil) ||
+      (now < serverCoreCache.quotaCooldownUntil ||
         (now - serverCoreCache.questions!.fetchedAt < SERVER_CACHE_TTLS.questions &&
           now - serverCoreCache.subjects!.fetchedAt < SERVER_CACHE_TTLS.subjects &&
           now - serverCoreCache.notifications!.fetchedAt < SERVER_CACHE_TTLS.notifications &&
@@ -2135,9 +1833,8 @@ app.get('/api/cache/core', async (req, res) => {
     if (!allowForce && hasWarmCore && since > 0 && since === serverCoreCache.version) {
       return res.json({
         unchanged: true,
-        backend,
         version: serverCoreCache.version,
-        quotaLimited: !usingSupabase && now < serverCoreCache.quotaCooldownUntil,
+        quotaLimited: now < serverCoreCache.quotaCooldownUntil,
       });
     }
 
@@ -2157,22 +1854,18 @@ app.get('/api/cache/core', async (req, res) => {
 
     const anyRejected = [qRes, sRes, nRes, bcRes].some((r) => r.status === 'rejected');
     const quotaLimited =
-      !usingSupabase &&
-      (Date.now() < serverCoreCache.quotaCooldownUntil ||
-        [qRes, sRes, nRes, bcRes].some(
-          (r) => r.status === 'rejected' && (r.reason?.status === 429 || String(r.reason?.message || '').includes('429'))
-        ));
-    const requiresAuth =
-      !usingSupabase &&
+      Date.now() < serverCoreCache.quotaCooldownUntil ||
       [qRes, sRes, nRes, bcRes].some(
-        (r) => r.status === 'rejected' && (r.reason?.status === 401 || r.reason?.status === 403)
+        (r) => r.status === 'rejected' && (r.reason?.status === 429 || String(r.reason?.message || '').includes('429'))
       );
+    const requiresAuth = [qRes, sRes, nRes, bcRes].some(
+      (r) => r.status === 'rejected' && (r.reason?.status === 401 || r.reason?.status === 403)
+    );
 
     const hasAnyData = Boolean(questions || subjects || notifications || botCommands);
     if (!hasAnyData && anyRejected) {
       return res.status(requiresAuth ? 401 : 503).json({
         success: false,
-        backend,
         quotaLimited,
         requiresAuth,
         error: quotaLimited
@@ -2185,53 +1878,200 @@ app.get('/api/cache/core', async (req, res) => {
 
     res.json({
       unchanged: false,
-      backend,
       version: serverCoreCache.version,
       quotaLimited,
       requiresAuth,
-      partial: !questions?.length || !subjects?.length,
+      partial: !questions || !subjects,
       ...(questions ? { questions } : {}),
       ...(subjects ? { subjects } : {}),
       ...(notifications ? { notifications } : {}),
       ...(botCommands ? { botCommands } : {}),
     });
   } catch (err: any) {
-    const usingSupabase = shouldUseSupabaseOnServer();
     res.status(503).json({
       success: false,
-      backend: usingSupabase ? 'supabase' : 'firestore',
-      quotaLimited: !usingSupabase && Date.now() < serverCoreCache.quotaCooldownUntil,
+      quotaLimited: Date.now() < serverCoreCache.quotaCooldownUntil,
       error: err?.message || 'Cache unavailable',
     });
   }
+});
+
+// ---------------- Real-Time SSE Hub & Live Presence ----------------
+interface RealtimePresenceEntry {
+  username: string;
+  role: string;
+  lastSeen: number;
+}
+
+const sseClients = new Set<express.Response>();
+const activeRealtimePresence = new Map<string, RealtimePresenceEntry>();
+
+function pruneRealtimePresence(now = Date.now()) {
+  for (const [key, entry] of activeRealtimePresence.entries()) {
+    if (now - entry.lastSeen > 5 * 60 * 1000) {
+      activeRealtimePresence.delete(key);
+    }
+  }
+}
+
+function getEffectiveOnlineCount(): number {
+  pruneRealtimePresence();
+  return Math.max(
+    1,
+    activeRealtimePresence.size,
+    sseClients.size,
+    serverCoreCache.onlineCount?.count || 0
+  );
+}
+
+function broadcastRealtimeEvent(payload: Record<string, any>) {
+  if (sseClients.size === 0) return;
+  const serialized = `event: sync\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(serialized);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+app.get('/api/realtime/stream', (req, res) => {
+  req.setTimeout(0);
+  res.setTimeout(0);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const clientId =
+    typeof req.query.clientId === 'string' && req.query.clientId.trim()
+      ? req.query.clientId.trim().slice(0, 80)
+      : crypto.randomBytes(6).toString('hex');
+  const username =
+    typeof req.query.username === 'string' ? req.query.username.trim().slice(0, 80) : '';
+  const role = req.query.role === 'admin' ? 'admin' : 'user';
+
+  sseClients.add(res);
+  if (username) {
+    activeRealtimePresence.set(clientId, { username, role, lastSeen: Date.now() });
+  }
+
+  const initialOnlineCount = getEffectiveOnlineCount();
+  res.write(
+    `event: connected\ndata: ${JSON.stringify({
+      version: serverCoreCache.version,
+      onlineCount: initialOnlineCount,
+      ts: Date.now(),
+    })}\n\n`
+  );
+
+  broadcastRealtimeEvent({
+    scope: 'online_count',
+    action: 'replace',
+    onlineCount: initialOnlineCount,
+    version: serverCoreCache.version,
+    ts: Date.now(),
+  });
+
+  const keepAliveTimer = setInterval(() => {
+    try {
+      if (username) {
+        activeRealtimePresence.set(clientId, { username, role, lastSeen: Date.now() });
+      }
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(keepAliveTimer);
+      sseClients.delete(res);
+    }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(keepAliveTimer);
+    sseClients.delete(res);
+    activeRealtimePresence.delete(clientId);
+    broadcastRealtimeEvent({
+      scope: 'online_count',
+      action: 'replace',
+      onlineCount: getEffectiveOnlineCount(),
+      version: serverCoreCache.version,
+      ts: Date.now(),
+    });
+  });
+});
+
+app.post('/api/realtime/publish', (req, res) => {
+  const { scope, action, id, ids, item, items, replace, clientId } = req.body || {};
+  const allowedScopes = new Set([
+    'presence',
+    'feedbacks',
+    'logins',
+    'paid_users',
+    'global_stats',
+    'online_count',
+  ]);
+  if (typeof scope !== 'string' || !allowedScopes.has(scope)) {
+    return res.status(400).json({ ok: false, error: 'Invalid realtime scope' });
+  }
+
+  const now = Date.now();
+  if (scope === 'presence' && item?.username) {
+    const key = String(clientId || item.id || item.username).slice(0, 80);
+    activeRealtimePresence.set(key, {
+      username: String(item.username).slice(0, 80),
+      role: item.role === 'admin' ? 'admin' : 'user',
+      lastSeen: now,
+    });
+    const nextOnlineCount = getEffectiveOnlineCount();
+    broadcastRealtimeEvent({
+      scope: 'online_count',
+      action: 'replace',
+      onlineCount: nextOnlineCount,
+      version: serverCoreCache.version,
+      ts: now,
+    });
+  }
+
+  broadcastRealtimeEvent({
+    scope,
+    action: typeof action === 'string' ? action : 'upsert',
+    ...(id ? { id } : {}),
+    ...(Array.isArray(ids) ? { ids } : {}),
+    ...(item !== undefined ? { item } : {}),
+    ...(Array.isArray(items) ? { items } : {}),
+    ...(replace !== undefined ? { replace } : {}),
+    ...(typeof clientId === 'string' && clientId ? { sourceClientId: clientId } : {}),
+    version: serverCoreCache.version,
+    ts: now,
+  });
+
+  res.json({ ok: true, onlineCount: getEffectiveOnlineCount() });
 });
 
 app.get('/api/cache/online-count', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
     const now = Date.now();
-    const usingSupabase = shouldUseSupabaseOnServer();
     const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    if (!usingSupabase && (now < serverCoreCache.quotaCooldownUntil || !authHeader)) {
+    if (now < serverCoreCache.quotaCooldownUntil || !authHeader) {
       return res.json({
-        count: Math.max(serverCoreCache.onlineCount?.count || 1, sseClients.size),
+        count: getEffectiveOnlineCount(),
         quotaLimited: now < serverCoreCache.quotaCooldownUntil,
       });
     }
     const force = req.query.force === '1' && (!serverCoreCache.onlineCount || now - serverCoreCache.onlineCount.fetchedAt > 15000);
     if (!force && serverCoreCache.onlineCount && now - serverCoreCache.onlineCount.fetchedAt < SERVER_CACHE_TTLS.onlineCount) {
-      return res.json({ count: Math.max(serverCoreCache.onlineCount.count, sseClients.size) });
+      return res.json({ count: getEffectiveOnlineCount() });
     }
 
     if (serverCacheInFlight.has('onlineCount')) {
       const count = await serverCacheInFlight.get('onlineCount')!;
-      return res.json({ count: Math.max(count, sseClients.size) });
+      return res.json({ count: Math.max(getEffectiveOnlineCount(), count) });
     }
 
     const p = (async () => {
-      const count = usingSupabase
-        ? await sbFetchOnlineCount()
-        : await fetchActivePresenceCountViaRest(authHeader);
+      const count = await fetchActivePresenceCountViaRest(authHeader);
       serverCoreCache.onlineCount = { count, fetchedAt: Date.now() };
       schedulePersistServerCoreCache();
       return count;
@@ -2239,22 +2079,32 @@ app.get('/api/cache/online-count', async (req, res) => {
 
     serverCacheInFlight.set('onlineCount', p);
     const count = await p;
-    res.json({ count: Math.max(count, sseClients.size) });
+    res.json({ count: Math.max(getEffectiveOnlineCount(), count) });
   } catch (err: any) {
-    if (!shouldUseSupabaseOnServer()) markQuotaCooldownIfNeeded(err);
-    res.json({ count: Math.max(serverCoreCache.onlineCount?.count || 1, sseClients.size) });
+    markQuotaCooldownIfNeeded(err);
+    res.json({ count: getEffectiveOnlineCount() });
   }
 });
 
 // Safe in-place cache updates: supports atomic deltas (upsert/upsertMany/delete/reorder)
 // and authoritative full replacements so a partial client cache never overwrites complete server data
-app.post('/api/cache/mutate', async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
-  const { scope, action, item, items, id, replace, authoritative } = req.body || {};
+app.post('/api/cache/mutate', (req, res) => {
+  const { scope, action, item, items, id, ids, replace, authoritative, clientId } = req.body || {};
   const now = Date.now();
   let updated = false;
 
-  const sortByOrder = (arr: any[]) => [...arr].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const sortByOrder = (arr: any[]) => {
+    const map = new Map<string, any>();
+    const noId: any[] = [];
+    for (const entry of arr) {
+      if (entry?.id) {
+        map.set(entry.id, entry);
+      } else {
+        noId.push(entry);
+      }
+    }
+    return [...Array.from(map.values()), ...noId].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  };
 
   if (scope === 'questions' || scope === 'subjects') {
     const typedScope: 'questions' | 'subjects' = scope;
@@ -2279,6 +2129,13 @@ app.post('/api/cache/mutate', async (req, res) => {
     } else if (action === 'delete' && id && Array.isArray(existing)) {
       serverCoreCache[typedScope] = {
         data: existing.filter((x: any) => x.id !== id),
+        fetchedAt: now,
+      };
+      updated = true;
+    } else if (action === 'deleteMany' && Array.isArray(ids) && ids.length > 0 && Array.isArray(existing)) {
+      const idSet = new Set<string>(ids.filter((x: unknown): x is string => typeof x === 'string' && Boolean(x)));
+      serverCoreCache[typedScope] = {
+        data: existing.filter((x: any) => !idSet.has(x.id)),
         fetchedAt: now,
       };
       updated = true;
@@ -2327,38 +2184,37 @@ app.post('/api/cache/mutate', async (req, res) => {
   if (updated) {
     serverCoreCache.version = now;
     schedulePersistServerCoreCache();
-    if (
-      scope === 'questions' ||
-      scope === 'subjects' ||
-      scope === 'notifications' ||
-      scope === 'bot_commands'
-    ) {
-      const typedCoreScope: 'questions' | 'subjects' | 'notifications' | 'bot_commands' = scope;
-      emitRealtimeChange({
-        scope: typedCoreScope,
-        action:
-          action === 'upsert' ||
-          action === 'upsertMany' ||
-          action === 'delete' ||
-          action === 'clear'
-            ? action
-            : 'replace',
-        id,
-        item,
-        items,
-        replace:
-          action === 'upsert' || action === 'upsertMany' || action === 'delete' || action === 'clear'
-            ? undefined
-            : serverCoreCache[typedCoreScope]?.data,
-        source: 'firestore',
-      });
-    }
   }
+
+  if (
+    updated ||
+    scope === 'questions' ||
+    scope === 'subjects' ||
+    scope === 'notifications' ||
+    scope === 'bot_commands'
+  ) {
+    if (!updated) {
+      serverCoreCache.version = now;
+    }
+    broadcastRealtimeEvent({
+      scope,
+      action: action || 'replace',
+      ...(item !== undefined ? { item } : {}),
+      ...(Array.isArray(items) ? { items } : {}),
+      ...(id ? { id } : {}),
+      ...(Array.isArray(ids) ? { ids } : {}),
+      ...(replace !== undefined ? { replace } : {}),
+      ...(authoritative ? { authoritative: true } : {}),
+      ...(typeof clientId === 'string' && clientId ? { sourceClientId: clientId } : {}),
+      version: serverCoreCache.version,
+      ts: now,
+    });
+  }
+
   res.json({ ok: true, updated, version: serverCoreCache.version });
 });
 
-app.post('/api/cache/invalidate', async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
+app.post('/api/cache/invalidate', (req, res) => {
   const scopes: string[] = Array.isArray(req.body?.scopes)
     ? req.body.scopes
     : ['questions', 'subjects', 'notifications', 'bot_commands'];
@@ -2371,1431 +2227,250 @@ app.post('/api/cache/invalidate', async (req, res) => {
   }
   serverCoreCache.version = Date.now();
   schedulePersistServerCoreCache();
+  broadcastRealtimeEvent({
+    scope: 'core',
+    action: 'refresh',
+    scopes,
+    version: serverCoreCache.version,
+    ts: serverCoreCache.version,
+  });
   res.json({ ok: true, version: serverCoreCache.version });
 });
 
-// ---------------- Supabase Database API Routes & Admin Token Guard ----------------
-const ADMIN_EMAIL = 'reaksmey8114@gmail.com';
-const ADMIN_MASTER_CODE = (process.env.ADMIN_MASTER_CODE || '168').trim();
-const ADMIN_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const ADMIN_TOKEN_SECRET = crypto
-  .createHash('sha256')
-  .update(
-    String(
-      process.env.ADMIN_SESSION_SECRET ||
-        process.env.SUPABASE_SERVICE_ROLE_KEY ||
-        serverFbConfig?.apiKey ||
-        'master-quiz-kh-admin-secret-v1'
-    )
-  )
-  .digest();
-
-function safeCompareStrings(a: string, b: string): boolean {
-  const hashA = crypto.createHash('sha256').update(a).digest();
-  const hashB = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(hashA, hashB);
+interface ClaimedAdminPasscodeRecord {
+  algorithm: 'scrypt';
+  salt: string;
+  hash: string;
+  claimedAt: string;
 }
 
-function signAdminSessionToken(): { token: string; expiresAt: number } {
-  const now = Date.now();
-  const expiresAt = now + ADMIN_TOKEN_TTL_MS;
-  const payloadB64 = Buffer.from(
-    JSON.stringify({ role: 'admin', iat: now, exp: expiresAt })
-  ).toString('base64url');
-  const sig = crypto
-    .createHmac('sha256', ADMIN_TOKEN_SECRET)
-    .update(payloadB64)
-    .digest('base64url');
-  return { token: `mpqa.${payloadB64}.${sig}`, expiresAt };
+const ADMIN_AUTH_FILE_PRIMARY = path.resolve(__dirname, '.mpq_admin_auth.json');
+const ADMIN_AUTH_FILE_FALLBACK = path.join(os.tmpdir(), 'mpq-admin-auth-v1.json');
+let claimedAdminPasscodeCache: ClaimedAdminPasscodeRecord | null | undefined;
+let adminSetupLock = false;
+const adminVerifyAttempts = new Map<string, number[]>();
+
+function getConfiguredEnvAdminCode(): string {
+  return (process.env.ADMIN_MASTER_CODE || process.env.ADMIN_PASSCODE || '').trim();
 }
 
-function verifyAdminSessionToken(rawToken: string): { role: 'admin'; iat: number; exp: number } | null {
-  if (!rawToken || typeof rawToken !== 'string') return null;
-  const parts = rawToken.trim().split('.');
-  if (parts.length !== 3 || parts[0] !== 'mpqa') return null;
-  const [, payloadB64, sig] = parts;
-  if (!payloadB64 || !sig) return null;
-  const expectedSig = crypto
-    .createHmac('sha256', ADMIN_TOKEN_SECRET)
-    .update(payloadB64)
-    .digest('base64url');
-  if (!safeCompareStrings(sig, expectedSig)) return null;
-  try {
-    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    if (parsed?.role !== 'admin' || typeof parsed?.exp !== 'number' || parsed.exp <= Date.now()) {
-      return null;
-    }
-    return parsed;
-  } catch {
-    return null;
+function loadClaimedAdminPasscode(): ClaimedAdminPasscodeRecord | null {
+  if (claimedAdminPasscodeCache !== undefined) {
+    return claimedAdminPasscodeCache;
   }
-}
-
-function extractAdminSessionToken(req: express.Request): string {
-  const headerToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : '';
-  if (headerToken) return headerToken;
-  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization.trim() : '';
-  if (authHeader.startsWith('Admin ')) {
-    return authHeader.slice(6).trim();
-  }
-  return '';
-}
-
-const firebaseAdminApp = serverFbConfig?.projectId
-  ? (getApps().length ? getApp() : initializeApp({ projectId: serverFbConfig.projectId }))
-  : null;
-
-async function verifyBearerUser(req: express.Request) {
-  if (!firebaseAdminApp) return null;
-  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
-  if (!authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.slice(7).trim();
-  if (!token) return null;
-  try {
-    return await getAuth(firebaseAdminApp).verifyIdToken(token);
-  } catch {
-    return null;
-  }
-}
-
-async function resolveAdminIdentity(
-  req: express.Request
-): Promise<{ via: 'firebase' | 'passcode'; email?: string; uid?: string } | null> {
-  const decoded = await verifyBearerUser(req);
-  if (decoded) {
-    const email = String(decoded.email || '').toLowerCase();
-    if (email === ADMIN_EMAIL && decoded.email_verified === true) {
-      return { via: 'firebase', email, uid: decoded.uid };
+  for (const filePath of [ADMIN_AUTH_FILE_PRIMARY, ADMIN_AUTH_FILE_FALLBACK]) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        parsed.algorithm === 'scrypt' &&
+        typeof parsed.salt === 'string' &&
+        parsed.salt.length >= 16 &&
+        typeof parsed.hash === 'string' &&
+        parsed.hash.length >= 64
+      ) {
+        claimedAdminPasscodeCache = parsed as ClaimedAdminPasscodeRecord;
+        return claimedAdminPasscodeCache;
+      }
+    } catch {
+      // Try fallback file
     }
   }
-  const adminToken = extractAdminSessionToken(req);
-  const verifiedPasscodeSession = verifyAdminSessionToken(adminToken);
-  if (verifiedPasscodeSession) {
-    return { via: 'passcode', email: ADMIN_EMAIL };
-  }
+  claimedAdminPasscodeCache = null;
   return null;
 }
 
-async function requireAdmin(req: express.Request, res: express.Response) {
-  const admin = await resolveAdminIdentity(req);
-  if (!admin) {
-    res.status(401).json({
-      success: false,
-      error: 'Unauthorized: Admin authentication required',
-    });
-    return null;
+function saveClaimedAdminPasscode(record: ClaimedAdminPasscodeRecord): boolean {
+  const serialized = JSON.stringify(record);
+  for (const filePath of [ADMIN_AUTH_FILE_PRIMARY, ADMIN_AUTH_FILE_FALLBACK]) {
+    try {
+      fs.writeFileSync(filePath, serialized, { mode: 0o600, flag: 'wx' });
+      claimedAdminPasscodeCache = record;
+      return true;
+    } catch (err: any) {
+      if (err?.code === 'EEXIST') {
+        return false;
+      }
+    }
   }
-  return admin;
+  claimedAdminPasscodeCache = record;
+  return true;
 }
 
-app.post('/api/admin/login', (req, res) => {
+function hashPasscodeScrypt(passcode: string): ClaimedAdminPasscodeRecord {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(passcode, salt, 64).toString('hex');
+  return {
+    algorithm: 'scrypt',
+    salt,
+    hash,
+    claimedAt: new Date().toISOString(),
+  };
+}
+
+function verifyPasscodeScrypt(passcode: string, record: ClaimedAdminPasscodeRecord): boolean {
+  try {
+    const derived = crypto.scryptSync(passcode, record.salt, 64);
+    const expected = Buffer.from(record.hash, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
+function timingSafeCompareStrings(aStr: string, bStr: string): boolean {
+  const aHash = crypto.createHash('sha256').update(aStr).digest();
+  const bHash = crypto.createHash('sha256').update(bStr).digest();
+  return crypto.timingSafeEqual(aHash, bHash);
+}
+
+function isAdminRateLimited(ipKey: string): boolean {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000;
+  const recent = (adminVerifyAttempts.get(ipKey) || []).filter((ts) => now - ts < windowMs);
+  adminVerifyAttempts.set(ipKey, recent);
+  return recent.length >= 15;
+}
+
+function recordAdminFailedAttempt(ipKey: string) {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000;
+  const recent = (adminVerifyAttempts.get(ipKey) || []).filter((ts) => now - ts < windowMs);
+  recent.push(now);
+  adminVerifyAttempts.set(ipKey, recent);
+}
+
+app.get('/api/admin/auth-status', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
+  const hasEnvPasscode = Boolean(getConfiguredEnvAdminCode());
+  const hasClaimedPasscode = Boolean(loadClaimedAdminPasscode());
+  res.json({
+    hasEnvPasscode,
+    hasClaimedPasscode,
+    needsSetup: !hasEnvPasscode && !hasClaimedPasscode,
+  });
+});
+
+app.post('/api/admin/setup-passcode', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const ipKey = req.ip || 'unknown';
+  if (isAdminRateLimited(ipKey)) {
+    return res.status(429).json({
+      success: false,
+      error: 'សាកល្បងច្រើនដងពេក! សូមរង់ចាំប៉ុន្មាននាទីទៀត។',
+    });
+  }
+
+  if (adminSetupLock || getConfiguredEnvAdminCode() || loadClaimedAdminPasscode()) {
+    return res.status(409).json({
+      success: false,
+      alreadyConfigured: true,
+      error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ! សូមបញ្ចូលលេខកូដដើម្បីចូលប្រព័ន្ធ។',
+    });
+  }
+
   const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
-  if (!passcode || !safeCompareStrings(passcode, ADMIN_MASTER_CODE)) {
+  const confirmPasscode =
+    typeof req.body?.confirmPasscode === 'string' ? req.body.confirmPasscode.trim() : '';
+
+  if (passcode.length < 6 || passcode.length > 128) {
+    return res.status(400).json({
+      success: false,
+      error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវមានយ៉ាងតិច ៦ តួអក្សរ (អតិបរមា ១២៨ តួអក្សរ)!',
+    });
+  }
+
+  if (confirmPasscode && passcode !== confirmPasscode) {
+    return res.status(400).json({
+      success: false,
+      error: 'ការបញ្ជាក់លេខកូដមិនត្រូវគ្នាទេ! សូមពិនិត្យម្ដងទៀត។',
+    });
+  }
+
+  adminSetupLock = true;
+  try {
+    if (getConfiguredEnvAdminCode() || loadClaimedAdminPasscode()) {
+      return res.status(409).json({
+        success: false,
+        alreadyConfigured: true,
+        error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ!',
+      });
+    }
+    const record = hashPasscodeScrypt(passcode);
+    const saved = saveClaimedAdminPasscode(record);
+    if (!saved) {
+      return res.status(409).json({
+        success: false,
+        alreadyConfigured: true,
+        error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ!',
+      });
+    }
+    adminVerifyAttempts.delete(ipKey);
+    res.json({ success: true, mode: 'claimed' });
+  } finally {
+    adminSetupLock = false;
+  }
+});
+
+app.post('/api/admin/verify-passcode', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const ipKey = req.ip || 'unknown';
+  if (isAdminRateLimited(ipKey)) {
+    return res.status(429).json({
+      success: false,
+      error: 'សាកល្បងខុសច្រើនដងពេក! សូមរង់ចាំ ១០ នាទី ឬភ្ជាប់គណនី Google Admin។',
+    });
+  }
+
+  const submitted = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+  if (!submitted || submitted.length > 128) {
+    return res.status(400).json({
+      success: false,
+      error: 'សូមបញ្ចូលលេខកូដ Master Code ឱ្យបានត្រឹមត្រូវ!',
+    });
+  }
+
+  const configuredEnv = getConfiguredEnvAdminCode();
+  if (configuredEnv) {
+    if (!timingSafeCompareStrings(configuredEnv, submitted)) {
+      recordAdminFailedAttempt(ipKey);
+      return res.status(401).json({
+        success: false,
+        error: 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។',
+      });
+    }
+    adminVerifyAttempts.delete(ipKey);
+    return res.json({ success: true, mode: 'env' });
+  }
+
+  const claimed = loadClaimedAdminPasscode();
+  if (!claimed) {
+    return res.status(400).json({
+      success: false,
+      needsSetup: true,
+      error: 'មិនទាន់មានលេខកូដ Master Code នៅឡើយទេ! សូមបង្កើតលេខកូដដំបូង ឬភ្ជាប់គណនី Google Admin។',
+    });
+  }
+
+  if (!verifyPasscodeScrypt(submitted, claimed)) {
+    recordAdminFailedAttempt(ipKey);
     return res.status(401).json({
       success: false,
-      error: 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ!',
-    });
-  }
-  const { token, expiresAt } = signAdminSessionToken();
-  return res.json({ success: true, token, expiresAt });
-});
-
-app.get('/api/admin/verify', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const admin = await resolveAdminIdentity(req);
-  if (!admin) {
-    return res.status(401).json({ authenticated: false });
-  }
-  return res.json({ authenticated: true, via: admin.via });
-});
-
-function updateLocalServerCacheScope(
-  scope: 'questions' | 'subjects' | 'notifications' | 'bot_commands',
-  mutateFn: (current: any) => any
-) {
-  const now = Date.now();
-  const prev = serverCoreCache[scope]?.data;
-  const hasWarmScope =
-    scope === 'questions' || scope === 'subjects' || scope === 'notifications'
-      ? Array.isArray(prev)
-      : Boolean(prev && typeof prev === 'object');
-
-  if (hasWarmScope) {
-    const next = mutateFn(prev);
-    serverCoreCache[scope] = { data: next, fetchedAt: now };
-  } else {
-    serverCoreCache[scope] = null;
-  }
-  serverCoreCache.version = Math.max(now, serverCoreCache.version + 1);
-  schedulePersistServerCoreCache();
-}
-
-function applyRealtimeDeltaToServerCache(payload: {
-  scope?: string;
-  action?: string;
-  id?: string;
-  ids?: string[];
-  item?: any;
-  items?: any[];
-  replace?: any;
-  mode?: DbModeType;
-  version?: number;
-}) {
-  const now = Date.now();
-  const { scope, action, id, ids, item, items, replace, mode, version } = payload;
-  const bumpVersion = () => {
-    serverCoreCache.version = Math.max(now, serverCoreCache.version + 1, Number(version || 0));
-    schedulePersistServerCoreCache();
-  };
-
-  if (scope === 'db_mode' && (mode === 'dual' || mode === 'supabase' || mode === 'firestore')) {
-    currentDbMode = mode;
-    saveDbMode(mode);
-    serverCoreCache.questions = null;
-    serverCoreCache.subjects = null;
-    serverCoreCache.notifications = null;
-    serverCoreCache.bot_commands = null;
-    bumpVersion();
-    return;
-  }
-
-  if (scope === 'core' && action === 'refresh') {
-    serverCoreCache.questions = null;
-    serverCoreCache.subjects = null;
-    serverCoreCache.notifications = null;
-    serverCoreCache.bot_commands = null;
-    bumpVersion();
-    return;
-  }
-
-  if (scope === 'questions' || scope === 'subjects') {
-    updateLocalServerCacheScope(scope, (prev) => {
-      const arr = Array.isArray(prev) ? prev : [];
-      if (action === 'replace' && Array.isArray(replace)) {
-        return [...replace].sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-      }
-      if (action === 'upsert' && item?.id) {
-        const map = new Map(arr.map((x: any) => [x.id, x]));
-        map.set(item.id, { ...(map.get(item.id) || {}), ...item });
-        return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-      }
-      if (action === 'upsertMany' && Array.isArray(items)) {
-        const map = new Map(arr.map((x: any) => [x.id, x]));
-        for (const it of items) {
-          if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
-        }
-        return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-      }
-      if (action === 'delete' && id) {
-        return arr.filter((x: any) => x.id !== id);
-      }
-      if (action === 'deleteMany' && Array.isArray(ids)) {
-        const idSet = new Set(ids);
-        return arr.filter((x: any) => !idSet.has(x.id));
-      }
-      return arr;
-    });
-    if (typeof version === 'number' && version > serverCoreCache.version) {
-      serverCoreCache.version = version;
-      schedulePersistServerCoreCache();
-    }
-    return;
-  }
-
-  if (scope === 'notifications') {
-    updateLocalServerCacheScope('notifications', (prev) => {
-      const arr = Array.isArray(prev) ? prev : [];
-      const sortNotifs = (list: any[]) =>
-        [...list]
-          .sort((a: any, b: any) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
-          .slice(0, 50);
-      if (action === 'clear') return [];
-      if (action === 'replace' && Array.isArray(replace)) return sortNotifs(replace);
-      if (action === 'upsert' && item?.id) {
-        return sortNotifs([item, ...arr.filter((x: any) => x.id !== item.id)]);
-      }
-      if (action === 'delete' && id) {
-        return arr.filter((x: any) => x.id !== id);
-      }
-      return arr;
-    });
-    if (typeof version === 'number' && version > serverCoreCache.version) {
-      serverCoreCache.version = version;
-      schedulePersistServerCoreCache();
-    }
-    return;
-  }
-
-  if (scope === 'bot_commands') {
-    updateLocalServerCacheScope('bot_commands', (prev) => {
-      const next = { ...(prev && typeof prev === 'object' ? prev : {}) };
-      if (action === 'clear') return {};
-      if (action === 'replace' && replace && typeof replace === 'object' && !Array.isArray(replace)) {
-        return replace;
-      }
-      if (action === 'upsert' && item?.command) {
-        next[item.command] = item;
-        return next;
-      }
-      if (action === 'delete' && id) {
-        delete next[id];
-        return next;
-      }
-      return next;
-    });
-    if (typeof version === 'number' && version > serverCoreCache.version) {
-      serverCoreCache.version = version;
-      schedulePersistServerCoreCache();
-    }
-  }
-}
-
-app.get('/api/db/status', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const configured = isSupabaseConfigured();
-  res.json({
-    mode: currentDbMode,
-    backend: shouldUseSupabaseOnServer() ? 'supabase' : 'firestore',
-    supabaseConfigured: configured,
-  });
-});
-
-app.get('/api/db/stats', async (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const stats = await sbFetchGlobalStats();
-    res.json({ success: true, stats });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Stats error' });
-  }
-});
-
-app.get('/api/db/paid-check', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const username = typeof req.query.username === 'string' ? req.query.username.trim() : '';
-    if (!username) return res.json({ isPaid: false, paidUser: null });
-    const paidUser = await sbCheckIsUserPaid(username);
-    res.json({
-      isPaid: Boolean(paidUser),
-      paidUser: paidUser
-        ? {
-            id: paidUser.id,
-            username: paidUser.username,
-            paidAt: paidUser.paidAt,
-            status: paidUser.status,
-            permanentAccess: paidUser.permanentAccess,
-            transactionRef: paidUser.transactionRef,
-          }
-        : null,
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Paid check error' });
-  }
-});
-
-app.post('/api/db/logins', async (req, res) => {
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const raw = req.body || {};
-    const id = typeof raw.id === 'string' ? raw.id.trim().slice(0, 120) : '';
-    const username = typeof raw.username === 'string' ? raw.username.trim().slice(0, 120) : '';
-    if (!id || !username) {
-      return res.status(400).json({ success: false, error: 'Invalid login record' });
-    }
-    const decoded = await verifyBearerUser(req);
-    const adminIdentity = await resolveAdminIdentity(req);
-    const isAdminCaller = Boolean(adminIdentity);
-    const role: 'user' | 'admin' = raw.role === 'admin' && isAdminCaller ? 'admin' : 'user';
-    const record = {
-      id,
-      username,
-      passwordUsed: role === 'admin' ? 'Admin Auth' : '••••••',
-      timestamp:
-        typeof raw.timestamp === 'string' && raw.timestamp.trim()
-          ? raw.timestamp.trim().slice(0, 64)
-          : new Date().toISOString(),
-      role,
-      uid: decoded?.uid || (typeof raw.uid === 'string' ? raw.uid.trim().slice(0, 128) : undefined),
-    };
-    await sbInsertLogin(record);
-    emitRealtimeChange({ scope: 'logins', action: 'upsert', item: record, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Login record error' });
-  }
-});
-
-app.post('/api/db/presence', async (req, res) => {
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const raw = req.body || {};
-    const id = typeof raw.id === 'string' ? raw.id.trim().slice(0, 140) : '';
-    const username = typeof raw.username === 'string' ? raw.username.trim().slice(0, 120) : '';
-    if (!id || !username) {
-      return res.status(400).json({ success: false, error: 'Invalid presence record' });
-    }
-    const decoded = await verifyBearerUser(req);
-    const adminIdentity = await resolveAdminIdentity(req);
-    const isAdminCaller = Boolean(adminIdentity);
-    const record = {
-      id,
-      username,
-      role: raw.role === 'admin' && isAdminCaller ? ('admin' as const) : ('user' as const),
-      lastSeen: new Date().toISOString(),
-      uid: decoded?.uid || (typeof raw.uid === 'string' ? raw.uid.trim().slice(0, 128) : undefined),
-    };
-    await sbUpsertPresence(record);
-    emitRealtimeChange({ scope: 'presence', action: 'upsert', item: record, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Presence error' });
-  }
-});
-
-app.post('/api/db/feedbacks', async (req, res) => {
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const raw = req.body || {};
-    const id = typeof raw.id === 'string' ? raw.id.trim().slice(0, 120) : '';
-    const username = typeof raw.username === 'string' ? raw.username.trim().slice(0, 120) : '';
-    const text = typeof raw.text === 'string' ? raw.text.trim().slice(0, 3000) : '';
-    if (!id || !username || !text) {
-      return res.status(400).json({ success: false, error: 'Invalid feedback' });
-    }
-    const decoded = await verifyBearerUser(req);
-    const record = {
-      id,
-      username,
-      text,
-      createdAt:
-        typeof raw.createdAt === 'string' && raw.createdAt.trim()
-          ? raw.createdAt.trim().slice(0, 64)
-          : new Date().toISOString(),
-      uid: decoded?.uid || (typeof raw.uid === 'string' ? raw.uid.trim().slice(0, 128) : undefined),
-    };
-    await sbInsertFeedback(record);
-    emitRealtimeChange({ scope: 'feedbacks', action: 'upsert', item: record, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Feedback error' });
-  }
-});
-
-app.post('/api/db/paid-users', async (req, res) => {
-  if (!isSupabaseConfigured()) {
-    return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  }
-  try {
-    const raw = req.body?.record || req.body || {};
-    const id = typeof raw.id === 'string' ? raw.id.trim().slice(0, 140) : '';
-    const username = typeof raw.username === 'string' ? raw.username.trim().slice(0, 120) : '';
-    if (!id || !username) {
-      return res.status(400).json({ success: false, error: 'Invalid paid user payload' });
-    }
-    const decoded = await verifyBearerUser(req);
-    const adminIdentity = await resolveAdminIdentity(req);
-    const isAdminCaller = Boolean(adminIdentity);
-
-    const allowedStatuses = new Set(['active', 'pending', 'revoked']);
-    const safeStatus: 'active' | 'pending' | 'revoked' =
-      isAdminCaller && allowedStatuses.has(raw.status) ? raw.status : 'pending';
-    const safePermanent = isAdminCaller ? Boolean(raw.permanentAccess) : false;
-
-    const record = {
-      id,
-      username,
-      phoneNumber: typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim().slice(0, 40) : '',
-      amount: typeof raw.amount === 'number' && Number.isFinite(raw.amount) && raw.amount >= 0 ? raw.amount : 10,
-      currency: typeof raw.currency === 'string' && raw.currency.trim() ? raw.currency.trim().slice(0, 12) : 'USD',
-      paidAt:
-        typeof raw.paidAt === 'string' && raw.paidAt.trim()
-          ? raw.paidAt.trim().slice(0, 64)
-          : new Date().toISOString(),
-      status: safeStatus,
-      permanentAccess: safePermanent,
-      transactionRef: typeof raw.transactionRef === 'string' ? raw.transactionRef.trim().slice(0, 120) : '',
-      method: typeof raw.method === 'string' ? raw.method.trim().slice(0, 60) : 'KHQR_BAKONG_ABA',
-      note: typeof raw.note === 'string' ? raw.note.trim().slice(0, 500) : '',
-      uid: decoded?.uid || (typeof raw.uid === 'string' ? raw.uid.trim().slice(0, 128) : undefined),
-    };
-
-    await sbUpsertPaidUsers([record]);
-    emitRealtimeChange({ scope: 'paid_users', action: 'upsert', item: record, source: 'supabase' });
-    res.json({ success: true, record });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Paid user save error' });
-  }
-});
-
-// Admin-protected Supabase endpoints
-app.post('/api/db/questions', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const items = Array.isArray(req.body?.items) ? req.body.items : req.body?.item ? [req.body.item] : [];
-    if (items.length === 0) return res.status(400).json({ success: false, error: 'Missing question items' });
-    await sbUpsertQuestions(items);
-    updateLocalServerCacheScope('questions', (prev) => {
-      const map = new Map((Array.isArray(prev) ? prev : []).map((x: any) => [x.id, x]));
-      for (const it of items) {
-        if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
-      }
-      return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-    });
-    emitRealtimeChange({
-      scope: 'questions',
-      action: items.length === 1 ? 'upsert' : 'upsertMany',
-      item: items.length === 1 ? items[0] : undefined,
-      items: items.length > 1 ? items : undefined,
-      source: 'supabase',
-    });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Save question error' });
-  }
-});
-
-app.patch('/api/db/questions/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const updates = req.body?.updates || req.body || {};
-    await sbUpdateQuestion(id, updates);
-    let updatedItem: any = { id, ...updates };
-    updateLocalServerCacheScope('questions', (prev) =>
-      (Array.isArray(prev) ? prev : [])
-        .map((q: any) => {
-          if (q.id === id) {
-            updatedItem = { ...q, ...updates };
-            return updatedItem;
-          }
-          return q;
-        })
-        .sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0))
-    );
-    emitRealtimeChange({ scope: 'questions', action: 'upsert', id, item: updatedItem, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Update question error' });
-  }
-});
-
-app.post('/api/db/questions/rename-subject', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const oldSubject = typeof req.body?.oldSubject === 'string' ? req.body.oldSubject.trim() : '';
-    const newSubject = typeof req.body?.newSubject === 'string' ? req.body.newSubject.trim() : '';
-    if (!oldSubject || !newSubject) {
-      return res.status(400).json({ success: false, error: 'Missing oldSubject or newSubject' });
-    }
-    await sbRenameQuestionsSubject(oldSubject, newSubject);
-
-    const updatedItems: any[] = [];
-    updateLocalServerCacheScope('questions', (prev) =>
-      (Array.isArray(prev) ? prev : []).map((q: any) => {
-        if ((q.subject || '').trim() === oldSubject) {
-          const nextQ = { ...q, subject: newSubject };
-          updatedItems.push(nextQ);
-          return nextQ;
-        }
-        return q;
-      })
-    );
-
-    if (updatedItems.length > 0) {
-      emitRealtimeChange({
-        scope: 'questions',
-        action: 'upsertMany',
-        items: updatedItems,
-        source: 'supabase',
-      });
-    } else {
-      emitRealtimeChange({
-        scope: 'core',
-        action: 'refresh',
-        source: 'supabase',
-      });
-    }
-
-    res.json({ success: true, updatedCount: updatedItems.length, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Rename questions subject error' });
-  }
-});
-
-app.delete('/api/db/questions/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete in Supabase
-    await sbDeleteQuestion(id);
-
-    // 2. Dual-delete in Firestore REST
-    await deleteDocumentViaFirestoreRest('questions', id, authHeader).catch((err) => {
-      console.warn(`[Dual Delete] Firestore question delete note (${id}):`, err?.message || err);
-    });
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('questions', (prev) =>
-      (Array.isArray(prev) ? prev : []).filter((q: any) => q.id !== id)
-    );
-    emitRealtimeChange({ scope: 'questions', action: 'delete', id, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete question error' });
-  }
-});
-
-app.post('/api/db/questions/delete-batch', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const ids = rawIds.filter((x: unknown) => typeof x === 'string' && (x as string).trim());
-    if (ids.length === 0) return res.json({ success: true, count: 0, version: serverCoreCache.version });
-
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete batch in Supabase (chunked by 200)
-    await sbDeleteQuestionsByIds(ids);
-
-    // 2. Dual-delete batch in Firestore REST (parallel chunks)
-    await deleteDocumentsViaFirestoreRestBatch('questions', ids, authHeader).catch((err) => {
-      console.warn('[Dual Delete] Firestore questions batch delete note:', err?.message || err);
-    });
-
-    // 3. Update local server cache
-    const idSet = new Set(ids);
-    updateLocalServerCacheScope('questions', (prev) =>
-      (Array.isArray(prev) ? prev : []).filter((q: any) => !idSet.has(q.id))
-    );
-    emitRealtimeChange({ scope: 'questions', action: 'deleteMany', ids, source: 'supabase' });
-
-    res.json({ success: true, count: ids.length, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete questions batch error' });
-  }
-});
-
-app.post('/api/db/subjects', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const items = Array.isArray(req.body?.items) ? req.body.items : req.body?.item ? [req.body.item] : [];
-    if (items.length === 0) return res.status(400).json({ success: false, error: 'Missing subject items' });
-    await sbUpsertSubjects(items);
-    updateLocalServerCacheScope('subjects', (prev) => {
-      const map = new Map((Array.isArray(prev) ? prev : []).map((x: any) => [x.id, x]));
-      for (const it of items) {
-        if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
-      }
-      return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-    });
-    emitRealtimeChange({
-      scope: 'subjects',
-      action: items.length === 1 ? 'upsert' : 'upsertMany',
-      item: items.length === 1 ? items[0] : undefined,
-      items: items.length > 1 ? items : undefined,
-      source: 'supabase',
-    });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Save subject error' });
-  }
-});
-
-app.patch('/api/db/subjects/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const updates = req.body?.updates || req.body || {};
-    await sbUpdateSubject(id, updates);
-    let updatedSub: any = { id, ...updates };
-    updateLocalServerCacheScope('subjects', (prev) =>
-      (Array.isArray(prev) ? prev : [])
-        .map((s: any) => {
-          if (s.id === id) {
-            updatedSub = { ...s, ...updates };
-            return updatedSub;
-          }
-          return s;
-        })
-        .sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0))
-    );
-    emitRealtimeChange({ scope: 'subjects', action: 'upsert', id, item: updatedSub, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Update subject error' });
-  }
-});
-
-app.delete('/api/db/subjects/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete in Supabase
-    await sbDeleteSubject(id);
-
-    // 2. Dual-delete in Firestore REST
-    await deleteDocumentViaFirestoreRest('subjects', id, authHeader).catch((err) => {
-      console.warn(`[Dual Delete] Firestore subject delete note (${id}):`, err?.message || err);
-    });
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('subjects', (prev) =>
-      (Array.isArray(prev) ? prev : []).filter((s: any) => s.id !== id)
-    );
-    emitRealtimeChange({ scope: 'subjects', action: 'delete', id, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete subject error' });
-  }
-});
-
-app.post('/api/db/notifications', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  const item = req.body?.item || req.body;
-  // Allow either Admin or valid VIP registration broadcast
-  const isVipRegistration = Boolean(req.body?.vipWelcome && typeof item?.message === 'string');
-  if (!isVipRegistration && !(await requireAdmin(req, res))) return;
-  try {
-    if (!item?.id || !item?.message) {
-      return res.status(400).json({ success: false, error: 'Invalid notification' });
-    }
-    await sbUpsertNotification(item);
-    updateLocalServerCacheScope('notifications', (prev) => {
-      const base = Array.isArray(prev) ? prev.filter((x: any) => x.id !== item.id) : [];
-      return [item, ...base]
-        .sort((a: any, b: any) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
-        .slice(0, 50);
-    });
-    emitRealtimeChange({ scope: 'notifications', action: 'upsert', item, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Notification save error' });
-  }
-});
-
-app.delete('/api/db/notifications/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete in Supabase
-    await sbDeleteNotification(id);
-
-    // 2. Dual-delete in Firestore REST
-    await deleteDocumentViaFirestoreRest('notifications', id, authHeader).catch(() => {});
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('notifications', (prev) =>
-      (Array.isArray(prev) ? prev : []).filter((n: any) => n.id !== id)
-    );
-    emitRealtimeChange({ scope: 'notifications', action: 'delete', id, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete notification error' });
-  }
-});
-
-app.delete('/api/db/notifications', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete in Supabase
-    await sbDeleteNotificationsByIds(ids);
-
-    // 2. Dual-delete in Firestore REST
-    if (ids.length > 0) {
-      await deleteDocumentsViaFirestoreRestBatch('notifications', ids, authHeader).catch(() => {});
-    }
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('notifications', () => []);
-    emitRealtimeChange({ scope: 'notifications', action: 'clear', source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Clear notifications error' });
-  }
-});
-
-app.post('/api/db/bot-commands', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const config = req.body?.config || req.body;
-    if (!config?.command) return res.status(400).json({ success: false, error: 'Missing command' });
-    await sbSaveBotCommand(config);
-    updateLocalServerCacheScope('bot_commands', (prev) => ({
-      ...(prev && typeof prev === 'object' ? prev : {}),
-      [config.command]: config,
-    }));
-    emitRealtimeChange({ scope: 'bot_commands', action: 'upsert', item: config, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Save bot command error' });
-  }
-});
-
-app.delete('/api/db/bot-commands/:command', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const cmd = decodeURIComponent(req.params.command);
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    const docId = cmd.replace(/^\//, '').replace(/[^a-zA-Z0-9_-]/g, '_');
-
-    // 1. Delete in Supabase
-    await sbDeleteBotCommand(cmd);
-
-    // 2. Dual-delete in Firestore REST
-    await deleteDocumentViaFirestoreRest('bot_commands', docId, authHeader).catch(() => {});
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('bot_commands', (prev) => {
-      const next = { ...(prev && typeof prev === 'object' ? prev : {}) };
-      delete next[cmd];
-      return next;
-    });
-    emitRealtimeChange({ scope: 'bot_commands', action: 'delete', id: cmd, source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete bot command error' });
-  }
-});
-
-app.delete('/api/db/bot-commands', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const commands = Array.isArray(req.body?.commands) ? req.body.commands : [];
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    // 1. Delete in Supabase
-    await sbDeleteBotCommands(commands);
-
-    // 2. Dual-delete in Firestore REST
-    const docIds = commands.map((c: string) => c.replace(/^\//, '').replace(/[^a-zA-Z0-9_-]/g, '_'));
-    if (docIds.length > 0) {
-      await deleteDocumentsViaFirestoreRestBatch('bot_commands', docIds, authHeader).catch(() => {});
-    }
-
-    // 3. Update local server cache
-    updateLocalServerCacheScope('bot_commands', () => ({}));
-    emitRealtimeChange({ scope: 'bot_commands', action: 'clear', source: 'supabase' });
-    res.json({ success: true, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Reset bot commands error' });
-  }
-});
-
-app.get('/api/db/feedbacks', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const limitVal = Math.min(50, Math.max(1, Number(req.query.limit || 20)));
-    const page = await sbFetchFeedbacksPage(offset, limitVal);
-    res.json({ success: true, ...page });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Fetch feedbacks error' });
-  }
-});
-
-app.get('/api/db/logins', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const limitVal = Math.min(50, Math.max(1, Number(req.query.limit || 20)));
-    const page = await sbFetchLoginsPage(offset, limitVal);
-    res.json({ success: true, ...page });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Fetch logins error' });
-  }
-});
-
-app.delete('/api/db/logins/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    await sbDeleteLogin(id);
-    await deleteDocumentViaFirestoreRest('logins', id, authHeader).catch(() => {});
-    emitRealtimeChange({ scope: 'logins', action: 'delete', id, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete login error' });
-  }
-});
-
-app.post('/api/db/logins/delete-batch', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    await sbDeleteLoginsByIds(ids);
-    if (ids.length > 0) {
-      await deleteDocumentsViaFirestoreRestBatch('logins', ids, authHeader).catch(() => {});
-    }
-    emitRealtimeChange({ scope: 'logins', action: 'deleteMany', ids, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Batch delete logins error' });
-  }
-});
-
-app.get('/api/db/presence', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const limitVal = Math.min(50, Math.max(1, Number(req.query.limit || 20)));
-    const page = await sbFetchPresencePage(offset, limitVal);
-    res.json({ success: true, ...page });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Fetch presence error' });
-  }
-});
-
-app.get('/api/db/paid-users', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const limitVal = Math.min(200, Math.max(1, Number(req.query.limit || 100)));
-    const items = await sbFetchPaidUsersPage(offset, limitVal);
-    res.json({ success: true, items });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Fetch paid users error' });
-  }
-});
-
-app.patch('/api/db/paid-users/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { status, permanentAccess } = req.body || {};
-    await sbUpdatePaidUserStatus(req.params.id, status, Boolean(permanentAccess));
-    emitRealtimeChange({
-      scope: 'paid_users',
-      action: 'upsert',
-      id: req.params.id,
-      item: { id: req.params.id, status, permanentAccess: Boolean(permanentAccess) },
-      source: 'supabase',
-    });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Update paid user error' });
-  }
-});
-
-app.delete('/api/db/paid-users/:id', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const { id } = req.params;
-    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-    await sbDeletePaidUser(id);
-    await deleteDocumentViaFirestoreRest('paid_users', id, authHeader).catch(() => {});
-    emitRealtimeChange({ scope: 'paid_users', action: 'delete', id, source: 'supabase' });
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Delete paid user error' });
-  }
-});
-
-// Expose cached core snapshot for Admin full export/migration merging
-app.get('/api/db/server-cache-snapshot', async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
-  const customTemplates = loadCustomBotTemplates();
-  const cachedBotMap =
-    serverCoreCache.bot_commands?.data && typeof serverCoreCache.bot_commands.data === 'object'
-      ? serverCoreCache.bot_commands.data
-      : {};
-  res.json({
-    success: true,
-    questions: Array.isArray(serverCoreCache.questions?.data) ? serverCoreCache.questions!.data : [],
-    subjects: Array.isArray(serverCoreCache.subjects?.data) ? serverCoreCache.subjects!.data : [],
-    notifications: Array.isArray(serverCoreCache.notifications?.data)
-      ? serverCoreCache.notifications!.data
-      : [],
-    botCommands: { ...customTemplates, ...cachedBotMap },
-  });
-});
-
-app.get('/api/db/mode', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({
-    success: true,
-    mode: currentDbMode,
-    backend: shouldUseSupabaseOnServer() ? 'supabase' : 'firestore',
-    supabaseConfigured: isSupabaseConfigured(),
-    firestoreConfigured: true,
-  });
-});
-
-app.post('/api/db/mode', async (req, res) => {
-  if (!(await requireAdmin(req, res))) return;
-  const { mode } = req.body || {};
-  if (mode === 'dual' || mode === 'supabase' || mode === 'firestore') {
-    currentDbMode = mode;
-    saveDbMode(mode);
-    serverCoreCache.questions = null;
-    serverCoreCache.subjects = null;
-    serverCoreCache.notifications = null;
-    serverCoreCache.bot_commands = null;
-    serverCoreCache.version = Date.now();
-    schedulePersistServerCoreCache();
-    emitRealtimeChange({
-      scope: 'db_mode',
-      action: 'replace',
-      mode: currentDbMode,
-      source: 'server',
-    });
-    return res.json({ success: true, mode: currentDbMode, version: serverCoreCache.version });
-  }
-  res.status(400).json({ success: false, error: 'Invalid database mode' });
-});
-
-// Serve schema.sql content cleanly so Admin can copy & run it in Supabase SQL Editor
-app.get('/api/db/schema-sql', (req, res) => {
-  try {
-    const sqlPath = path.resolve(__dirname, 'supabase/schema.sql');
-    const sql = fs.readFileSync(sqlPath, 'utf8');
-    const wantsRaw =
-      req.query.raw === '1' ||
-      (req.query.format !== 'json' && String(req.headers.accept || '').includes('text/html'));
-    if (wantsRaw) {
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      return res.send(sql);
-    }
-    res.json({ success: true, sql });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || 'Cannot read schema.sql' });
-  }
-});
-
-function formatSupabaseMigrationError(err: any, fallbackMsg: string): string {
-  const msg = String(err?.message || fallbackMsg || '');
-  if (
-    msg.includes('PGRST205') ||
-    msg.includes('Could not find the table') ||
-    msg.includes('schema cache') ||
-    msg.includes('does not exist')
-  ) {
-    return 'មិនទាន់មានតារា Database នៅក្នុង Supabase ទេ! សូមចុច "ចម្លង SQL បង្កើតតារា" រួច Paste និង Run ក្នុង Supabase → SQL Editor ជាមុនសិន។';
-  }
-  if (
-    msg.toLowerCase().includes('row-level security') ||
-    msg.toLowerCase().includes('permission denied') ||
-    msg.toLowerCase().includes('invalid api key')
-  ) {
-    return 'សោ Supabase មិនមានសិទ្ធិសរសេរទិន្នន័យ (RLS) ទេ! សូមប្រើ Secret / service_role key (មិនមែន sb_publishable_...) សម្រាប់ SUPABASE_SERVICE_ROLE_KEY ក្នុង AI Studio Secrets។';
-  }
-  return msg || fallbackMsg;
-}
-
-// Bulk-migrate existing cached/Firestore datasets into Supabase (Admin only, chunk-safe)
-app.post('/api/db/migrate', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const {
-      questions,
-      subjects,
-      notifications,
-      botCommands,
-      paidUsers,
-      feedbacks,
-      logins,
-      presence,
-      refreshCache = true,
-      refreshStats = true,
-    } = req.body || {};
-    const imported: Record<string, number> = {};
-
-    if (Array.isArray(subjects) && subjects.length > 0) {
-      await sbUpsertSubjects(subjects);
-      imported.subjects = subjects.length;
-    }
-    if (Array.isArray(questions) && questions.length > 0) {
-      await sbUpsertQuestions(questions);
-      imported.questions = questions.length;
-    }
-    if (Array.isArray(notifications) && notifications.length > 0) {
-      await sbUpsertNotifications(notifications);
-      imported.notifications = notifications.length;
-    }
-    if (botCommands && typeof botCommands === 'object' && !Array.isArray(botCommands)) {
-      const keys = Object.keys(botCommands);
-      if (keys.length > 0) {
-        await sbUpsertBotCommandsMap(botCommands);
-        saveCustomBotTemplates({ ...loadCustomBotTemplates(), ...botCommands });
-        imported.botCommands = keys.length;
-      }
-    }
-    if (Array.isArray(paidUsers) && paidUsers.length > 0) {
-      await sbUpsertPaidUsers(paidUsers);
-      imported.paidUsers = paidUsers.length;
-    }
-    if (Array.isArray(feedbacks) && feedbacks.length > 0) {
-      await sbUpsertFeedbacks(feedbacks);
-      imported.feedbacks = feedbacks.length;
-    }
-    if (Array.isArray(logins) && logins.length > 0) {
-      await sbUpsertLogins(logins);
-      imported.logins = logins.length;
-    }
-    if (Array.isArray(presence) && presence.length > 0) {
-      await sbUpsertPresenceBatch(presence);
-      imported.presence = presence.length;
-    }
-
-    if (refreshStats !== false) {
-      await sbRefreshGlobalStatsRow().catch(() => {});
-    }
-
-    if (refreshCache !== false) {
-      const [freshQ, freshS, freshN, freshBC] = await Promise.all([
-        sbFetchAllQuestions().catch(() => serverCoreCache.questions?.data || []),
-        sbFetchAllSubjects().catch(() => serverCoreCache.subjects?.data || []),
-        sbFetchNotifications(50).catch(() => serverCoreCache.notifications?.data || []),
-        sbFetchBotCommandsMap().catch(() => serverCoreCache.bot_commands?.data || {}),
-      ]);
-      const now = Date.now();
-      serverCoreCache.questions = { data: freshQ, fetchedAt: now };
-      serverCoreCache.subjects = { data: freshS, fetchedAt: now };
-      serverCoreCache.notifications = { data: freshN, fetchedAt: now };
-      serverCoreCache.bot_commands = { data: freshBC, fetchedAt: now };
-      serverCoreCache.version = now;
-      schedulePersistServerCoreCache();
-      emitRealtimeChange({ scope: 'core', action: 'refresh', source: 'supabase' });
-    }
-
-    res.json({ success: true, imported, version: serverCoreCache.version });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: formatSupabaseMigrationError(err, 'Migration failed'),
-    });
-  }
-});
-
-// Direct Server-Side Migration: reads all 8 Firestore collections via paginated REST (limit 20),
-// merges with disk-cached server datasets, and upserts everything into Supabase (Admin only).
-app.post('/api/db/migrate-from-firestore', async (req, res) => {
-  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
-  if (!(await requireAdmin(req, res))) return;
-  try {
-    const authHeader =
-      typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
-
-    const collectionNames = [
-      'subjects',
-      'questions',
-      'notifications',
-      'bot_commands',
-      'paid_users',
-      'feedbacks',
-      'logins',
-      'presence',
-    ] as const;
-
-    const settled = await Promise.allSettled(
-      collectionNames.map((name) => fetchCollectionViaFirestoreRest(name, authHeader))
-    );
-
-    const warnings: string[] = [];
-    const pulled: Record<(typeof collectionNames)[number], any[]> = {
-      subjects: [],
-      questions: [],
-      notifications: [],
-      bot_commands: [],
-      paid_users: [],
-      feedbacks: [],
-      logins: [],
-      presence: [],
-    };
-
-    settled.forEach((result, idx) => {
-      const col = collectionNames[idx];
-      if (result.status === 'fulfilled') {
-        pulled[col] = result.value;
-      } else {
-        warnings.push(`${col}: ${result.reason?.message || 'Firestore read failed'}`);
-      }
-    });
-
-    // Merge server disk cache fallback with Firestore REST data (deduplicated by id/command)
-    const mergeArrays = (cached: any[] | undefined, live: any[]) => {
-      const map = new Map<string, any>();
-      for (const item of cached || []) {
-        if (item?.id) map.set(String(item.id), item);
-      }
-      for (const item of live || []) {
-        if (item?.id) map.set(String(item.id), { ...(map.get(String(item.id)) || {}), ...item });
-      }
-      return Array.from(map.values());
-    };
-
-    const mergedSubjects = mergeArrays(serverCoreCache.subjects?.data, pulled.subjects);
-    const mergedQuestions = mergeArrays(serverCoreCache.questions?.data, pulled.questions);
-    const mergedNotifications = mergeArrays(serverCoreCache.notifications?.data, pulled.notifications);
-
-    const mergedBotMap: Record<string, any> = {
-      ...loadCustomBotTemplates(),
-      ...(serverCoreCache.bot_commands?.data || {}),
-    };
-    for (const bc of pulled.bot_commands) {
-      if (bc?.command) {
-        mergedBotMap[bc.command] = bc;
-      }
-    }
-
-    const imported: Record<string, number> = {};
-    if (mergedSubjects.length > 0) {
-      await sbUpsertSubjects(mergedSubjects);
-      imported.subjects = mergedSubjects.length;
-    }
-    if (mergedQuestions.length > 0) {
-      await sbUpsertQuestions(mergedQuestions);
-      imported.questions = mergedQuestions.length;
-    }
-    if (mergedNotifications.length > 0) {
-      await sbUpsertNotifications(mergedNotifications);
-      imported.notifications = mergedNotifications.length;
-    }
-    if (Object.keys(mergedBotMap).length > 0) {
-      await sbUpsertBotCommandsMap(mergedBotMap);
-      saveCustomBotTemplates(mergedBotMap);
-      imported.botCommands = Object.keys(mergedBotMap).length;
-    }
-    if (pulled.paid_users.length > 0) {
-      await sbUpsertPaidUsers(pulled.paid_users);
-      imported.paidUsers = pulled.paid_users.length;
-    }
-    if (pulled.feedbacks.length > 0) {
-      await sbUpsertFeedbacks(pulled.feedbacks);
-      imported.feedbacks = pulled.feedbacks.length;
-    }
-    if (pulled.logins.length > 0) {
-      await sbUpsertLogins(pulled.logins);
-      imported.logins = pulled.logins.length;
-    }
-    if (pulled.presence.length > 0) {
-      await sbUpsertPresenceBatch(pulled.presence);
-      imported.presence = pulled.presence.length;
-    }
-
-    await sbRefreshGlobalStatsRow().catch(() => {});
-
-    const [freshQ, freshS, freshN, freshBC] = await Promise.all([
-      sbFetchAllQuestions().catch(() => mergedQuestions),
-      sbFetchAllSubjects().catch(() => mergedSubjects),
-      sbFetchNotifications(50).catch(() => mergedNotifications),
-      sbFetchBotCommandsMap().catch(() => mergedBotMap),
-    ]);
-    const now = Date.now();
-    serverCoreCache.questions = { data: freshQ, fetchedAt: now };
-    serverCoreCache.subjects = { data: freshS, fetchedAt: now };
-    serverCoreCache.notifications = { data: freshN, fetchedAt: now };
-    serverCoreCache.bot_commands = { data: freshBC, fetchedAt: now };
-    serverCoreCache.version = now;
-    schedulePersistServerCoreCache();
-    emitRealtimeChange({ scope: 'core', action: 'refresh', source: 'supabase' });
-
-    res.json({
-      success: true,
-      imported,
-      warnings,
-      partial: warnings.length > 0,
-      version: serverCoreCache.version,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: formatSupabaseMigrationError(err, 'Firestore migration failed'),
-    });
-  }
-});
-
-function handleServerSupabaseRealtimeEvent(evt: {
-  table: string;
-  eventType: 'INSERT' | 'UPDATE' | 'DELETE' | 'BROADCAST';
-  record?: any;
-  oldRecord?: any;
-  broadcastPayload?: any;
-}) {
-  if (evt.eventType === 'BROADCAST') {
-    const payload = evt.broadcastPayload;
-    if (!payload) return;
-    if (payload.serverInstanceId && payload.serverInstanceId === SERVER_INSTANCE_ID) return;
-    const scope = payload.scope;
-    const action = payload.action;
-    if (!scope || !action) return;
-    applyRealtimeDeltaToServerCache(payload);
-    emitRealtimeChange({
-      scope,
-      action,
-      id: payload.id,
-      ids: payload.ids,
-      item: payload.item,
-      items: payload.items,
-      replace: payload.replace,
-      mode: payload.mode,
-      version: serverCoreCache.version,
-      source: 'supabase',
-      skipSupabaseBroadcast: true,
-    });
-    return;
-  }
-
-  const validScopes = new Set([
-    'questions',
-    'subjects',
-    'notifications',
-    'bot_commands',
-    'feedbacks',
-    'logins',
-    'presence',
-    'paid_users',
-    'global_stats',
-  ]);
-  if (!validScopes.has(evt.table)) return;
-
-  const scope = evt.table as RealtimeBroadcastEvent['scope'];
-  const isDelete = evt.eventType === 'DELETE';
-  const record = evt.record;
-  const oldRecord = evt.oldRecord;
-  const id = String(
-    (isDelete ? oldRecord?.id || oldRecord?.command : record?.id || record?.command) || ''
-  );
-
-  if (scope === 'questions' || scope === 'subjects') {
-    updateLocalServerCacheScope(scope, (prev) => {
-      const arr = Array.isArray(prev) ? prev : [];
-      if (isDelete && id) return arr.filter((x: any) => x.id !== id);
-      if (record?.id) {
-        const map = new Map(arr.map((x: any) => [x.id, x]));
-        map.set(record.id, { ...(map.get(record.id) || {}), ...record });
-        return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
-      }
-      return arr;
-    });
-  } else if (scope === 'notifications') {
-    updateLocalServerCacheScope('notifications', (prev) => {
-      const arr = Array.isArray(prev) ? prev : [];
-      if (isDelete && id) return arr.filter((x: any) => x.id !== id);
-      if (record?.id) {
-        const base = arr.filter((x: any) => x.id !== record.id);
-        return [record, ...base]
-          .sort((a: any, b: any) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
-          .slice(0, 50);
-      }
-      return arr;
-    });
-  } else if (scope === 'bot_commands') {
-    updateLocalServerCacheScope('bot_commands', (prev) => {
-      const next = { ...(prev && typeof prev === 'object' ? prev : {}) };
-      if (isDelete) {
-        const keyToRemove = oldRecord?.command || id;
-        if (keyToRemove) delete next[keyToRemove];
-      } else if (record?.command) {
-        next[record.command] = record;
-      }
-      return next;
+      error: 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។',
     });
   }
 
-  emitRealtimeChange({
-    scope,
-    action: isDelete ? 'delete' : 'upsert',
-    id: id || undefined,
-    item: isDelete ? undefined : record,
-    source: 'supabase',
-    skipSupabaseBroadcast: true,
-  });
-}
-
-async function runAutomaticFirestoreToSupabaseMigration() {
-  if (!isSupabaseConfigured()) return;
-  try {
-    const { data: existingQ } = await getSupabaseAdmin().from('questions').select('id').limit(1);
-    if (Array.isArray(existingQ) && existingQ.length > 0) {
-      // Ensure subjects table always matches existing question subjects (fixes orphaned subjects)
-      const ensuredSubjects = await sbEnsureSubjectsFromQuestions().catch(() => null);
-      if (Array.isArray(ensuredSubjects) && ensuredSubjects.length > 0) {
-        serverCoreCache.subjects = { data: ensuredSubjects, fetchedAt: Date.now() };
-        serverCoreCache.version = Date.now();
-        schedulePersistServerCoreCache();
-      }
-      return;
-    }
-
-    console.log('[Supabase Auto-Migration] Starting automatic transfer from cache/Firestore to Supabase...');
-    const subjects = serverCoreCache.subjects?.data || [];
-    const questions = serverCoreCache.questions?.data || [];
-    const notifications = serverCoreCache.notifications?.data || [];
-    const botCommands = {
-      ...loadCustomBotTemplates(),
-      ...(serverCoreCache.bot_commands?.data || {}),
-    };
-
-    if (subjects.length > 0) await sbUpsertSubjects(subjects).catch(() => {});
-    if (questions.length > 0) await sbUpsertQuestions(questions).catch(() => {});
-    if (notifications.length > 0) await sbUpsertNotifications(notifications).catch(() => {});
-    if (Object.keys(botCommands).length > 0) await sbUpsertBotCommandsMap(botCommands).catch(() => {});
-    await sbEnsureSubjectsFromQuestions().catch(() => {});
-    await sbRefreshGlobalStatsRow().catch(() => {});
-    console.log('[Supabase Auto-Migration] Automatic migration completed successfully!');
-  } catch (err) {
-    console.warn('[Supabase Auto-Migration] Note:', err);
-  }
-}
+  adminVerifyAttempts.delete(ipKey);
+  res.json({ success: true, mode: 'claimed' });
+});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'Master Quiz KH' });
 });
-
-// Trigger auto migration & start Supabase Realtime bridge after boot
-setTimeout(() => {
-  void runAutomaticFirestoreToSupabaseMigration();
-  if (isSupabaseConfigured()) {
-    startServerSupabaseRealtime(handleServerSupabaseRealtimeEvent);
-  }
-}, 1500);
 
 // Mount Vite or static dist in production
 async function startServer() {

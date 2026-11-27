@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, CheckCircle2 } from 'lucide-react';
-import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid, loginAdminWithPasscode } from '../services/firebase';
+import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid, verifyFirebaseAdminAccess } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
@@ -74,7 +74,32 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   // Admin form state
   const [adminCode, setAdminCode] = useState('');
+  const [adminConfirmCode, setAdminConfirmCode] = useState('');
   const [adminError, setAdminError] = useState('');
+  const [adminNeedsSetup, setAdminNeedsSetup] = useState(false);
+  const [isLoadingAdminStatus, setIsLoadingAdminStatus] = useState(false);
+
+  useEffect(() => {
+    if (activeModal !== 'admin') return;
+    let active = true;
+    setIsLoadingAdminStatus(true);
+    setAdminError('');
+    void fetch('/api/admin/auth-status', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active || !data) return;
+        setAdminNeedsSetup(Boolean(data.needsSetup));
+      })
+      .catch(() => {
+        // Ignore transient status fetch error
+      })
+      .finally(() => {
+        if (active) setIsLoadingAdminStatus(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeModal]);
 
   // Validate member passcode: 6 digits, starts with 20, ends with 26
   const validateMemberPasscode = (code: string): boolean => {
@@ -142,20 +167,91 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setAdminError('');
 
     const trimmed = adminCode.trim();
-    if (!trimmed) {
-      setAdminError('សូមបញ្ចូលលេខកូដ Master Code របស់អ្នកគ្រប់គ្រង!');
-      return;
-    }
-
     setIsCheckingAdmin(true);
     try {
-      await loginAdminWithPasscode(trimmed);
+      if (!trimmed) {
+        const firebaseAdmin = await verifyFirebaseAdminAccess(false);
+        if (firebaseAdmin.ok) {
+          const session: UserSession = {
+            username: firebaseAdmin.email || 'Admin Master',
+            role: 'admin',
+            loggedInAt: new Date().toISOString(),
+          };
+          await recordLogin(session.username, 'Google Admin Auth', 'admin');
+          onLoginSuccess(session);
+          return;
+        }
+        setAdminError(
+          adminNeedsSetup
+            ? 'សូមបង្កើតលេខកូដ Master Code ថ្មី (យ៉ាងតិច ៦ តួអក្សរ) ឬភ្ជាប់គណនី Google Admin!'
+            : 'សូមបញ្ចូលលេខកូដ Master Code ឬភ្ជាប់គណនី Google Admin ខាងក្រោម!'
+        );
+        return;
+      }
+
+      if (adminNeedsSetup) {
+        if (trimmed.length < 6) {
+          setAdminError('លេខកូដ Master Code ត្រូវមានយ៉ាងតិច ៦ តួអក្សរ!');
+          return;
+        }
+        if (trimmed !== adminConfirmCode.trim()) {
+          setAdminError('ការបញ្ជាក់លេខកូដមិនត្រូវគ្នាទេ! សូមពិនិត្យម្ដងទៀត។');
+          return;
+        }
+
+        const setupRes = await fetch('/api/admin/setup-passcode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            passcode: trimmed,
+            confirmPasscode: adminConfirmCode.trim(),
+          }),
+        });
+        const setupData = await setupRes.json().catch(() => null);
+        if (setupRes.status === 409) {
+          setAdminNeedsSetup(false);
+          setAdminConfirmCode('');
+          setAdminError(
+            setupData?.error ||
+              'លេខកូដត្រូវបានកំណត់រួចហើយ! សូមបញ្ចូលលេខកូដដើម្បីចូលប្រព័ន្ធ។'
+          );
+          return;
+        }
+        if (!setupRes.ok || !setupData?.success) {
+          throw new Error(setupData?.error || 'មិនអាចបង្កើតលេខកូដ Admin បានទេ!');
+        }
+
+        setAdminNeedsSetup(false);
+        const session: UserSession = {
+          username: 'Admin Master',
+          role: 'admin',
+          loggedInAt: new Date().toISOString(),
+        };
+        await recordLogin('Admin Master', 'Admin Setup Auth', 'admin');
+        onLoginSuccess(session);
+        return;
+      }
+
+      const res = await fetch('/api/admin/verify-passcode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: trimmed }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.needsSetup) {
+        setAdminNeedsSetup(true);
+        setAdminError(data.error || 'មិនទាន់មានលេខកូដនៅឡើយទេ! សូមបង្កើតលេខកូដដំបូងខាងក្រោម។');
+        return;
+      }
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។');
+      }
+
       const session: UserSession = {
         username: 'Admin Master',
         role: 'admin',
         loggedInAt: new Date().toISOString(),
       };
-
       await recordLogin('Admin Master', 'Admin Auth', 'admin');
       onLoginSuccess(session);
     } catch (err: any) {
@@ -168,9 +264,24 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const handleConnectGoogle = async () => {
     if (isGoogleSigningIn) return;
     setGoogleAuthError('');
+    setAdminError('');
     setIsGoogleSigningIn(true);
     try {
       await signInWithGoogle();
+      if (activeModal === 'admin') {
+        const adminCheck = await verifyFirebaseAdminAccess(false);
+        if (adminCheck.ok) {
+          const session: UserSession = {
+            username: adminCheck.email || 'Admin Master',
+            role: 'admin',
+            loggedInAt: new Date().toISOString(),
+          };
+          await recordLogin(session.username, 'Google Admin Auth', 'admin');
+          onLoginSuccess(session);
+        } else {
+          setGoogleAuthError('គណនី Google នេះមិនមានសិទ្ធិ Admin ទេ (ត្រូវការគណនី reaksmey8114@gmail.com)!');
+        }
+      }
     } catch (err: any) {
       setGoogleAuthError(err?.message || 'មិនអាចភ្ជាប់គណនី Google បានទេ។ សូមសាកល្បងម្ដងទៀត!');
     } finally {
@@ -540,7 +651,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               </div>
               <div>
                 <h3 className="font-moul text-base sm:text-lg app-text-primary">ផ្ទាំងគ្រប់គ្រង (Admin)</h3>
-                <p className="text-sm app-text-secondary">បញ្ចូលលេខកូដ Master Code របស់អ្នកគ្រប់គ្រង</p>
+                <p className="text-sm app-text-secondary">
+                  {adminNeedsSetup
+                    ? 'កំណត់លេខកូដ Master Code សម្ងាត់ដំបូងសម្រាប់ Admin'
+                    : 'បញ្ចូលលេខកូដ Master Code របស់អ្នកគ្រប់គ្រង'}
+                </p>
               </div>
             </div>
 
@@ -551,28 +666,60 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               </div>
             )}
 
+            {adminNeedsSetup && !isLoadingAdminStatus && (
+              <div className="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200 text-xs leading-relaxed">
+                មិនទាន់មានលេខកូដ Admin ត្រូវបានកំណត់នៅឡើយទេ។ សូមបង្កើតលេខកូដសម្ងាត់ផ្ទាល់ខ្លួនរបស់អ្នក (យ៉ាងតិច ៦ ខ្ទង់/តួអក្សរ) ដើម្បីប្រើសម្រាប់ចូលប្រព័ន្ធលើកក្រោយ។
+              </div>
+            )}
+
             <form onSubmit={handleAdminLogin} className="space-y-4">
               <div>
                 <label className="block text-sm font-semibold app-text-primary mb-1.5">
-                  Master Code សម្ងាត់ <span className="text-red-600">*</span>
+                  {adminNeedsSetup ? 'បង្កើត Master Code ថ្មី' : 'Master Code សម្ងាត់'}{' '}
+                  <span className="text-red-600">*</span>
                 </label>
                 <input
                   type="password"
                   value={adminCode}
                   onChange={(e) => setAdminCode(e.target.value)}
-                  placeholder="បញ្ចូលលេខកូដសម្ងាត់ Admin"
+                  placeholder={
+                    adminNeedsSetup
+                      ? 'បញ្ចូលលេខកូដថ្មី (យ៉ាងតិច ៦ តួអក្សរ)'
+                      : 'បញ្ចូលលេខកូដសម្ងាត់ Admin'
+                  }
                   className="w-full px-3.5 py-2.5 rounded-xl app-input text-lg font-mono tracking-widest text-center transition"
                   autoFocus
                 />
               </div>
 
+              {adminNeedsSetup && (
+                <div>
+                  <label className="block text-sm font-semibold app-text-primary mb-1.5">
+                    បញ្ជាក់ Master Code ម្ដងទៀត <span className="text-red-600">*</span>
+                  </label>
+                  <input
+                    type="password"
+                    value={adminConfirmCode}
+                    onChange={(e) => setAdminConfirmCode(e.target.value)}
+                    placeholder="វាយលេខកូដដដែលម្ដងទៀត"
+                    className="w-full px-3.5 py-2.5 rounded-xl app-input text-lg font-mono tracking-widest text-center transition"
+                  />
+                </div>
+              )}
+
               <button
                 type="submit"
-                disabled={isCheckingAdmin}
+                disabled={isCheckingAdmin || isLoadingAdminStatus}
                 className="w-full py-3 rounded-xl khmer-btn-crimson font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 <Lock className="w-4 h-4" />
-                <span>{isCheckingAdmin ? 'កំពុងផ្ទៀងផ្ទាត់...' : 'ផ្ទៀងផ្ទាត់ និងចូលគ្រប់គ្រង'}</span>
+                <span>
+                  {isCheckingAdmin
+                    ? 'កំពុងផ្ទៀងផ្ទាត់...'
+                    : adminNeedsSetup
+                      ? 'កំណត់លេខកូដ និងចូលគ្រប់គ្រង'
+                      : 'ផ្ទៀងផ្ទាត់ និងចូលគ្រប់គ្រង'}
+                </span>
               </button>
             </form>
 
@@ -590,7 +737,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     )}
                   </p>
                 </div>
-                {!firebaseUserEmail && (
+                {!firebaseUserEmail ? (
                   <button
                     type="button"
                     disabled={isGoogleSigningIn}
@@ -598,6 +745,28 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     className="px-3 py-1.5 rounded-lg app-card border app-border text-xs font-bold text-rose-700 dark:text-rose-300 hover:opacity-85 disabled:opacity-60 transition shrink-0 cursor-pointer"
                   >
                     {isGoogleSigningIn ? 'កំពុងភ្ជាប់...' : 'ភ្ជាប់ Google'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void verifyFirebaseAdminAccess(false).then(async (check) => {
+                        if (check.ok) {
+                          const session: UserSession = {
+                            username: check.email || 'Admin Master',
+                            role: 'admin',
+                            loggedInAt: new Date().toISOString(),
+                          };
+                          await recordLogin(session.username, 'Google Admin Auth', 'admin');
+                          onLoginSuccess(session);
+                        } else {
+                          setGoogleAuthError('គណនី Google នេះមិនមានសិទ្ធិ Admin ទេ!');
+                        }
+                      });
+                    }}
+                    className="px-3 py-1.5 rounded-lg app-card border app-border text-xs font-bold text-emerald-700 dark:text-emerald-300 hover:opacity-85 transition shrink-0 cursor-pointer"
+                  >
+                    ចូលដោយ Google
                   </button>
                 )}
               </div>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { User as FirebaseUser } from 'firebase/auth';
+import { QueryDocumentSnapshot, DocumentData } from 'firebase/firestore';
 import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig, QuizContext, GlobalStats } from './types';
 import { LandingPage } from './components/LandingPage';
 import { Navbar } from './components/Navbar';
@@ -31,9 +32,6 @@ import {
   fetchSubjectsCached,
   signInWithGoogle,
   startCoreRealtimeSync,
-  clearAdminSessionToken,
-  verifyAdminSession,
-  PaginationCursor,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
 import {
@@ -85,48 +83,6 @@ export default function App() {
     }
   });
 
-  // Verify restored Admin sessions actually have a valid server token (or Firebase Admin auth)
-  // Keep offline PWA Admin sessions active when offline / network_error and re-verify once back online.
-  useEffect(() => {
-    if (session?.role !== 'admin') return;
-    let active = true;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clearInvalidAdminSession = () => {
-      clearAdminSessionToken();
-      try {
-        localStorage.removeItem('master_pro_quiz_session');
-      } catch {
-        // Ignore
-      }
-      setSession(null);
-    };
-
-    const runVerification = () => {
-      void verifyAdminSession().then((status) => {
-        if (!active || status === 'valid' || status === 'network_error') return;
-        // Wait briefly if Firebase Auth is still initializing on page load
-        if (retryTimer) clearTimeout(retryTimer);
-        retryTimer = setTimeout(() => {
-          if (!active) return;
-          void verifyAdminSession().then((retryStatus) => {
-            if (!active || retryStatus !== 'invalid') return;
-            clearInvalidAdminSession();
-          });
-        }, 1200);
-      });
-    };
-
-    runVerification();
-    window.addEventListener('online', runVerification);
-
-    return () => {
-      active = false;
-      if (retryTimer) clearTimeout(retryTimer);
-      window.removeEventListener('online', runVerification);
-    };
-  }, [session?.role, firebaseUser?.uid]);
-
   // App View State
   const [activeTab, setActiveTab] = useState<'play' | 'admin'>('play');
   const [activeQuizQuestions, setActiveQuizQuestions] = useState<Question[] | null>(null);
@@ -143,24 +99,23 @@ export default function App() {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [globalStats, setGlobalStats] = useState<GlobalStats>({});
   const [logins, setLogins] = useState<LoginRecord[]>([]);
-  const [loginsCursor, setLoginsCursor] = useState<PaginationCursor>(null);
+  const [loginsCursor, setLoginsCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
   const [hasMoreLogins, setHasMoreLogins] = useState(false);
   const [isLoadingMoreLogins, setIsLoadingMoreLogins] = useState(false);
 
   const [presence, setPresence] = useState<PresenceRecord[]>([]);
-  const [presenceCursor, setPresenceCursor] = useState<PaginationCursor>(null);
+  const [presenceCursor, setPresenceCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
   const [hasMorePresence, setHasMorePresence] = useState(false);
   const [isLoadingMorePresence, setIsLoadingMorePresence] = useState(false);
 
   const [onlineCount, setOnlineCount] = useState<number>(1);
   const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
-  const [feedbacksCursor, setFeedbacksCursor] = useState<PaginationCursor>(null);
+  const [feedbacksCursor, setFeedbacksCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
   const [hasMoreFeedbacks, setHasMoreFeedbacks] = useState(false);
   const [isLoadingMoreFeedbacks, setIsLoadingMoreFeedbacks] = useState(false);
 
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
   const [isSyncingCore, setIsSyncingCore] = useState(false);
-  const [realtimeEpoch, setRealtimeEpoch] = useState(0);
 
   // Core data subscriptions: only attach AFTER user logs in (re-sync cleanly on Firebase Auth sign-in)
   const isLoggedIn = Boolean(session);
@@ -262,7 +217,7 @@ export default function App() {
       setPresence(presPage.items);
       setPresenceCursor(presPage.lastDoc);
       setHasMorePresence(presPage.hasMore);
-      setOnlineCount(Math.max(1, presPage.items.length));
+      setOnlineCount((prev) => Math.max(prev, presPage.items.length));
     }
     if (fbPage.items.length > 0) {
       setFeedbacks(fbPage.items);
@@ -270,6 +225,33 @@ export default function App() {
       setHasMoreFeedbacks(fbPage.hasMore);
     }
   }, []);
+
+  // Unified Real-Time Sync (SSE + BroadcastChannel + targeted limit(20) Firestore listeners)
+  const sessionUsername = session?.username || '';
+  const sessionRole = session?.role;
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const handleOnlineCountChanged = (e: Event) => {
+      const nextCount = Number((e as CustomEvent<number>).detail);
+      if (!Number.isNaN(nextCount) && nextCount >= 1) {
+        setOnlineCount(nextCount);
+      }
+    };
+    window.addEventListener('mpq-online-count-changed', handleOnlineCountChanged);
+
+    const stopRealtimeSync = startCoreRealtimeSync({
+      isAdmin: isAdminPanelActive,
+      username: sessionUsername,
+      role: sessionRole,
+    });
+
+    return () => {
+      window.removeEventListener('mpq-online-count-changed', handleOnlineCountChanged);
+      stopRealtimeSync();
+    };
+  }, [isLoggedIn, isAdminPanelActive, firebaseUid, sessionUsername, sessionRole]);
 
   useEffect(() => {
     if (!isLoggedIn) return;
@@ -287,7 +269,9 @@ export default function App() {
     const unsubLog = subscribeLogins(setLogins);
     const unsubPres = subscribePresence((list) => {
       setPresence(list);
-      setOnlineCount(Math.max(1, list.length));
+      if (list.length > 0) {
+        setOnlineCount((prev) => Math.max(prev, list.length));
+      }
     });
     const unsubFb = subscribeFeedbacks(setFeedbacks);
 
@@ -300,34 +284,8 @@ export default function App() {
     };
   }, [isLoggedIn, isAdminPanelActive, firebaseUid, loadInitialMonitoringPages]);
 
-  // Unified Real-Time Sync (Server SSE + Supabase Realtime + Firebase Firestore onSnapshot)
-  useEffect(() => {
-    if (!isLoggedIn) return;
-
-    const handleOnlineCount = (e: Event) => {
-      const custom = e as CustomEvent<number>;
-      if (typeof custom.detail === 'number' && custom.detail > 0) {
-        setOnlineCount(custom.detail);
-      }
-    };
-    const handleDbModeChanged = () => {
-      setRealtimeEpoch((prev) => prev + 1);
-    };
-
-    window.addEventListener('mpq-online-count-changed', handleOnlineCount);
-    window.addEventListener('mpq-db-mode-changed', handleDbModeChanged);
-
-    const stopRealtime = startCoreRealtimeSync({ isAdmin: isAdminPanelActive });
-
-    return () => {
-      stopRealtime();
-      window.removeEventListener('mpq-online-count-changed', handleOnlineCount);
-      window.removeEventListener('mpq-db-mode-changed', handleDbModeChanged);
-    };
-  }, [isLoggedIn, isAdminPanelActive, firebaseUid, realtimeEpoch]);
-
   const handleLoadMoreLogins = useCallback(async () => {
-    if (isLoadingMoreLogins || !hasMoreLogins || loginsCursor === null) return;
+    if (isLoadingMoreLogins || !hasMoreLogins || !loginsCursor) return;
     setIsLoadingMoreLogins(true);
     try {
       const page = await fetchLoginsPage(loginsCursor, true);
@@ -344,7 +302,7 @@ export default function App() {
   }, [isLoadingMoreLogins, hasMoreLogins, loginsCursor]);
 
   const handleLoadMorePresence = useCallback(async () => {
-    if (isLoadingMorePresence || !hasMorePresence || presenceCursor === null) return;
+    if (isLoadingMorePresence || !hasMorePresence || !presenceCursor) return;
     setIsLoadingMorePresence(true);
     try {
       const page = await fetchPresencePage(presenceCursor, true);
@@ -361,7 +319,7 @@ export default function App() {
   }, [isLoadingMorePresence, hasMorePresence, presenceCursor]);
 
   const handleLoadMoreFeedbacks = useCallback(async () => {
-    if (isLoadingMoreFeedbacks || !hasMoreFeedbacks || feedbacksCursor === null) return;
+    if (isLoadingMoreFeedbacks || !hasMoreFeedbacks || !feedbacksCursor) return;
     setIsLoadingMoreFeedbacks(true);
     try {
       const page = await fetchFeedbacksPage(feedbacksCursor, true);
@@ -395,20 +353,18 @@ export default function App() {
     setHasMoreFeedbacks(fbPage.hasMore);
   }, []);
 
-  // Real-time 5-minute Presence Heartbeat (primitive dependencies prevent re-render/loop)
-  const sessionUsername = session?.username || '';
-  const sessionRole = session?.role;
+  // Real-time Presence Heartbeat (2m server SSE publish, 4.5m Firestore write throttle)
   useEffect(() => {
     if (!sessionUsername || !sessionRole) return;
 
-    updatePresenceHeartbeat(sessionUsername, sessionRole);
+    void updatePresenceHeartbeat(sessionUsername, sessionRole, true);
 
     const interval = setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
-      updatePresenceHeartbeat(sessionUsername, sessionRole);
-    }, 300000);
+      void updatePresenceHeartbeat(sessionUsername, sessionRole, false);
+    }, 120000);
 
     return () => clearInterval(interval);
   }, [sessionUsername, sessionRole, firebaseUid]);
@@ -426,7 +382,6 @@ export default function App() {
     setSession(null);
     setActiveQuizQuestions(null);
     setActiveQuizContext(null);
-    clearAdminSessionToken();
     try {
       localStorage.removeItem('master_pro_quiz_session');
     } catch {
@@ -537,7 +492,7 @@ export default function App() {
           setActiveTab(tab);
         }}
         onLogout={handleLogout}
-        onlineCount={isAdminPanelActive && presence.length > 0 ? presence.length : onlineCount}
+        onlineCount={isAdminPanelActive ? Math.max(onlineCount, presence.length) : onlineCount}
         isMuted={isMuted}
         onToggleMute={handleToggleMute}
         currentTheme={currentTheme}
