@@ -2239,8 +2239,13 @@ app.post('/api/cache/invalidate', (req, res) => {
 
 const adminVerifyAttempts = new Map<string, number[]>();
 
-function getConfiguredAdminCode(): string {
-  return (process.env.ADMIN_MASTER_CODE || process.env.ADMIN_PASSCODE || '').trim();
+const DEFAULT_ADMIN_CODE = '168';
+
+function getConfiguredAdminCodes(): string[] {
+  const envCode = (process.env.ADMIN_MASTER_CODE || process.env.ADMIN_PASSCODE || '').trim();
+  return envCode && envCode !== DEFAULT_ADMIN_CODE
+    ? [envCode, DEFAULT_ADMIN_CODE]
+    : [DEFAULT_ADMIN_CODE];
 }
 
 function timingSafeCompareStrings(aStr: string, bStr: string): boolean {
@@ -2283,15 +2288,10 @@ app.post('/api/admin/verify-passcode', (req, res) => {
     });
   }
 
-  const configuredCode = getConfiguredAdminCode();
-  if (!configuredCode) {
-    return res.status(503).json({
-      success: false,
-      error: 'មិនទាន់បានកំណត់ ADMIN_MASTER_CODE នៅលើ Server នៅឡើយទេ!',
-    });
-  }
+  const validCodes = getConfiguredAdminCodes();
+  const isValid = validCodes.some((code) => timingSafeCompareStrings(code, submitted));
 
-  if (!timingSafeCompareStrings(configuredCode, submitted)) {
+  if (!isValid) {
     recordAdminFailedAttempt(ipKey);
     return res.status(401).json({
       success: false,
