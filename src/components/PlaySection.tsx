@@ -273,17 +273,17 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center justify-center gap-3 shrink-0">
+          <div className="flex flex-wrap items-center justify-center gap-3 shrink-0">
             <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
               <span className="block text-lg sm:text-2xl font-bold khmer-accent-text font-moul tabular-nums">
-                {toKhmerNum(Math.max(questions.length, globalStats?.questionsCount || 0))}
+                {toKhmerNum(questions.length > 0 ? questions.length : (globalStats?.questionsCount || 0))}
               </span>
               <span className="text-xs app-text-secondary font-semibold">សំណួរសរុប</span>
             </div>
 
             <div className="text-center px-4 py-2.5 rounded-xl khmer-frame-card min-w-[100px]">
               <span className="block text-lg sm:text-2xl font-bold khmer-gold-text font-moul tabular-nums">
-                {toKhmerNum(Math.max(activeSubjects.length, globalStats?.subjectsCount || 0))}
+                {toKhmerNum(activeSubjects.length > 0 ? activeSubjects.length : (globalStats?.subjectsCount || 0))}
               </span>
               <span className="text-xs app-text-secondary font-semibold">មុខវិជ្ជា</span>
             </div>
@@ -641,7 +641,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
             <label className="block text-sm font-bold app-text-primary mb-3">
               ចំនួនសំណួរចៃដន្យ៖
             </label>
-            <div className="grid grid-cols-5 gap-2 sm:gap-3">
+            <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 sm:gap-3">
               {[10, 20, 30, 50, 100].map((num) => (
                 <button
                   key={num}

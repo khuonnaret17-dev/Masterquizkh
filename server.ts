@@ -1847,6 +1847,17 @@ function emitRealtimeChange(
   }
 }
 
+let onlineCountBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleBroadcastOnlineCount() {
+  if (onlineCountBroadcastTimer) return;
+  onlineCountBroadcastTimer = setTimeout(() => {
+    onlineCountBroadcastTimer = null;
+    if (sseClients.size === 0) return;
+    const onlineCount = Math.max(serverCoreCache.onlineCount?.count || 1, sseClients.size);
+    broadcastSsePayload('online_count', { onlineCount, ts: Date.now() });
+  }, 500);
+}
+
 // Keep-alive heartbeat for SSE clients (prevents proxy idle timeout)
 setInterval(() => {
   if (sseClients.size === 0) return;
@@ -1882,8 +1893,11 @@ app.get('/api/realtime/events', (req, res) => {
     sseClients.delete(res);
   }
 
+  scheduleBroadcastOnlineCount();
+
   req.on('close', () => {
     sseClients.delete(res);
+    scheduleBroadcastOnlineCount();
   });
 });
 

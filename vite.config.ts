@@ -22,10 +22,10 @@ export default defineConfig(() => {
         ],
         manifest: {
           id: '/',
-          name: 'Master Quiz KH - ប្រព័ន្ធធ្វើតេស្តត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ',
+          name: 'Master Pro Quiz KH - ប្រព័ន្ធធ្វើតេស្តត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ',
           short_name: 'Master Quiz',
           description:
-            'ប្រព័ន្ធគ្រប់គ្រង និងធ្វើតេស្តសមត្ថភាពត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ (Master Quiz KH)',
+            'ប្រព័ន្ធគ្រប់គ្រង និងធ្វើតេស្តសមត្ថភាពត្រៀមប្រឡងក្របខ័ណ្ឌរដ្ឋ (Master Pro Quiz KH)',
           lang: 'km',
           dir: 'ltr',
           theme_color: '#8f251b',

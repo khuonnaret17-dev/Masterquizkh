@@ -128,6 +128,17 @@ export function applyThemeToDom(themeId: AppThemeId): void {
     root.classList.remove('dark');
   }
 
+  if (themeConfig) {
+    const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeColorMeta) {
+      themeColorMeta.setAttribute('content', themeConfig.swatch.bg);
+    }
+    const appleStatusMeta = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+    if (appleStatusMeta) {
+      appleStatusMeta.setAttribute('content', themeConfig.isDark ? 'black-translucent' : 'default');
+    }
+  }
+
   window.dispatchEvent(new CustomEvent('appthemechange', { detail: themeId }));
 }
 

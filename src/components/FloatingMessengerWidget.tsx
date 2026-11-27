@@ -270,7 +270,7 @@ export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = (
   };
 
   return (
-    <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50">
+    <div className="fixed bottom-[calc(1rem+env(safe-area-inset-bottom,0px))] right-[calc(1rem+env(safe-area-inset-right,0px))] sm:bottom-[calc(1.5rem+env(safe-area-inset-bottom,0px))] sm:right-[calc(1.5rem+env(safe-area-inset-right,0px))] z-50">
       {!isOpen && !hideClosedLauncher && (
         <button
           type="button"

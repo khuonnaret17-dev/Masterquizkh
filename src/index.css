@@ -151,6 +151,11 @@
 }
 
 @layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
   body {
     font-family: 'Kantumruy Pro', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: var(--theme-text-primary);
@@ -158,7 +163,19 @@
     overflow-x: hidden;
     line-height: 1.65;
     -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    overscroll-behavior-y: contain;
     transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  /* Prevent automatic viewport zoom when focusing inputs on iOS Safari & iOS Home Screen PWA */
+  @media (max-width: 767px) {
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]),
+    textarea,
+    select {
+      font-size: 16px;
+    }
   }
 }
 
@@ -169,6 +186,7 @@
 }
 
 .min-h-miniapp {
+  min-height: 100vh;
   min-height: var(--tg-viewport-stable-height, 100dvh);
 }
 

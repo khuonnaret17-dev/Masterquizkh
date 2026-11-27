@@ -198,10 +198,46 @@ export function connectSupabaseRealtime(
   let cancelled = false;
   let localChannel: RealtimeChannel | null = null;
   let clientRef: SupabaseClient | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectDelayMs = 2500;
+  let isSubscribed = false;
 
-  void getBrowserSupabaseClient().then((sb) => {
+  const cleanupChannel = () => {
+    isSubscribed = false;
+    if (localChannel && clientRef) {
+      try {
+        clientRef.removeChannel(localChannel);
+      } catch {
+        // Ignore cleanup errors
+      }
+      if (activeRealtimeChannel === localChannel) {
+        activeRealtimeChannel = null;
+        activeChannelSubscribed = false;
+      }
+      localChannel = null;
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (cancelled || reconnectTimer) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    const delay = reconnectDelayMs;
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!cancelled) {
+        void attachChannel();
+      }
+    }, delay);
+  };
+
+  const attachChannel = async () => {
+    if (cancelled) return;
+    const sb = clientRef || (await getBrowserSupabaseClient());
     if (cancelled || !sb) return;
     clientRef = sb;
+
+    cleanupChannel();
 
     const coreTables: ClientRealtimeDeltaEvent['scope'][] = [
       'questions',
@@ -270,24 +306,52 @@ export function connectSupabaseRealtime(
     });
 
     localChannel = ch.subscribe((status) => {
-      activeChannelSubscribed = status === 'SUBSCRIBED';
+      if (cancelled) return;
+      if (status === 'SUBSCRIBED') {
+        isSubscribed = true;
+        activeChannelSubscribed = true;
+        reconnectDelayMs = 2500;
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        isSubscribed = false;
+        activeChannelSubscribed = false;
+        scheduleReconnect();
+      }
     });
     activeRealtimeChannel = localChannel;
-  });
+  };
+
+  void attachChannel();
+
+  const handleWakeReconnect = () => {
+    if (cancelled) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    if (!isSubscribed) {
+      reconnectDelayMs = 2500;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      void attachChannel();
+    }
+  };
+
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    window.addEventListener('online', handleWakeReconnect);
+    document.addEventListener('visibilitychange', handleWakeReconnect);
+  }
 
   return () => {
     cancelled = true;
-    if (localChannel && clientRef) {
-      try {
-        clientRef.removeChannel(localChannel);
-      } catch {
-        // Ignore cleanup errors
-      }
-      if (activeRealtimeChannel === localChannel) {
-        activeRealtimeChannel = null;
-        activeChannelSubscribed = false;
-      }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      window.removeEventListener('online', handleWakeReconnect);
+      document.removeEventListener('visibilitychange', handleWakeReconnect);
+    }
+    cleanupChannel();
   };
 }
 

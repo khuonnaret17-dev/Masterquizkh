@@ -3313,6 +3313,10 @@ function applyRealtimeDelta(event: ClientRealtimeDeltaEvent) {
       setLocal(STORAGE_KEYS.QUESTIONS, next);
       setSyncTimestamp('QUESTIONS');
       window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+      const prevStats = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+      const updatedStats: GlobalStats = { ...prevStats, questionsCount: next.length };
+      setLocal(STORAGE_KEYS.GLOBAL_STATS, updatedStats);
+      window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: updatedStats }));
     }
     return;
   }
@@ -3344,6 +3348,10 @@ function applyRealtimeDelta(event: ClientRealtimeDeltaEvent) {
       setLocal(STORAGE_KEYS.SUBJECTS, next);
       setSyncTimestamp('SUBJECTS');
       window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
+      const prevStats = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+      const updatedStats: GlobalStats = { ...prevStats, subjectsCount: next.length };
+      setLocal(STORAGE_KEYS.GLOBAL_STATS, updatedStats);
+      window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: updatedStats }));
     }
     return;
   }
@@ -3506,6 +3514,14 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
   // Layer 1: Express Server-Sent Events (SSE) for instant push across all clients
   const connectSse = () => {
     if (disposed || typeof EventSource === 'undefined') return;
+    if (sse) {
+      try {
+        sse.close();
+      } catch {
+        // Ignore
+      }
+      sse = null;
+    }
     try {
       sse = new EventSource('/api/realtime/events');
 
@@ -3523,6 +3539,19 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
             if (data.version > localVer) {
               void syncCoreFromServer(false).catch(() => {});
             }
+          }
+        } catch {
+          // Ignore malformed frame
+        }
+      });
+
+      sse.addEventListener('online_count', (evt: MessageEvent) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (typeof data?.onlineCount === 'number' && data.onlineCount > 0) {
+            window.dispatchEvent(
+              new CustomEvent('mpq-online-count-changed', { detail: data.onlineCount })
+            );
           }
         } catch {
           // Ignore malformed frame
@@ -3560,6 +3589,41 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
   };
 
   connectSse();
+
+  // Mobile Safari / Android PWA wake-from-background & network reconnect recovery
+  let lastWakeSyncAt = 0;
+  const handleWakeOrOnline = () => {
+    if (disposed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+    // Immediately revive frozen/closed EventSource after OS sleep
+    if (!sse || sse.readyState !== EventSource.OPEN) {
+      reconnectDelayMs = 2000;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      connectSse();
+    }
+
+    // Throttled lightweight catch-up sync to fetch deltas missed while phone was asleep
+    const now = Date.now();
+    if (now - lastWakeSyncAt > 8000) {
+      lastWakeSyncAt = now;
+      void syncCoreFromServer(false).catch(() => {});
+    }
+  };
+
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === 'visible') {
+      handleWakeOrOnline();
+    }
+  };
+
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('pageshow', handleWakeOrOnline);
+  window.addEventListener('online', handleWakeOrOnline);
 
   // Layer 2 & Layer 3: Supabase Realtime + Firebase Firestore onSnapshot
   void fetchRealtimeConfig(true).then((cfg) => {
@@ -3687,6 +3751,9 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
 
   return () => {
     disposed = true;
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.removeEventListener('pageshow', handleWakeOrOnline);
+    window.removeEventListener('online', handleWakeOrOnline);
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (sse) {
       try {

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Download,
   Share,
@@ -41,6 +41,15 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
   });
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [justInstalled, setJustInstalled] = useState(false);
+
+  useEffect(() => {
+    if (!showGuideModal) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowGuideModal(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showGuideModal]);
 
   // Hide only when already running inside installed standalone App (and not showing confirmation)
   if (isInstalled && !justInstalled) {
@@ -175,7 +184,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
               />
               <div className="min-w-0">
                 <h3 className="font-moul text-sm sm:text-base app-text-primary leading-snug">
-                  ទាញកម្មវិធី Master Quiz KH
+                  ទាញកម្មវិធី Master Pro Quiz KH
                 </h3>
                 <p className="text-xs app-text-secondary mt-0.5">
                   ដំឡើងលើអេក្រង់ដើម ដើម្បីប្រើជា App ពេញលេញ

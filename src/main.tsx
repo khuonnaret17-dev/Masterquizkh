@@ -5,7 +5,23 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import './index.css';
 
 if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
-  registerSW({ immediate: true });
+  registerSW({
+    immediate: true,
+    onRegisteredSW(_swUrl, registration) {
+      if (!registration) return;
+      const checkForUpdate = () => {
+        if (navigator.onLine) {
+          void registration.update().catch(() => {});
+        }
+      };
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          checkForUpdate();
+        }
+      });
+      setInterval(checkForUpdate, 60 * 60 * 1000);
+    },
+  });
 }
 
 createRoot(document.getElementById('root')!).render(
