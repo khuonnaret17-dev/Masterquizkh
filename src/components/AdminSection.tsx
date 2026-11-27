@@ -2267,8 +2267,29 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     void fetchCodeStoreStatus().then((st) => {
       if (active) setCodeStoreStatus(st);
     });
+
+    const handleCodeStoreSynced = (e: Event) => {
+      const detail = (e as CustomEvent<{
+        ok?: boolean;
+        version?: number;
+        updatedAt?: string;
+        subjectsCount?: number;
+        questionsCount?: number;
+      }>).detail;
+      if (!active || !detail?.ok) return;
+      setCodeStoreStatus((prev) => ({
+        version: detail.version ?? prev?.version ?? 0,
+        updatedAt: detail.updatedAt ?? new Date().toISOString(),
+        subjectsCount: detail.subjectsCount ?? prev?.subjectsCount ?? 0,
+        questionsCount: detail.questionsCount ?? prev?.questionsCount ?? 0,
+        writable: true,
+      }));
+    };
+
+    window.addEventListener('mpq-code-store-synced', handleCodeStoreSynced);
     return () => {
       active = false;
+      window.removeEventListener('mpq-code-store-synced', handleCodeStoreSynced);
     };
   }, []);
 

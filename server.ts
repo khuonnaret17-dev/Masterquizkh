@@ -1604,6 +1604,8 @@ interface ServerCoreCacheState {
 
 function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
   const bundled = loadBundledCodeStoreFromDisk();
+  const customBotTemplates = loadCustomBotTemplates();
+  const hasCustomBotTemplates = Object.keys(customBotTemplates).length > 0;
   const empty: ServerCoreCacheState = {
     version: bundled?.version || Date.now(),
     bundledVersion: bundled?.version || 0,
@@ -1617,8 +1619,8 @@ function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
       bundled && bundled.subjects.length > 0
         ? { data: bundled.subjects, fetchedAt: Date.now() }
         : null,
-    notifications: null,
-    bot_commands: null,
+    notifications: { data: [], fetchedAt: 0 },
+    bot_commands: hasCustomBotTemplates ? { data: customBotTemplates, fetchedAt: Date.now() } : null,
     onlineCount: null,
   };
   for (const cachePath of [SERVER_DISK_CACHE_PRIMARY, SERVER_DISK_CACHE_FALLBACK]) {
@@ -1650,11 +1652,11 @@ function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
               : empty.version,
           bundledVersion: bundled?.version || diskBundledVer,
           questions:
-            shouldPreferNewBundled && bundled && bundled.questions.length >= (parsed.questions?.data?.length || 0)
+            shouldPreferNewBundled && bundled
               ? { data: bundled.questions, fetchedAt: Date.now() }
               : diskQuestions,
           subjects:
-            shouldPreferNewBundled && bundled && bundled.subjects.length >= (parsed.subjects?.data?.length || 0)
+            shouldPreferNewBundled && bundled
               ? { data: bundled.subjects, fetchedAt: Date.now() }
               : diskSubjects,
           notifications: Array.isArray(parsed.notifications?.data) ? parsed.notifications : null,
@@ -1831,9 +1833,11 @@ async function getServerCachedNotifications(force = false, authHeader?: string):
     return serverCoreCache.notifications.data;
   }
   if (now < serverCoreCache.quotaCooldownUntil) {
-    const err: any = new Error('Firestore quota cooldown active');
-    err.status = 429;
-    throw err;
+    if (serverCoreCache.notifications) {
+      return serverCoreCache.notifications.data;
+    }
+    serverCoreCache.notifications = { data: [], fetchedAt: now };
+    return [];
   }
 
   const key = 'notifications';
@@ -1849,9 +1853,11 @@ async function getServerCachedNotifications(force = false, authHeader?: string):
     } catch (err: any) {
       markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.notifications) {
+        serverCoreCache.notifications.fetchedAt = Date.now();
         return serverCoreCache.notifications.data;
       }
-      throw err;
+      serverCoreCache.notifications = { data: [], fetchedAt: Date.now() };
+      return [];
     }
   })().finally(() => serverCacheInFlight.delete(key));
 
@@ -1870,9 +1876,12 @@ async function getServerCachedBotCommands(force = false, authHeader?: string): P
     return serverCoreCache.bot_commands.data;
   }
   if (now < serverCoreCache.quotaCooldownUntil) {
-    const err: any = new Error('Firestore quota cooldown active');
-    err.status = 429;
-    throw err;
+    if (serverCoreCache.bot_commands) {
+      return serverCoreCache.bot_commands.data;
+    }
+    const localTemplates = loadCustomBotTemplates();
+    serverCoreCache.bot_commands = { data: localTemplates, fetchedAt: now };
+    return localTemplates;
   }
 
   const key = 'bot_commands';
@@ -1893,9 +1902,12 @@ async function getServerCachedBotCommands(force = false, authHeader?: string): P
     } catch (err: any) {
       markQuotaCooldownIfNeeded(err);
       if (serverCoreCache.bot_commands) {
+        serverCoreCache.bot_commands.fetchedAt = Date.now();
         return serverCoreCache.bot_commands.data;
       }
-      throw err;
+      const localTemplates = loadCustomBotTemplates();
+      serverCoreCache.bot_commands = { data: localTemplates, fetchedAt: Date.now() };
+      return localTemplates;
     }
   })().finally(() => serverCacheInFlight.delete(key));
 
@@ -1932,10 +1944,17 @@ app.get('/api/cache/core', async (req, res) => {
           now - serverCoreCache.bot_commands!.fetchedAt < SERVER_CACHE_TTLS.bot_commands));
 
     if (!allowForce && hasWarmCore && since > 0 && since === serverCoreCache.version) {
+      const needMeta = req.query.needMeta === '1';
       return res.json({
         unchanged: true,
         version: serverCoreCache.version,
         quotaLimited: now < serverCoreCache.quotaCooldownUntil,
+        ...(needMeta
+          ? {
+              notifications: serverCoreCache.notifications?.data || [],
+              botCommands: serverCoreCache.bot_commands?.data || {},
+            }
+          : {}),
       });
     }
 
@@ -2708,6 +2727,15 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
   try {
     fs.mkdirSync(BUNDLED_CODE_BASE_DIR, { recursive: true });
     fs.writeFileSync(resolvedTarget, fileContent, 'utf8');
+    if (activeViteServer?.moduleGraph) {
+      const modsToInvalidate = [
+        activeViteServer.moduleGraph.getModuleById(resolvedTarget),
+        activeViteServer.moduleGraph.getModuleById(path.resolve(__dirname, 'src', 'services', 'initialData.ts')),
+      ];
+      for (const m of modsToInvalidate) {
+        if (m) activeViteServer.moduleGraph.invalidateModule(m);
+      }
+    }
   } catch (err: any) {
     const code = err?.code || '';
     const isReadOnly = code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
@@ -2754,6 +2782,8 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
   });
 });
 
+let activeViteServer: any = null;
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'Master Quiz KH' });
@@ -2762,9 +2792,35 @@ app.get('/api/health', (req, res) => {
 // Mount Vite or static dist in production
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use(
+      express.static(distDir, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          const base = path.basename(filePath);
+          if (
+            base === 'index.html' ||
+            base === 'sw.js' ||
+            base === 'registerSW.js' ||
+            base === 'manifest.webmanifest' ||
+            base.startsWith('workbox-')
+          ) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
+    app.all('/api/*', (_req, res) => {
+      res.status(404).json({ ok: false, error: 'API endpoint not found' });
+    });
+    app.get('/assets/*', (_req, res) => {
+      res.status(404).send('Asset not found');
+    });
+    app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
     const { createServer: createViteServer } = await import('vite');
@@ -2776,6 +2832,7 @@ async function startServer() {
       },
       appType: 'spa',
     });
+    activeViteServer = vite;
 
     // Suppress Vite HMR WebSocket attempts when HMR is disabled in AI Studio / Cloud Run preview
     app.get('/@vite/client', async (_req, res, next) => {

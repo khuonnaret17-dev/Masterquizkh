@@ -59,6 +59,7 @@ import {
 import { syncTelegramBotTemplates } from './telegram';
 import {
   hydrateCacheFromIdb,
+  isCacheHydratedFromIdb,
   getCachedValue,
   hasCachedValue,
   setCachedValue,
@@ -384,6 +385,7 @@ const normTextKey = (val?: string) => String(val || '').trim().toLowerCase().rep
 let lastHydratedBundledVer = 0;
 
 function ensureBundledCodeDataHydrated() {
+  if (!isCacheHydratedFromIdb()) return;
   const savedVer = getLocal<number>(STORAGE_KEYS.BUNDLED_REVISION, 0);
   const currentQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
   const currentSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
@@ -401,51 +403,27 @@ function ensureBundledCodeDataHydrated() {
     return;
   }
 
-  if (needsInitialS) {
+  if ((needsInitialS || hasNewBundledVersion) && INITIAL_SUBJECTS.length > 0) {
     const sortedS = sortSubjects([...INITIAL_SUBJECTS]);
     setLocal(STORAGE_KEYS.SUBJECTS, sortedS);
     setSyncTimestamp('SUBJECTS');
     window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedS }));
-  } else if (hasNewBundledVersion && INITIAL_SUBJECTS.length > 0) {
-    const existingIds = new Set(currentSubjects.map((s) => s.id));
-    const existingNames = new Set(currentSubjects.map((s) => normTextKey(s.name)));
-    const additions = INITIAL_SUBJECTS.filter(
-      (s) => !existingIds.has(s.id) && !existingNames.has(normTextKey(s.name))
-    );
-    if (additions.length > 0) {
-      const mergedS = sortSubjects([...currentSubjects, ...additions]);
-      setLocal(STORAGE_KEYS.SUBJECTS, mergedS);
-      setSyncTimestamp('SUBJECTS');
-      window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: mergedS }));
-    }
   }
 
-  if (needsInitialQ) {
+  if ((needsInitialQ || hasNewBundledVersion) && INITIAL_QUESTIONS.length > 0) {
     const sortedQ = sortQuestions([...INITIAL_QUESTIONS]);
     setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
     setSyncTimestamp('QUESTIONS');
     window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
-  } else if (hasNewBundledVersion && INITIAL_QUESTIONS.length > 0) {
-    const existingIds = new Set(currentQuestions.map((q) => q.id).filter(Boolean));
-    const existingKeys = new Set(
-      currentQuestions.map((q) => `${normTextKey(q.subject)}|||${normTextKey(q.question)}`)
-    );
-    const additions = INITIAL_QUESTIONS.filter((q) => {
-      if (q.id && existingIds.has(q.id)) return false;
-      const key = `${normTextKey(q.subject)}|||${normTextKey(q.question)}`;
-      return !existingKeys.has(key);
-    });
-    if (additions.length > 0) {
-      const mergedQ = sortQuestions([...currentQuestions, ...additions]);
-      setLocal(STORAGE_KEYS.QUESTIONS, mergedQ);
-      setSyncTimestamp('QUESTIONS');
-      window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: mergedQ }));
-    }
   }
 
   if (INITIAL_BUNDLED_VERSION > 0) {
     lastHydratedBundledVer = INITIAL_BUNDLED_VERSION;
     setLocal(STORAGE_KEYS.BUNDLED_REVISION, INITIAL_BUNDLED_VERSION);
+    const prevCoreVer = getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0);
+    if (INITIAL_BUNDLED_VERSION > prevCoreVer) {
+      setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, INITIAL_BUNDLED_VERSION);
+    }
   }
 }
 
@@ -768,17 +746,19 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
       const localQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
       const localSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
       const localBotCommands = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
-      const hasAllLocal =
-        localQuestions.length > 0 &&
-        localSubjects.length > 0 &&
-        Object.keys(localBotCommands).length > 0;
-      const savedVersion = hasAllLocal
-        ? getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0)
+      const hasCoreCatalog = localQuestions.length > 0 && localSubjects.length > 0;
+      const needMeta =
+        Object.keys(localBotCommands).length === 0 || !hasCachedValue(STORAGE_KEYS.NOTIFICATIONS);
+      const savedVersion = hasCoreCatalog
+        ? Math.max(getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0), INITIAL_BUNDLED_VERSION)
         : 0;
 
       const params = new URLSearchParams();
       if (force) params.set('force', '1');
-      if (useSince && !force && savedVersion > 0) params.set('since', String(savedVersion));
+      if (useSince && !force && savedVersion > 0) {
+        params.set('since', String(savedVersion));
+        if (needMeta) params.set('needMeta', '1');
+      }
 
       const authHeader = await getAuthBearerHeader();
       const headers: Record<string, string> = {};
@@ -811,6 +791,20 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
           payload = retry.payload;
           if (!res.ok || !payload) return false;
         } else {
+          if (Array.isArray(payload?.notifications)) {
+            const notifs = resolveNotificationsWithDismissed(payload.notifications);
+            setLocal(STORAGE_KEYS.NOTIFICATIONS, notifs);
+            window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: notifs }));
+          }
+          if (payload?.botCommands && typeof payload.botCommands === 'object') {
+            setLocal(STORAGE_KEYS.BOT_COMMANDS, payload.botCommands);
+            window.dispatchEvent(
+              new CustomEvent('mpq-bot-commands-changed', { detail: payload.botCommands })
+            );
+          }
+          if (typeof payload?.version === 'number') {
+            setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, payload.version);
+          }
           setSyncTimestamp('CORE_CHECK');
           setSyncTimestamp('QUESTIONS');
           setSyncTimestamp('SUBJECTS');
@@ -821,17 +815,33 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
       }
 
       if (Array.isArray(payload?.questions) && payload.questions.length > 0) {
-        const sortedQ = sortQuestions(payload.questions);
-        setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
-        setSyncTimestamp('QUESTIONS');
-        window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
+        const existingLocalQ = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+        const isOlderStarterDowngrade =
+          typeof payload?.version === 'number' &&
+          INITIAL_BUNDLED_VERSION > 0 &&
+          payload.version < INITIAL_BUNDLED_VERSION &&
+          payload.questions.length < existingLocalQ.length;
+        if (!isOlderStarterDowngrade) {
+          const sortedQ = sortQuestions(payload.questions);
+          setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
+          setSyncTimestamp('QUESTIONS');
+          window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
+        }
       }
 
       if (Array.isArray(payload?.subjects) && payload.subjects.length > 0) {
-        const sortedSub = sortSubjects(payload.subjects);
-        setLocal(STORAGE_KEYS.SUBJECTS, sortedSub);
-        setSyncTimestamp('SUBJECTS');
-        window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedSub }));
+        const existingLocalS = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+        const isOlderStarterDowngradeS =
+          typeof payload?.version === 'number' &&
+          INITIAL_BUNDLED_VERSION > 0 &&
+          payload.version < INITIAL_BUNDLED_VERSION &&
+          payload.subjects.length < existingLocalS.length;
+        if (!isOlderStarterDowngradeS) {
+          const sortedSub = sortSubjects(payload.subjects);
+          setLocal(STORAGE_KEYS.SUBJECTS, sortedSub);
+          setSyncTimestamp('SUBJECTS');
+          window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedSub }));
+        }
       }
 
       if (Array.isArray(payload?.notifications)) {
@@ -941,7 +951,6 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
 }
 
 export function subscribeQuestions(callback: (questions: Question[]) => void) {
-  ensureBundledCodeDataHydrated();
   const cached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   if (cached.length > 0) {
     callback(cached);
@@ -1050,7 +1059,6 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
 }
 
 export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
-  ensureBundledCodeDataHydrated();
   const cached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   if (cached.length > 0) {
     callback(cached);
@@ -1579,6 +1587,30 @@ function sanitizeData<T extends Record<string, any>>(obj: T): T {
   return result;
 }
 
+let autoSyncCodeStoreTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleAutoSyncCodeStore() {
+  if (typeof window === 'undefined') return;
+  if (!inMemoryAdminToken && !auth.currentUser) return;
+  if (autoSyncCodeStoreTimer) {
+    clearTimeout(autoSyncCodeStoreTimer);
+  }
+  autoSyncCodeStoreTimer = setTimeout(() => {
+    autoSyncCodeStoreTimer = null;
+    const latestQuestions = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+    const latestSubjects = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+    if (latestQuestions.length === 0) return;
+    void saveAllToCodeStore({
+      questions: latestQuestions,
+      subjects: latestSubjects,
+    }).then((res) => {
+      if (res.ok) {
+        window.dispatchEvent(new CustomEvent('mpq-code-store-synced', { detail: res }));
+      }
+    });
+  }, 1200);
+}
+
 export async function addQuestion(q: Omit<Question, 'id'>) {
   const id = `q-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const cleanQ = sanitizeData(q);
@@ -1591,6 +1623,7 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
   syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
   adjustGlobalStat('questionsCount', 1);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1620,6 +1653,7 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
   syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
   adjustGlobalStat('questionsCount', created.length);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1655,6 +1689,7 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
   if (updatedItem) {
     syncMutationToServerCache('questions', { action: 'upsert', item: updatedItem });
   }
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1674,6 +1709,7 @@ export async function deleteQuestion(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
   syncMutationToServerCache('questions', { action: 'delete', id });
   adjustGlobalStat('questionsCount', -1);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1697,6 +1733,7 @@ export async function deleteQuestionsBatch(ids: string[]): Promise<number> {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
   syncMutationToServerCache('questions', { action: 'deleteMany', ids: uniqueIds });
   adjustGlobalStat('questionsCount', -uniqueIds.length);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     const CHUNK_SIZE = 450;
@@ -1766,6 +1803,7 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
   syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
   adjustGlobalStat('subjectsCount', 1);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1790,6 +1828,7 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   if (updatedSub) {
     syncMutationToServerCache('subjects', { action: 'upsert', item: updatedSub });
   }
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1817,6 +1856,7 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
   if (changed.length === 0) return normalized;
 
   syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {
@@ -1891,6 +1931,7 @@ export async function deleteSubject(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
   syncMutationToServerCache('subjects', { action: 'delete', id });
   adjustGlobalStat('subjectsCount', -1);
+  scheduleAutoSyncCodeStore();
 
   if (auth.currentUser && !isQuotaCooldownActive(false)) {
     try {

@@ -32,6 +32,7 @@ import {
   fetchSubjectsCached,
   signInWithGoogle,
   startCoreRealtimeSync,
+  setAdminSessionToken,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
 import {
@@ -379,6 +380,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    setAdminSessionToken(null);
     setSession(null);
     setActiveQuizQuestions(null);
     setActiveQuizContext(null);

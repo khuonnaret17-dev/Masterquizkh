@@ -58,8 +58,11 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          cleanupOutdatedCaches: true,
+          skipWaiting: true,
+          clientsClaim: true,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+          maximumFileSizeToCacheInBytes: 20 * 1024 * 1024,
           navigateFallbackDenylist: [/^\/api\//, /^\/s\//],
           runtimeCaching: [
             {
@@ -97,7 +100,7 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: false,
           type: 'module',
         },
       }),

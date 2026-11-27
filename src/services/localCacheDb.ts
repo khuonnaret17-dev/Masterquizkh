@@ -34,6 +34,10 @@ function openCacheDb(): Promise<IDBDatabase | null> {
   return dbPromise;
 }
 
+export function isCacheHydratedFromIdb(): boolean {
+  return hydrated;
+}
+
 export async function hydrateCacheFromIdb(): Promise<void> {
   if (hydrated) return;
   if (hydratePromise) return hydratePromise;

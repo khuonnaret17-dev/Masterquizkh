@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, CheckCircle2, Eye, EyeOff } from 'lucide-react';
-import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid, setAdminSessionToken } from '../services/firebase';
+import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, Eye, EyeOff } from 'lucide-react';
+import { recordLogin, subscribeBotCommands, checkIsUserPaid, setAdminSessionToken } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
@@ -22,14 +22,11 @@ interface LandingPageProps {
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   onLoginSuccess,
-  firebaseUserEmail = null,
 }) => {
   const [activeModal, setActiveModal] = useState<'member' | 'admin' | null>(null);
   const [currentTheme, setCurrentTheme] = useState<AppThemeId>(() => getStoredTheme());
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
-  const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
-  const [googleAuthError, setGoogleAuthError] = useState('');
 
   const tgUser = getTelegramMiniAppUser();
 
@@ -204,19 +201,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       setAdminError(err?.message || 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។');
     } finally {
       setIsCheckingAdmin(false);
-    }
-  };
-
-  const handleConnectGoogle = async () => {
-    if (isGoogleSigningIn) return;
-    setGoogleAuthError('');
-    setIsGoogleSigningIn(true);
-    try {
-      await signInWithGoogle();
-    } catch (err: any) {
-      setGoogleAuthError(err?.message || 'មិនអាចភ្ជាប់គណនី Google បានទេ។ សូមសាកល្បងម្ដងទៀត!');
-    } finally {
-      setIsGoogleSigningIn(false);
     }
   };
 
@@ -483,36 +467,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <ArrowRight className="w-4 h-4" />
               </button>
             </form>
-
-            <div className="mt-4 p-3 rounded-xl app-subcard border app-border">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="text-xs font-bold app-text-primary flex items-center gap-1.5">
-                    {firebaseUserEmail ? (
-                      <>
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                        <span className="truncate">បានភ្ជាប់ Google Sync ({firebaseUserEmail})</span>
-                      </>
-                    ) : (
-                      <span>ភ្ជាប់ Google ដើម្បីទាញសំណួរថ្មីៗពី Cloud</span>
-                    )}
-                  </p>
-                </div>
-                {!firebaseUserEmail && (
-                  <button
-                    type="button"
-                    disabled={isGoogleSigningIn}
-                    onClick={handleConnectGoogle}
-                    className="px-3 py-1.5 rounded-lg app-card border app-border text-xs font-bold khmer-accent-text hover:opacity-85 disabled:opacity-60 transition shrink-0 cursor-pointer"
-                  >
-                    {isGoogleSigningIn ? 'កំពុងភ្ជាប់...' : 'ភ្ជាប់ Google'}
-                  </button>
-                )}
-              </div>
-              {googleAuthError && (
-                <p className="text-xs text-red-600 dark:text-red-400 mt-1.5">{googleAuthError}</p>
-              )}
-            </div>
 
             <div className="mt-6 pt-4 border-t app-border text-center">
               <p className="text-sm app-text-secondary mb-3">មិនទាន់ចេះចុះឈ្មោះ ឬមិនទាន់មានលេខសម្ងាត់សមាជិក?</p>

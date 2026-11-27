@@ -360,7 +360,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
             ))}
           </div>
 
-          {/* Partial or Missing Question Data Recovery Banner */}
+          {/* Missing Question Data Recovery Banner */}
           {!isSyncingCore && activeSubjects.length > 0 && questions.length === 0 && (
             <div className="rounded-2xl khmer-frame-card border-amber-500/40 bg-amber-500/10 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-start gap-3">
@@ -370,9 +370,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                     ទិន្នន័យសំណួរមិនទាន់បានផ្ទុកចូលទូរស័ព្ទនេះពេញលេញទេ
                   </h4>
                   <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
-                    {!firebaseUserEmail
-                      ? 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ឬភ្ជាប់គណនី Google ដើម្បីផ្ទុកសំណួរទាំងអស់ចូលមុខវិជ្ជានីមួយៗ។'
-                      : 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ដើម្បីទាញយកសំណួរទាំងអស់ពី Cloud មកប្រើប្រាស់។'}
+                    សូមចុច «ទាញទិន្នន័យឡើងវិញ» ដើម្បីផ្ទុកសំណួរទាំងអស់ចូលមុខវិជ្ជានីមួយៗ។
                   </p>
                 </div>
               </div>
@@ -387,7 +385,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                     <span>ទាញទិន្នន័យឡើងវិញ</span>
                   </button>
                 )}
-                {!firebaseUserEmail && onConnectGoogle && (
+                {session.role === 'admin' && !firebaseUserEmail && onConnectGoogle && (
                   <button
                     type="button"
                     onClick={() => void onConnectGoogle()}
@@ -400,42 +398,6 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
               </div>
             </div>
           )}
-
-          {!isSyncingCore &&
-            questions.length > 0 &&
-            typeof globalStats?.questionsCount === 'number' &&
-            questions.length < globalStats.questionsCount && (
-              <div className="rounded-2xl app-subcard border app-border px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                <p className="text-xs sm:text-sm app-text-secondary">
-                  ទិន្នន័យក្នុងឧបករណ៍នេះមាន{' '}
-                  <strong className="app-text-primary">{toKhmerNum(questions.length)}</strong> /{' '}
-                  <strong className="khmer-accent-text">{toKhmerNum(globalStats.questionsCount)}</strong>{' '}
-                  សំណួរ។ ចុចប៊ូតុងដើម្បីផ្ទុកសំណួរឱ្យគ្រប់ចំនួន។
-                </p>
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  {onSyncNow && (
-                    <button
-                      type="button"
-                      onClick={() => void onSyncNow()}
-                      className="min-h-[36px] px-3 py-1.5 rounded-xl khmer-btn-primary text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5 shrink-0" />
-                      <span>ទាញសំណួរឱ្យគ្រប់</span>
-                    </button>
-                  )}
-                  {!firebaseUserEmail && onConnectGoogle && (
-                    <button
-                      type="button"
-                      onClick={() => void onConnectGoogle()}
-                      className="min-h-[36px] px-3 py-1.5 rounded-xl app-card border app-border text-xs font-semibold khmer-accent-text hover:opacity-85 flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Cloud className="w-3.5 h-3.5 shrink-0" />
-                      <span>ភ្ជាប់ Google Sync</span>
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
 
           {/* Subjects Grid */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
@@ -521,9 +483,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                     មិនទាន់មានមុខវិជ្ជា ឬវិញ្ញាសាក្នុងទូរស័ព្ទនេះនៅឡើយទេ
                   </h4>
                   <p className="text-sm app-text-secondary max-w-md mx-auto mb-5 leading-relaxed">
-                    {!firebaseUserEmail
-                      ? 'សម្រាប់ការបើកពី Home Screen លើកដំបូង សូមចុចទាញទិន្នន័យ ឬភ្ជាប់គណនី Google ដើម្បីផ្ទុកវិញ្ញាសាទាំងអស់ចូលកម្មវិធី។'
-                      : 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ឬអ្នកគ្រប់គ្រងអាចបញ្ចូលមុខវិជ្ជាថ្មីក្នុងផ្ទាំង «គ្រប់គ្រង»។'}
+                    សូមចុច «ទាញទិន្នន័យឡើងវិញ» ដើម្បីផ្ទុកវិញ្ញាសាទាំងអស់ចូលកម្មវិធី។
                   </p>
                   <div className="flex flex-wrap items-center justify-center gap-2.5">
                     {onSyncNow && (
@@ -536,7 +496,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                         <span>ទាញទិន្នន័យឡើងវិញ</span>
                       </button>
                     )}
-                    {!firebaseUserEmail && onConnectGoogle && (
+                    {session.role === 'admin' && !firebaseUserEmail && onConnectGoogle && (
                       <button
                         type="button"
                         onClick={() => void onConnectGoogle()}
