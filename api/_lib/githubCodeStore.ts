@@ -467,9 +467,152 @@ export async function fetchLatestBundledStore(force = false): Promise<{
   }
 }
 
-async function fetchGitHubFileSha(cfg: GitHubStoreConfig): Promise<string | undefined> {
+async function resolveDefaultBranchIfMissing(cfg: GitHubStoreConfig): Promise<string | null> {
+  try {
+    const repoUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}`;
+    const res = await fetch(repoUrl, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${cfg.token}`,
+        'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return typeof data?.default_branch === 'string' && data.default_branch.trim()
+      ? data.default_branch.trim()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function testGitHubConnection(): Promise<{
+  ok: boolean;
+  configured: boolean;
+  hasToken: boolean;
+  hasRepo: boolean;
+  missingVars: string[];
+  githubRepo: string | null;
+  githubBranch: string;
+  defaultBranch?: string | null;
+  canPush?: boolean;
+  statusCode?: number;
+  error?: string;
+}> {
+  const cfg = getGitHubStoreConfig();
+  if (!cfg.configured) {
+    return {
+      ok: false,
+      configured: false,
+      hasToken: cfg.hasToken,
+      hasRepo: cfg.hasRepo,
+      missingVars: cfg.missingVars,
+      githubRepo: cfg.fullRepo || null,
+      githubBranch: cfg.branch,
+      error: formatGitHubMissingError(cfg),
+    };
+  }
+
+  try {
+    const repoUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}`;
+    const res = await fetch(repoUrl, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${cfg.token}`,
+        'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      cache: 'no-store',
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      const ghMsg = typeof data?.message === 'string' ? data.message : `HTTP ${res.status}`;
+      let khError = `តភ្ជាប់ GitHub មិនជោគជ័យ (${ghMsg})`;
+      if (res.status === 401) {
+        khError = 'GITHUB_TOKEN មិនត្រឹមត្រូវ ឬផុតកំណត់ (401 Bad credentials) — សូមបង្កើត Token ថ្មី!';
+      } else if (res.status === 404) {
+        khError = `រកមិនឃើញ Repository «${cfg.fullRepo}» ទេ (404) ឬ Token គ្មានសិទ្ធិចូល Repo នេះ!`;
+      } else if (res.status === 403) {
+        khError = `GITHUB_TOKEN គ្មានសិទ្ធិចូល Repository «${cfg.fullRepo}» ទេ (403 Forbidden)!`;
+      }
+      return {
+        ok: false,
+        configured: true,
+        hasToken: true,
+        hasRepo: true,
+        missingVars: [],
+        githubRepo: cfg.fullRepo,
+        githubBranch: cfg.branch,
+        statusCode: res.status,
+        error: khError,
+      };
+    }
+
+    const canPush = data?.permissions?.push === true || data?.permissions?.admin === true || data?.permissions?.maintain === true;
+    const defaultBranch = typeof data?.default_branch === 'string' ? data.default_branch : cfg.branch;
+
+    // Fine-grained tokens don't always populate data.permissions.push on GET /repos; verify contents read as well
+    const dirRes = await fetch(
+      `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/src/data?ref=${encodeURIComponent(cfg.branch)}`,
+      {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${cfg.token}`,
+          'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        cache: 'no-store',
+      }
+    );
+
+    if (!dirRes.ok && defaultBranch !== cfg.branch && !cleanEnvValue(process.env.GITHUB_BRANCH)) {
+      return {
+        ok: false,
+        configured: true,
+        hasToken: true,
+        hasRepo: true,
+        missingVars: [],
+        githubRepo: cfg.fullRepo,
+        githubBranch: cfg.branch,
+        defaultBranch,
+        canPush,
+        statusCode: dirRes.status,
+        error: `Branch «${cfg.branch}» មិនមានក្នុង Repo ទេ (Default branch គឺ «${defaultBranch}») — សូមកំណត់ GITHUB_BRANCH=${defaultBranch} លើ Vercel!`,
+      };
+    }
+
+    return {
+      ok: true,
+      configured: true,
+      hasToken: true,
+      hasRepo: true,
+      missingVars: [],
+      githubRepo: cfg.fullRepo,
+      githubBranch: cfg.branch,
+      defaultBranch,
+      canPush,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      configured: true,
+      hasToken: true,
+      hasRepo: true,
+      missingVars: [],
+      githubRepo: cfg.fullRepo,
+      githubBranch: cfg.branch,
+      error: `មិនអាចតភ្ជាប់ទៅ GitHub API បានទេ៖ ${err?.message || 'Network error'}`,
+    };
+  }
+}
+
+async function fetchGitHubFileSha(cfg: GitHubStoreConfig, branchOverride?: string): Promise<string | undefined> {
+  const targetBranch = branchOverride || cfg.branch;
   // List parent directory (src/data) to obtain exact blob SHA reliably even when file > 1MB
-  const dirUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/src/data?ref=${encodeURIComponent(cfg.branch)}`;
+  const dirUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/src/data?ref=${encodeURIComponent(targetBranch)}`;
   const res = await fetch(dirUrl, {
     headers: {
       Accept: 'application/vnd.github+json',
@@ -483,7 +626,9 @@ async function fetchGitHubFileSha(cfg: GitHubStoreConfig): Promise<string | unde
   if (res.status === 404) return undefined;
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`GitHub metadata HTTP ${res.status}: ${txt.slice(0, 160)}`);
+    const err: any = new Error(`GitHub metadata HTTP ${res.status}: ${txt.slice(0, 160)}`);
+    err.status = res.status;
+    throw err;
   }
 
   const list = await res.json().catch(() => null);
@@ -508,7 +653,7 @@ export async function saveBundledStoreToGitHub(payload: BundledCodeStoreData): P
       ok: false,
       githubRepo: cfg.fullRepo,
       githubBranch: cfg.branch,
-      error: 'មិនទាន់បានកំណត់ GITHUB_TOKEN ឬ GITHUB_REPO លើ Vercel នៅឡើយទេ។',
+      error: formatGitHubMissingError(cfg),
     };
   }
 
@@ -517,67 +662,94 @@ export async function saveBundledStoreToGitHub(payload: BundledCodeStoreData): P
   const putUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${cfg.filePath}`;
   const commitMessage = `chore(quiz): sync ${payload.questions.length} questions, ${payload.subjects.length} subjects [v${payload.version}]`;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const sha = await fetchGitHubFileSha(cfg);
-    const bodyPayload: Record<string, any> = {
-      message: commitMessage,
-      content: contentBase64,
-      branch: cfg.branch,
-    };
-    if (sha) {
-      bodyPayload.sha = sha;
-    }
+  let activeBranch = cfg.branch;
 
-    const res = await fetch(putUrl, {
-      method: 'PUT',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.token}`,
-        'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-      body: JSON.stringify(bodyPayload),
-    });
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let sha = await fetchGitHubFileSha(cfg, activeBranch);
+      if (!sha && attempt === 0 && !cleanEnvValue(process.env.GITHUB_BRANCH)) {
+        const detectedDefault = await resolveDefaultBranchIfMissing(cfg);
+        if (detectedDefault && detectedDefault !== activeBranch) {
+          activeBranch = detectedDefault;
+          sha = await fetchGitHubFileSha(cfg, activeBranch);
+        }
+      }
 
-    if (res.status === 409 && attempt < 2) {
-      // Concurrent write conflict — retry with fresh SHA
-      continue;
-    }
+      const bodyPayload: Record<string, any> = {
+        message: commitMessage,
+        content: contentBase64,
+        branch: activeBranch,
+      };
+      if (sha) {
+        bodyPayload.sha = sha;
+      }
 
-    const data = await res.json().catch(() => null);
-    if (!res.ok) {
-      const ghMsg =
-        typeof data?.message === 'string' ? data.message : `GitHub HTTP ${res.status}`;
+      const res = await fetch(putUrl, {
+        method: 'PUT',
+        headers: {
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.token}`,
+          'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      if (res.status === 409 && attempt < 2) {
+        // Concurrent write conflict — retry with fresh SHA
+        continue;
+      }
+
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        const ghMsg =
+          typeof data?.message === 'string' ? data.message : `GitHub HTTP ${res.status}`;
+        let hint = 'សូមពិនិត្យសិទ្ធិ Contents: Read & Write របស់ GITHUB_TOKEN។';
+        if (res.status === 401) {
+          hint = 'GITHUB_TOKEN មិនត្រឹមត្រូវ ឬផុតកំណត់។';
+        } else if (res.status === 404) {
+          hint = `រកមិនឃើញ Repo «${cfg.fullRepo}» ឬ Branch «${activeBranch}» ទេ — សូមពិនិត្យ GITHUB_REPO និង GITHUB_BRANCH!`;
+        } else if (res.status === 403) {
+          hint = 'Token គ្មានសិទ្ធិ Write ទៅ Repo នេះទេ (ត្រូវបើក Contents: Read and write)។';
+        }
+        return {
+          ok: false,
+          githubRepo: cfg.fullRepo,
+          githubBranch: activeBranch,
+          error: `បរាជ័យក្នុងការរក្សាទុកទៅ GitHub (${ghMsg}) — ${hint}`,
+        };
+      }
+
+      const cacheKey = `${cfg.fullRepo}@${activeBranch}`;
+      remoteCache = {
+        cacheKey,
+        etag: null,
+        checkedAt: Date.now(),
+        data: payload,
+      };
+
       return {
-        ok: false,
+        ok: true,
+        commitUrl: data?.commit?.html_url || undefined,
+        commitSha: data?.commit?.sha || undefined,
         githubRepo: cfg.fullRepo,
-        githubBranch: cfg.branch,
-        error: `បរាជ័យក្នុងការរក្សាទុកទៅ GitHub (${ghMsg}) — សូមពិនិត្យសិទ្ធិ Contents: Read & Write របស់ GITHUB_TOKEN។`,
+        githubBranch: activeBranch,
       };
     }
 
-    const cacheKey = `${cfg.fullRepo}@${cfg.branch}`;
-    remoteCache = {
-      cacheKey,
-      etag: null,
-      checkedAt: Date.now(),
-      data: payload,
-    };
-
     return {
-      ok: true,
-      commitUrl: data?.commit?.html_url || undefined,
-      commitSha: data?.commit?.sha || undefined,
+      ok: false,
       githubRepo: cfg.fullRepo,
-      githubBranch: cfg.branch,
+      githubBranch: activeBranch,
+      error: 'មានការប៉ះទង្គិចទិន្នន័យលើ GitHub (409 Conflict) — សូមព្យាយាមម្ដងទៀត!',
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      githubRepo: cfg.fullRepo,
+      githubBranch: activeBranch,
+      error: `បរាជ័យក្នុងការតភ្ជាប់ទៅ GitHub (${err?.message || 'Network error'}) — សូមពិនិត្យ GITHUB_TOKEN និង GITHUB_REPO ម្ដងទៀត!`,
     };
   }
-
-  return {
-    ok: false,
-    githubRepo: cfg.fullRepo,
-    githubBranch: cfg.branch,
-    error: 'មានការប៉ះទង្គិចទិន្នន័យលើ GitHub (409 Conflict) — សូមព្យាយាមម្ដងទៀត!',
-  };
 }

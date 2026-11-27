@@ -3168,6 +3168,11 @@ export interface CodeStoreStatus {
   githubRepo?: string | null;
   githubBranch?: string | null;
   storageMode?: 'github' | 'disk' | 'hybrid' | 'readonly';
+  githubReachable?: boolean;
+  githubCheckError?: string | null;
+  canPush?: boolean;
+  defaultBranch?: string | null;
+  statusError?: string | null;
 }
 
 export interface SaveToCodeStoreResult {
@@ -3192,13 +3197,14 @@ export interface SaveToCodeStoreResult {
   error?: string;
 }
 
-export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
+export async function fetchCodeStoreStatus(checkGitHub = false): Promise<CodeStoreStatus> {
+  const endpoint = `/api/code-store/status${checkGitHub ? '?check=github' : ''}`;
   try {
-    const res = await fetch('/api/code-store/status', { cache: 'no-store' });
+    const res = await fetch(endpoint, { cache: 'no-store' });
     const contentType = res.headers.get('content-type') || '';
-    if (res.ok && contentType.includes('application/json')) {
-      const data = await res.json();
-      if (data?.ok) {
+    if (contentType.includes('application/json')) {
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.ok) {
         return {
           version: Number(data.version || INITIAL_BUNDLED_VERSION),
           updatedAt: data.updatedAt || null,
@@ -3212,21 +3218,64 @@ export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
           githubRepo: data.githubRepo || null,
           githubBranch: data.githubBranch || null,
           storageMode: data.storageMode,
+          githubReachable:
+            typeof data.githubReachable === 'boolean' ? data.githubReachable : undefined,
+          githubCheckError:
+            typeof data.githubCheckError === 'string' ? data.githubCheckError : null,
+          canPush: typeof data.canPush === 'boolean' ? data.canPush : undefined,
+          defaultBranch: typeof data.defaultBranch === 'string' ? data.defaultBranch : null,
+          statusError: typeof data.warning === 'string' ? data.warning : null,
         };
       }
+      const errText =
+        typeof data?.error === 'string' && data.error
+          ? data.error
+          : `API Status Error (HTTP ${res.status})`;
+      return {
+        version: INITIAL_BUNDLED_VERSION,
+        updatedAt: null,
+        subjectsCount: INITIAL_SUBJECTS.length,
+        questionsCount: INITIAL_QUESTIONS.length,
+        writable: false,
+        githubConfigured: false,
+        storageMode: 'readonly',
+        statusError: errText,
+      };
     }
-  } catch {
-    // Static hosting / offline fallback
+
+    const rawSnippet = (await res.text().catch(() => ''))
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 140);
+
+    const statusError =
+      res.status >= 400
+        ? `API /api/code-store/status បរាជ័យ (HTTP ${res.status})${rawSnippet ? `: ${rawSnippet}` : ' — សូមពិនិត្យថា Vercel មាន Folder /api និង Redeploy ម្ដងទៀត!'}`
+        : 'Hosting នេះកំពុងដំណើរការជា Static (មិនមាន Vercel Serverless /api/code-store/status ទេ)';
+
+    return {
+      version: INITIAL_BUNDLED_VERSION,
+      updatedAt: null,
+      subjectsCount: INITIAL_SUBJECTS.length,
+      questionsCount: INITIAL_QUESTIONS.length,
+      writable: false,
+      githubConfigured: false,
+      storageMode: 'readonly',
+      statusError,
+    };
+  } catch (err: any) {
+    return {
+      version: INITIAL_BUNDLED_VERSION,
+      updatedAt: null,
+      subjectsCount: INITIAL_SUBJECTS.length,
+      questionsCount: INITIAL_QUESTIONS.length,
+      writable: false,
+      githubConfigured: false,
+      storageMode: 'readonly',
+      statusError: `មិនអាចតភ្ជាប់ទៅ /api/code-store/status បានទេ៖ ${err?.message || 'Network error'}`,
+    };
   }
-  return {
-    version: INITIAL_BUNDLED_VERSION,
-    updatedAt: null,
-    subjectsCount: INITIAL_SUBJECTS.length,
-    questionsCount: INITIAL_QUESTIONS.length,
-    writable: false,
-    githubConfigured: false,
-    storageMode: 'readonly',
-  };
 }
 
 export async function saveAllToCodeStore(params: {
@@ -3265,6 +3314,23 @@ export async function saveAllToCodeStore(params: {
       : null;
 
     if (!data) {
+      if (res.status === 413) {
+        return {
+          ok: false,
+          error: 'ទំហំទិន្នន័យលើសកម្រិត Vercel (4.5 MB)! សូមពិនិត្យទំហំសំណួរ។',
+        };
+      }
+
+      const rawText = await res.text().catch(() => '');
+      const cleanSnippet = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+
+      if (res.status >= 400) {
+        return {
+          ok: false,
+          error: `Serverless API /api/code-store/save បរាជ័យ (HTTP ${res.status})${cleanSnippet ? `: ${cleanSnippet}` : ' — សូមពិនិត្យថាបាន Deploy Folder /api ទៅ GitHub/Vercel រួចរាល់!'}`,
+        };
+      }
+
       return {
         ok: false,
         readOnly: true,
@@ -3283,11 +3349,10 @@ export async function saveAllToCodeStore(params: {
     }
 
     return data as SaveToCodeStoreResult;
-  } catch {
+  } catch (err: any) {
     return {
       ok: false,
-      readOnly: true,
-      error: 'មិនអាចតភ្ជាប់ទៅ Server ដើម្បីរក្សាទុកចូល Code បានទេ — សូមទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ។',
+      error: `មិនអាចតភ្ជាប់ទៅ Server (/api/code-store/save) បានទេ៖ ${err?.message || 'សូមពិនិត្យអ៊ីនធឺណិត ឬស្ថានភាព Vercel Deployment'}`,
     };
   }
 }

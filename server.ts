@@ -9,6 +9,7 @@ import {
   getGitHubStoreConfig,
   renderBundledQuestionsTsContent,
   saveBundledStoreToGitHub,
+  testGitHubConnection,
 } from './api/_lib/githubCodeStore.ts';
 
 dotenv.config();
@@ -2540,10 +2541,12 @@ app.post('/api/admin/verify-passcode', (req, res) => {
   res.json({ success: true, adminToken });
 });
 
-app.get('/api/code-store/status', (_req, res) => {
+app.get('/api/code-store/status', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const bundled = loadBundledCodeStoreFromDisk();
   const ghCfg = getGitHubStoreConfig();
+  const checkGithub = req.query.check === 'github';
+  const checkResult = checkGithub ? await testGitHubConnection() : null;
   let diskWritable = false;
   try {
     fs.accessSync(BUNDLED_CODE_STORE_PATH, fs.constants.W_OK);
@@ -2565,6 +2568,14 @@ app.get('/api/code-store/status', (_req, res) => {
     githubRepo: ghCfg.fullRepo || null,
     githubBranch: ghCfg.branch || null,
     storageMode: ghCfg.configured ? (diskWritable ? 'hybrid' : 'github') : diskWritable ? 'disk' : 'readonly',
+    ...(checkResult
+      ? {
+          githubReachable: checkResult.ok,
+          githubCheckError: checkResult.error || null,
+          canPush: checkResult.canPush,
+          defaultBranch: checkResult.defaultBranch || null,
+        }
+      : {}),
   });
 });
 

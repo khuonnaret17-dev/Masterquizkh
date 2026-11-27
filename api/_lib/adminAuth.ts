@@ -14,11 +14,11 @@ function getAdminSessionSecret(): string {
   if (explicit) return explicit;
 
   // Deterministic across stateless Vercel serverless containers when GitHub sync secret is set
-  const ghToken = (process.env.GITHUB_TOKEN || '').trim();
-  if (ghToken) {
+  const rawGh = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '').trim().replace(/^["']+|["']+$/g, '').trim();
+  if (rawGh) {
     return crypto
       .createHmac('sha256', 'mpq-vercel-admin-session-v1')
-      .update(ghToken)
+      .update(rawGh)
       .digest('hex');
   }
 

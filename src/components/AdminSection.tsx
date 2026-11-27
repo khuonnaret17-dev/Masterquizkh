@@ -2258,14 +2258,19 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   // Built-in Code Store State & Handlers (src/data/bundledQuestions.ts)
   const [codeStoreStatus, setCodeStoreStatus] = useState<CodeStoreStatus | null>(null);
   const [isSavingToCodeStore, setIsSavingToCodeStore] = useState(false);
+  const [isTestingGitHub, setIsTestingGitHub] = useState(false);
   const [codeStoreMsg, setCodeStoreMsg] = useState<{ text: string; success: boolean } | null>(null);
   const [codeStorePasscodeModalOpen, setCodeStorePasscodeModalOpen] = useState(false);
   const [codeStorePasscodeInput, setCodeStorePasscodeInput] = useState('');
   const [codeStorePasscodeError, setCodeStorePasscodeError] = useState('');
+  const questionsCountRef = useRef(questions.length);
+  const subjectsCountRef = useRef(subjects.length);
+  questionsCountRef.current = questions.length;
+  subjectsCountRef.current = subjects.length;
 
   useEffect(() => {
     let active = true;
-    void fetchCodeStoreStatus().then((st) => {
+    void fetchCodeStoreStatus(false).then((st) => {
       if (active) setCodeStoreStatus(st);
     });
 
@@ -2289,14 +2294,19 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         questionsCount: detail.questionsCount ?? prev?.questionsCount ?? 0,
         writable: true,
         githubConfigured: detail.githubConfigured ?? prev?.githubConfigured,
+        hasToken: detail.hasToken ?? prev?.hasToken,
+        hasRepo: detail.hasRepo ?? prev?.hasRepo,
         githubRepo: detail.githubRepo ?? prev?.githubRepo,
         githubBranch: detail.githubBranch ?? prev?.githubBranch,
         storageMode: detail.githubSynced ? 'github' : prev?.storageMode,
+        githubReachable: detail.githubSynced ? true : prev?.githubReachable,
+        githubCheckError: null,
+        statusError: null,
       }));
       setCodeStoreMsg({
         text: detail.githubSynced
-          ? `បានរក្សាទុក Real-Time ទៅ GitHub (${detail.githubRepo || 'Repo'}) រួចរាល់! សមាជិកលើ Vercel នឹងទទួលបានសំណួរថ្មី (${toKhmerNum(detail.questionsCount ?? questions.length)} សំណួរ) ស្វ័យប្រវត្តិ។`
-          : `បានរក្សាទុក Real-Time (${toKhmerNum(detail.subjectsCount ?? subjects.length)} មុខវិជ្ជា · ${toKhmerNum(detail.questionsCount ?? questions.length)} សំណួរ) ចូល Code ជោគជ័យ!`,
+          ? `បានរក្សាទុក Real-Time ទៅ GitHub (${detail.githubRepo || 'Repo'}) រួចរាល់! សមាជិកលើ Vercel នឹងទទួលបានសំណួរថ្មី (${toKhmerNum(detail.questionsCount ?? questionsCountRef.current)} សំណួរ) ស្វ័យប្រវត្តិ។`
+          : `បានរក្សាទុក Real-Time (${toKhmerNum(detail.subjectsCount ?? subjectsCountRef.current)} មុខវិជ្ជា · ${toKhmerNum(detail.questionsCount ?? questionsCountRef.current)} សំណួរ) ចូល Code ជោគជ័យ!`,
         success: true,
       });
     };
@@ -2332,7 +2342,56 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       window.removeEventListener('mpq-code-store-error', handleCodeStoreError);
       window.removeEventListener('mpq-code-store-auth-needed', handleCodeStoreAuthNeeded);
     };
-  }, [questions.length, subjects.length]);
+  }, []);
+
+  const handleTestGitHubConnection = async () => {
+    if (isTestingGitHub) return;
+    setIsTestingGitHub(true);
+    setCodeStoreMsg(null);
+    try {
+      const st = await fetchCodeStoreStatus(true);
+      setCodeStoreStatus(st);
+
+      if (st.statusError) {
+        setCodeStoreMsg({ text: st.statusError, success: false });
+        return;
+      }
+
+      if (!st.githubConfigured) {
+        const missing: string[] = [];
+        if (!st.hasToken) missing.push('GITHUB_TOKEN');
+        if (!st.hasRepo) missing.push('GITHUB_REPO');
+        setCodeStoreMsg({
+          text:
+            missing.length > 0
+              ? `Vercel មិនទាន់ស្គាល់ ${missing.join(' និង ')} ទេ! សូមពិនិត្យ Vercel Settings → Environment Variables (Production & Preview) រួចចុច Deployments → Redeploy ម្ដងទៀត។`
+              : 'មិនទាន់បានភ្ជាប់ GitHub Sync លើ Server នៅឡើយទេ។',
+          success: false,
+        });
+        return;
+      }
+
+      if (st.githubCheckError) {
+        setCodeStoreMsg({ text: st.githubCheckError, success: false });
+        return;
+      }
+
+      if (st.githubReachable) {
+        setCodeStoreMsg({
+          text: `តភ្ជាប់ GitHub (${st.githubRepo || 'Repo'} · ${st.githubBranch || 'main'}) ជោគជ័យ ១០០%! អ្នកអាចកែប្រែ ឬរក្សាទុក Real-Time បានហើយ។`,
+          success: true,
+        });
+        return;
+      }
+
+      setCodeStoreMsg({
+        text: `បានរកឃើញការកំណត់ GitHub (${st.githubRepo || ''}) — សូមសាកល្បងរក្សាទុកដើម្បីបញ្ជាក់សិទ្ធិ Write។`,
+        success: true,
+      });
+    } finally {
+      setIsTestingGitHub(false);
+    }
+  };
 
   const handleDownloadBundledTs = () => {
     setCodeStoreMsg(null);
@@ -2391,9 +2450,14 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           questionsCount: res.questionsCount ?? questions.length,
           writable: true,
           githubConfigured: res.githubConfigured ?? prev?.githubConfigured,
+          hasToken: res.hasToken ?? prev?.hasToken,
+          hasRepo: res.hasRepo ?? prev?.hasRepo,
           githubRepo: res.githubRepo ?? prev?.githubRepo,
           githubBranch: res.githubBranch ?? prev?.githubBranch,
           storageMode: res.githubSynced ? 'github' : prev?.storageMode,
+          githubReachable: res.githubSynced ? true : prev?.githubReachable,
+          githubCheckError: null,
+          statusError: null,
         }));
         setCodeStoreMsg({
           text: res.githubSynced
@@ -2436,6 +2500,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       codeSCount === subjects.length;
     const isGithubLive = Boolean(codeStoreStatus?.githubConfigured);
     const isVercelReadOnly = codeStoreStatus !== null && !codeStoreStatus.writable;
+    const showDiagBadges =
+      codeStoreStatus !== null &&
+      (isVercelReadOnly ||
+        Boolean(codeStoreStatus.statusError) ||
+        Boolean(codeStoreStatus.githubCheckError));
 
     return (
       <div className="app-card rounded-2xl p-5 sm:p-6 shadow-sm border border-emerald-500/30">
@@ -2475,7 +2544,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                   ? 'ដើម្បីឱ្យរក្សាទុក និង Update Real-Time លើ GitHub + Vercel បាន សូមពិនិត្យ Environment Variables លើ Vercel រួចចុច Deployments → Redeploy។'
                   : 'រាល់សំណួរដែលរក្សាទុកក្នុង Code នឹងផ្ទុកមកជាមួយកម្មវិធីភ្លាមៗទាំង Online និង Offline ដោយមិនពឹងផ្អែកលើ Database ខាងក្រៅឡើយ។'}
             </p>
-            {isVercelReadOnly && (
+            {showDiagBadges && (
               <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px] font-mono">
                 <span
                   className={`px-2 py-0.5 rounded-md border ${
@@ -2500,6 +2569,12 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </span>
               </div>
             )}
+            {(codeStoreStatus?.statusError || codeStoreStatus?.githubCheckError) && !codeStoreMsg && (
+              <div className="mt-1.5 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-400/70 text-amber-900 dark:text-amber-200 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{codeStoreStatus.statusError || codeStoreStatus.githubCheckError}</span>
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 shrink-0">
@@ -2521,6 +2596,16 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                     ? 'រក្សាទុក & Update Real-Time'
                     : 'រក្សាទុកទាំងអស់ចូល Code'}
               </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={isTestingGitHub}
+              onClick={() => void handleTestGitHubConnection()}
+              className="px-3.5 py-2.5 rounded-xl app-subcard hover:opacity-85 disabled:opacity-50 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
+            >
+              <RefreshCw className={`w-4 h-4 shrink-0 ${isTestingGitHub ? 'animate-spin' : ''}`} />
+              <span>{isTestingGitHub ? 'កំពុងពិនិត្យ...' : 'ពិនិត្យតភ្ជាប់ GitHub'}</span>
             </button>
 
             <button
