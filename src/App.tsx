@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { User as FirebaseUser } from 'firebase/auth';
-import { QueryDocumentSnapshot, DocumentData } from 'firebase/firestore';
 import { UserSession, Question, Subject, AppNotification, LoginRecord, PresenceRecord, Feedback, AppThemeId, BotCommandConfig, QuizContext, GlobalStats } from './types';
 import { LandingPage } from './components/LandingPage';
 import { Navbar } from './components/Navbar';
@@ -28,7 +27,11 @@ import {
   refreshAdminMonitoringData,
   updatePresenceHeartbeat,
   refreshCoreData,
+  fetchQuestionsCached,
+  fetchSubjectsCached,
   signInWithGoogle,
+  startCoreRealtimeSync,
+  PaginationCursor,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
 import {
@@ -96,23 +99,24 @@ export default function App() {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [globalStats, setGlobalStats] = useState<GlobalStats>({});
   const [logins, setLogins] = useState<LoginRecord[]>([]);
-  const [loginsCursor, setLoginsCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [loginsCursor, setLoginsCursor] = useState<PaginationCursor>(null);
   const [hasMoreLogins, setHasMoreLogins] = useState(false);
   const [isLoadingMoreLogins, setIsLoadingMoreLogins] = useState(false);
 
   const [presence, setPresence] = useState<PresenceRecord[]>([]);
-  const [presenceCursor, setPresenceCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [presenceCursor, setPresenceCursor] = useState<PaginationCursor>(null);
   const [hasMorePresence, setHasMorePresence] = useState(false);
   const [isLoadingMorePresence, setIsLoadingMorePresence] = useState(false);
 
   const [onlineCount, setOnlineCount] = useState<number>(1);
   const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
-  const [feedbacksCursor, setFeedbacksCursor] = useState<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [feedbacksCursor, setFeedbacksCursor] = useState<PaginationCursor>(null);
   const [hasMoreFeedbacks, setHasMoreFeedbacks] = useState(false);
   const [isLoadingMoreFeedbacks, setIsLoadingMoreFeedbacks] = useState(false);
 
   const [botCommands, setBotCommands] = useState<Record<string, BotCommandConfig>>({});
   const [isSyncingCore, setIsSyncingCore] = useState(false);
+  const [realtimeEpoch, setRealtimeEpoch] = useState(0);
 
   // Core data subscriptions: only attach AFTER user logs in (re-sync cleanly on Firebase Auth sign-in)
   const isLoggedIn = Boolean(session);
@@ -134,11 +138,11 @@ export default function App() {
       }
     });
 
-    const syncPromise = firebaseUid ? refreshCoreData() : Promise.resolve();
+    const syncPromise = firebaseUid
+      ? refreshCoreData()
+      : Promise.all([fetchQuestionsCached(false), fetchSubjectsCached(false)]);
     void syncPromise.finally(() => {
-      setTimeout(() => {
-        if (active) setIsSyncingCore(false);
-      }, 400);
+      if (active) setIsSyncingCore(false);
     });
 
     return () => {
@@ -150,6 +154,30 @@ export default function App() {
       unsubBot();
     };
   }, [isLoggedIn, firebaseUid]);
+
+  // Auto-recover if a mobile/PWA device opened offline or with empty/incomplete data
+  const missingCoreData = questions.length === 0 || subjects.length === 0;
+  useEffect(() => {
+    if (!isLoggedIn || !missingCoreData) return;
+
+    const retryMissingSync = () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      void Promise.all([fetchQuestionsCached(false), fetchSubjectsCached(false)]);
+    };
+
+    const handleVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        retryMissingSync();
+      }
+    };
+
+    window.addEventListener('online', retryMissingSync);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('online', retryMissingSync);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [isLoggedIn, missingCoreData]);
 
   const handleSyncCoreNow = useCallback(async () => {
     setIsSyncingCore(true);
@@ -228,8 +256,34 @@ export default function App() {
     };
   }, [isLoggedIn, isAdminPanelActive, firebaseUid, loadInitialMonitoringPages]);
 
+  // Unified Real-Time Sync (Server SSE + Supabase Realtime + Firebase Firestore onSnapshot)
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const handleOnlineCount = (e: Event) => {
+      const custom = e as CustomEvent<number>;
+      if (typeof custom.detail === 'number' && custom.detail > 0) {
+        setOnlineCount(custom.detail);
+      }
+    };
+    const handleDbModeChanged = () => {
+      setRealtimeEpoch((prev) => prev + 1);
+    };
+
+    window.addEventListener('mpq-online-count-changed', handleOnlineCount);
+    window.addEventListener('mpq-db-mode-changed', handleDbModeChanged);
+
+    const stopRealtime = startCoreRealtimeSync({ isAdmin: isAdminPanelActive });
+
+    return () => {
+      stopRealtime();
+      window.removeEventListener('mpq-online-count-changed', handleOnlineCount);
+      window.removeEventListener('mpq-db-mode-changed', handleDbModeChanged);
+    };
+  }, [isLoggedIn, isAdminPanelActive, firebaseUid, realtimeEpoch]);
+
   const handleLoadMoreLogins = useCallback(async () => {
-    if (isLoadingMoreLogins || !hasMoreLogins || !loginsCursor) return;
+    if (isLoadingMoreLogins || !hasMoreLogins || loginsCursor === null) return;
     setIsLoadingMoreLogins(true);
     try {
       const page = await fetchLoginsPage(loginsCursor, true);
@@ -246,7 +300,7 @@ export default function App() {
   }, [isLoadingMoreLogins, hasMoreLogins, loginsCursor]);
 
   const handleLoadMorePresence = useCallback(async () => {
-    if (isLoadingMorePresence || !hasMorePresence || !presenceCursor) return;
+    if (isLoadingMorePresence || !hasMorePresence || presenceCursor === null) return;
     setIsLoadingMorePresence(true);
     try {
       const page = await fetchPresencePage(presenceCursor, true);
@@ -263,7 +317,7 @@ export default function App() {
   }, [isLoadingMorePresence, hasMorePresence, presenceCursor]);
 
   const handleLoadMoreFeedbacks = useCallback(async () => {
-    if (isLoadingMoreFeedbacks || !hasMoreFeedbacks || !feedbacksCursor) return;
+    if (isLoadingMoreFeedbacks || !hasMoreFeedbacks || feedbacksCursor === null) return;
     setIsLoadingMoreFeedbacks(true);
     try {
       const page = await fetchFeedbacksPage(feedbacksCursor, true);
@@ -381,7 +435,9 @@ export default function App() {
     }
     const nextPartIndex = activeQuizContext.partIndex + 1;
     const subjectQuestions = questions.filter(
-      (q) => q.isActive !== false && q.subject === activeQuizContext.subjectName
+      (q) =>
+        q.isActive !== false &&
+        (q.subject || '').trim() === activeQuizContext.subjectName!.trim()
     );
     const totalParts = Math.ceil(subjectQuestions.length / 10);
     const nextSlice = subjectQuestions.slice(nextPartIndex * 10, (nextPartIndex + 1) * 10);

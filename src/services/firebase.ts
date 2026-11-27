@@ -31,8 +31,11 @@ import {
   updateDoc,
   writeBatch,
   increment,
+  onSnapshot,
+  Query,
   QueryConstraint,
   QueryDocumentSnapshot,
+  QuerySnapshot,
   DocumentData,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -55,14 +58,123 @@ import {
   hasCachedValue,
   setCachedValue,
 } from './localCacheDb';
+import {
+  connectSupabaseRealtime,
+  fetchRealtimeConfig,
+  ClientRealtimeDeltaEvent,
+} from './supabaseClient';
 
 // Strict maximum items per single Firestore list query (aligned with firestore.rules limit <= 20)
 export const MAX_QUERY_LIMIT = 20;
 
+export type PaginationCursor = QueryDocumentSnapshot<DocumentData> | number | null;
+
 export interface PaginatedPageResult<T> {
   items: T[];
-  lastDoc: QueryDocumentSnapshot<DocumentData> | null;
+  lastDoc: PaginationCursor;
   hasMore: boolean;
+}
+
+type DbBackendType = 'supabase' | 'firestore';
+let detectedDbBackend: DbBackendType | null = null;
+let backendDetectPromise: Promise<DbBackendType> | null = null;
+
+export type DbModeType = 'dual' | 'supabase' | 'firestore';
+
+export async function fetchDbMode(): Promise<{
+  mode: DbModeType;
+  backend: DbBackendType;
+  supabaseConfigured: boolean;
+}> {
+  try {
+    const res = await fetch('/api/db/mode', { cache: 'no-store' });
+    if (!res.ok) return { mode: 'dual', backend: 'supabase', supabaseConfigured: false };
+    const data = await res.json();
+    return {
+      mode: data?.mode || 'dual',
+      backend: data?.backend === 'firestore' ? 'firestore' : 'supabase',
+      supabaseConfigured: Boolean(data?.supabaseConfigured),
+    };
+  } catch {
+    return { mode: 'dual', backend: 'supabase', supabaseConfigured: false };
+  }
+}
+
+export async function getDbExecutionTargets(): Promise<{
+  mode: DbModeType;
+  useSupabase: boolean;
+  useFirestore: boolean;
+}> {
+  const info = await fetchDbMode();
+  const mode = info.mode || 'dual';
+  if (mode === 'dual') {
+    return {
+      mode: 'dual',
+      useSupabase: info.supabaseConfigured !== false,
+      useFirestore: true,
+    };
+  }
+  if (mode === 'supabase') {
+    return {
+      mode: 'supabase',
+      useSupabase: true,
+      useFirestore: false,
+    };
+  }
+  return {
+    mode: 'firestore',
+    useSupabase: false,
+    useFirestore: true,
+  };
+}
+
+export async function setDbMode(mode: DbModeType): Promise<DbModeType> {
+  const res = await dbApiRequest('/api/db/mode', {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+  });
+  detectedDbBackend = null;
+  return res?.mode || mode;
+}
+
+async function ensureDbBackend(): Promise<DbBackendType> {
+  if (detectedDbBackend) return detectedDbBackend;
+  if (backendDetectPromise) return backendDetectPromise;
+  backendDetectPromise = fetchDbMode()
+    .then((info) => {
+      const b = info.backend;
+      detectedDbBackend = b;
+      return b;
+    })
+    .catch(() => 'firestore' as DbBackendType)
+    .finally(() => {
+      backendDetectPromise = null;
+    });
+  return backendDetectPromise;
+}
+
+async function dbApiRequest<T = any>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const authHeader = await getAuthBearerHeader();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...((options.headers as Record<string, string>) || {}),
+  };
+  if (authHeader) {
+    headers['Authorization'] = authHeader;
+  }
+  const res = await fetch(url, {
+    ...options,
+    headers,
+    cache: 'no-store',
+  });
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(payload?.error || `Database API error (${res.status})`);
+  }
+  return payload as T;
 }
 
 // Initialize Firebase App, Auth, & Firestore with persistent IndexedDB local cache
@@ -198,9 +310,11 @@ async function getAuthBearerHeader(): Promise<string | undefined> {
   }
 }
 
-// Startup Connection Validation (runs once per 24h when authenticated to avoid unauthenticated reads)
+// Startup Connection Validation (runs only if Firestore backend is active)
 async function testConnection(force = false) {
   try {
+    const backend = await ensureDbBackend();
+    if (backend === 'supabase') return;
     if (!auth.currentUser) return;
     const lastTested = Number(localStorage.getItem('mpq_conn_tested_at_v2') || '0');
     if (!force && lastTested && Date.now() - lastTested < 24 * 60 * 60 * 1000) {
@@ -317,28 +431,50 @@ const sortQuestions = (list: Question[]) =>
 const sortSubjects = (list: Subject[]) =>
   [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
+type ServerCacheMutationPayload =
+  | { action: 'upsert'; item: unknown }
+  | { action: 'upsertMany'; items: unknown[] }
+  | { action: 'delete'; id: string }
+  | { action: 'clear' }
+  | { replace: unknown; authoritative?: boolean };
+
 function syncMutationToServerCache(
   scope: 'questions' | 'subjects' | 'notifications' | 'bot_commands',
-  replace: unknown
+  payload: ServerCacheMutationPayload
 ) {
-  if (typeof fetch === 'undefined') return;
-  void fetch('/api/cache/mutate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scope, replace }),
-  })
+  if (typeof fetch === 'undefined' || !auth.currentUser) return;
+  void getAuthBearerHeader()
+    .then((authHeader) => {
+      if (!authHeader) return null;
+      return fetch('/api/cache/mutate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authHeader,
+        },
+        body: JSON.stringify({ scope, ...payload }),
+      });
+    })
     .then(async (res) => {
-      if (res.ok) {
+      if (res && res.ok) {
         const data = await res.json().catch(() => null);
         if (typeof data?.version === 'number') {
           setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, data.version);
-          setSyncTimestamp('CORE_CHECK');
+          if (hasNonEmptyCoreArrays()) {
+            setSyncTimestamp('CORE_CHECK');
+          }
         }
       }
     })
     .catch(() => {
       // Ignore when running purely offline
     });
+}
+
+function hasNonEmptyCoreArrays(): boolean {
+  const qs = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const subs = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+  return Array.isArray(qs) && qs.length > 0 && Array.isArray(subs) && subs.length > 0;
 }
 
 function resolveNotificationsWithDismissed(rawNotifs: AppNotification[]): AppNotification[] {
@@ -363,14 +499,15 @@ async function fetchCollectionPageFromFirestore<T>(
   constraints: QueryConstraint[],
   cursorDoc: QueryDocumentSnapshot<DocumentData> | null,
   mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => T,
-  forceServer = false
+  forceServer = false,
+  useCacheFirst = true
 ): Promise<PaginatedPageResult<T>> {
   const pageConstraints = cursorDoc
     ? [...constraints, startAfter(cursorDoc), limit(MAX_QUERY_LIMIT)]
     : [...constraints, limit(MAX_QUERY_LIMIT)];
   const q = query(collection(db, collectionName), ...pageConstraints);
 
-  if (!forceServer) {
+  if (!forceServer && useCacheFirst) {
     const cachedSnap = await getDocsFromCache(q).catch(() => null);
     if (cachedSnap && !cachedSnap.empty) {
       const items: T[] = [];
@@ -384,6 +521,19 @@ async function fetchCollectionPageFromFirestore<T>(
   }
 
   if (!auth.currentUser) {
+    if (useCacheFirst) {
+      return { items: [], lastDoc: null, hasMore: false };
+    }
+    const cachedSnap = await getDocsFromCache(q).catch(() => null);
+    if (cachedSnap && !cachedSnap.empty) {
+      const items: T[] = [];
+      cachedSnap.forEach((d) => items.push(mapDoc(d)));
+      return {
+        items,
+        lastDoc: cachedSnap.docs[cachedSnap.docs.length - 1] || null,
+        hasMore: cachedSnap.docs.length === MAX_QUERY_LIMIT,
+      };
+    }
     return { items: [], lastDoc: null, hasMore: false };
   }
 
@@ -398,34 +548,58 @@ async function fetchCollectionPageFromFirestore<T>(
 }
 
 /**
- * Paginated sequential cursor loader for full datasets (uses limit(20) + startAfter() per page)
+ * Paginated sequential cursor loader for full datasets (uses limit(20) + startAfter() per page).
+ * Always queries Firestore directly when online & authenticated so partial local IndexedDB cache
+ * never truncates pagination mid-way. Falls back to offline cache only if offline or unauthenticated.
  */
 async function fetchAllPagesWithLimit20<T>(
   collectionName: string,
   constraints: QueryConstraint[],
   mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => T,
   forceServer = false,
-  maxPages = 40
+  maxPages = 500
 ): Promise<T[]> {
-  const collected: T[] = [];
-  let cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null;
-  let pageCount = 0;
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const shouldUseCacheOnly = !forceServer && isOffline;
 
-  while (pageCount < maxPages) {
-    const page: PaginatedPageResult<T> = await fetchCollectionPageFromFirestore<T>(
-      collectionName,
-      constraints,
-      cursorDoc,
-      mapDoc,
-      forceServer
-    );
-    collected.push(...page.items);
-    pageCount += 1;
-    if (!page.hasMore || !page.lastDoc) break;
-    cursorDoc = page.lastDoc;
+  const runLoop = async (cacheOnly: boolean): Promise<T[]> => {
+    const collected: T[] = [];
+    let cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null;
+    let pageCount = 0;
+
+    while (pageCount < maxPages) {
+      const pageConstraints: QueryConstraint[] = cursorDoc
+        ? [...constraints, startAfter(cursorDoc), limit(MAX_QUERY_LIMIT)]
+        : [...constraints, limit(MAX_QUERY_LIMIT)];
+      const q: Query<DocumentData> = query(collection(db, collectionName), ...pageConstraints);
+
+      const snap: QuerySnapshot<DocumentData> = cacheOnly
+        ? await getDocsFromCache(q)
+        : await getDocs(q);
+      snap.forEach((d: QueryDocumentSnapshot<DocumentData>) => collected.push(mapDoc(d)));
+      pageCount += 1;
+
+      if (snap.docs.length < MAX_QUERY_LIMIT || snap.docs.length === 0) {
+        break;
+      }
+      cursorDoc = snap.docs[snap.docs.length - 1];
+    }
+
+    return collected;
+  };
+
+  if (shouldUseCacheOnly) {
+    return runLoop(true).catch(() => []);
   }
 
-  return collected;
+  try {
+    return await runLoop(false);
+  } catch (err) {
+    // Only fall back to local IndexedDB pages if network/offline failure occurred
+    const cached = await runLoop(true).catch(() => []);
+    if (cached.length > 0) return cached;
+    throw err;
+  }
 }
 
 // Non-blocking atomic counter helper on stats/global
@@ -463,10 +637,8 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 
   if (
     !force &&
-    (isQuotaCooldownActive(false) ||
-      (isCacheFresh('CORE_CHECK') &&
-        hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
-        hasCachedValue(STORAGE_KEYS.SUBJECTS)))
+    hasNonEmptyCoreArrays() &&
+    (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
   ) {
     return true;
   }
@@ -474,26 +646,27 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
   return runDeduplicated(`core_server:${force ? 'force' : 'ttl'}`, async () => {
     if (
       !force &&
-      (isQuotaCooldownActive(false) ||
-        (isCacheFresh('CORE_CHECK') &&
-          hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
-          hasCachedValue(STORAGE_KEYS.SUBJECTS)))
+      hasNonEmptyCoreArrays() &&
+      (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
     ) {
       return true;
     }
 
-    try {
+    const requestCore = async (useSince: boolean) => {
+      const localQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+      const localSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+      const localBotCommands = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
       const hasAllLocal =
-        hasCachedValue(STORAGE_KEYS.QUESTIONS) &&
-        hasCachedValue(STORAGE_KEYS.SUBJECTS) &&
-        hasCachedValue(STORAGE_KEYS.BOT_COMMANDS);
+        localQuestions.length > 0 &&
+        localSubjects.length > 0 &&
+        Object.keys(localBotCommands).length > 0;
       const savedVersion = hasAllLocal
         ? getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0)
         : 0;
 
       const params = new URLSearchParams();
       if (force) params.set('force', '1');
-      if (!force && savedVersion > 0) params.set('since', String(savedVersion));
+      if (useSince && !force && savedVersion > 0) params.set('since', String(savedVersion));
 
       const authHeader = await getAuthBearerHeader();
       const headers: Record<string, string> = {};
@@ -504,7 +677,15 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
         headers,
       });
       const payload = await res.json().catch(() => null);
+      return { res, payload };
+    };
 
+    try {
+      let { res, payload } = await requestCore(true);
+
+      if (payload?.backend === 'supabase' || payload?.backend === 'firestore') {
+        detectedDbBackend = payload.backend;
+      }
       if (payload?.quotaLimited) {
         clientQuotaCooldownUntil = Date.now() + 5 * 60 * 1000;
       }
@@ -513,24 +694,59 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
         return false;
       }
 
-      setSyncTimestamp('CORE_CHECK');
-
-      if (payload?.unchanged) {
-        setSyncTimestamp('QUESTIONS');
-        setSyncTimestamp('SUBJECTS');
-        setSyncTimestamp('NOTIFICATIONS');
-        setSyncTimestamp('BOT_COMMANDS');
-        return true;
+      // Auto-backfill Supabase once when Admin opens app with cached local catalog while Supabase is empty
+      const isAdminEmail =
+        auth.currentUser?.email?.toLowerCase() === 'reaksmey8114@gmail.com' &&
+        auth.currentUser?.emailVerified;
+      if (
+        payload?.backend === 'supabase' &&
+        isAdminEmail &&
+        (!Array.isArray(payload?.questions) || payload.questions.length === 0)
+      ) {
+        const localQ = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+        const localS = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+        const localN = getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
+        const localBC = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+        const localPU = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+        if (localQ.length > 0 || localS.length > 0) {
+          void dbApiRequest('/api/db/migrate', {
+            method: 'POST',
+            body: JSON.stringify({
+              questions: localQ,
+              subjects: localS,
+              notifications: localN,
+              botCommands: localBC,
+              paidUsers: localPU,
+            }),
+          }).catch(() => {});
+        }
       }
 
-      if (Array.isArray(payload?.questions)) {
+      if (payload?.unchanged) {
+        if (!hasNonEmptyCoreArrays()) {
+          // Local storage lost/empty despite version match — re-request full payload
+          const retry = await requestCore(false);
+          res = retry.res;
+          payload = retry.payload;
+          if (!res.ok || !payload) return false;
+        } else {
+          setSyncTimestamp('CORE_CHECK');
+          setSyncTimestamp('QUESTIONS');
+          setSyncTimestamp('SUBJECTS');
+          setSyncTimestamp('NOTIFICATIONS');
+          setSyncTimestamp('BOT_COMMANDS');
+          return true;
+        }
+      }
+
+      if (Array.isArray(payload?.questions) && payload.questions.length > 0) {
         const sortedQ = sortQuestions(payload.questions);
         setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
         setSyncTimestamp('QUESTIONS');
         window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
       }
 
-      if (Array.isArray(payload?.subjects)) {
+      if (Array.isArray(payload?.subjects) && payload.subjects.length > 0) {
         const sortedSub = sortSubjects(payload.subjects);
         setLocal(STORAGE_KEYS.SUBJECTS, sortedSub);
         setSyncTimestamp('SUBJECTS');
@@ -552,11 +768,15 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
         );
       }
 
-      if (typeof payload?.version === 'number') {
-        setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, payload.version);
+      const completeNow = !payload?.partial && hasNonEmptyCoreArrays();
+      if (completeNow) {
+        if (typeof payload?.version === 'number') {
+          setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, payload.version);
+        }
+        setSyncTimestamp('CORE_CHECK');
       }
 
-      return true;
+      return completeNow;
     } catch {
       return false;
     }
@@ -568,7 +788,11 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   await hydrateCacheFromIdb();
 
-  if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)) {
+  if (
+    !force &&
+    isCacheFresh('CORE_CHECK') &&
+    isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)
+  ) {
     return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   }
 
@@ -579,49 +803,50 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   }
 
   return runDeduplicated(`questions:${force ? 'force' : 'ttl'}`, async () => {
-    if (!force && isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)) {
+    if (
+      !force &&
+      isCacheFresh('CORE_CHECK') &&
+      isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)
+    ) {
       return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     }
     try {
-      if (!force) {
-        const cachedSnap = await getDocsFromCache(
-          query(collection(db, 'questions'), limit(MAX_QUERY_LIMIT))
-        ).catch(() => null);
-        if (cachedSnap && !cachedSnap.empty) {
-          const cachedAll = await fetchAllPagesWithLimit20<Question>(
-            'questions',
-            [],
-            (d) => ({ id: d.id, ...(d.data() as Omit<Question, 'id'>) }),
-            false
-          );
-          if (cachedAll.length > 0) {
-            const sorted = sortQuestions(cachedAll);
-            setLocal(STORAGE_KEYS.QUESTIONS, sorted);
-            setSyncTimestamp('QUESTIONS');
-            window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
-            return sorted;
-          }
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (!isOffline && !isQuotaCooldownActive(force)) {
+        const questions = await fetchAllPagesWithLimit20<Question>(
+          'questions',
+          [],
+          (d) => ({ id: d.id, ...(d.data() as Omit<Question, 'id'>) }),
+          true
+        );
+        if (questions.length > 0) {
+          const sorted = sortQuestions(questions);
+          setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+          setSyncTimestamp('QUESTIONS');
+          syncMutationToServerCache('questions', { replace: sorted, authoritative: true });
+          window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
+          return sorted;
         }
       }
 
-      if (isQuotaCooldownActive(force) || !auth.currentUser) {
-        return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
-      }
-
-      const questions = await fetchAllPagesWithLimit20<Question>(
+      // Offline / unauthenticated fallback: read all paginated docs from IndexedDB persistence
+      const cachedAll = await fetchAllPagesWithLimit20<Question>(
         'questions',
         [],
         (d) => ({ id: d.id, ...(d.data() as Omit<Question, 'id'>) }),
-        force
-      );
-      const sorted = sortQuestions(questions);
-      setLocal(STORAGE_KEYS.QUESTIONS, sorted);
-      setSyncTimestamp('QUESTIONS');
-      if (sorted.length > 0) {
-        syncMutationToServerCache('questions', sorted);
+        false
+      ).catch(() => []);
+      if (cachedAll.length > 0) {
+        const sorted = sortQuestions(cachedAll);
+        const existingLocal = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+        if (sorted.length >= existingLocal.length) {
+          setLocal(STORAGE_KEYS.QUESTIONS, sorted);
+          window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
+          return sorted;
+        }
       }
-      window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sorted }));
-      return sorted;
+
+      return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
       handleFirestoreError(err, OperationType.LIST, 'questions');
@@ -665,7 +890,11 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
 export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   await hydrateCacheFromIdb();
 
-  if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)) {
+  if (
+    !force &&
+    isCacheFresh('CORE_CHECK') &&
+    isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)
+  ) {
     return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   }
 
@@ -676,44 +905,49 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   }
 
   return runDeduplicated(`subjects:${force ? 'force' : 'ttl'}`, async () => {
-    if (!force && isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)) {
+    if (
+      !force &&
+      isCacheFresh('CORE_CHECK') &&
+      isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)
+    ) {
       return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     }
     try {
-      if (!force) {
-        const cachedSubs = await fetchAllPagesWithLimit20<Subject>(
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (!isOffline && !isQuotaCooldownActive(force)) {
+        const subs = await fetchAllPagesWithLimit20<Subject>(
           'subjects',
           [],
           (d) => ({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) }),
-          false
-        ).catch(() => []);
-        if (cachedSubs.length > 0) {
-          const sorted = sortSubjects(cachedSubs);
+          true
+        );
+        if (subs.length > 0) {
+          const sorted = sortSubjects(subs);
           setLocal(STORAGE_KEYS.SUBJECTS, sorted);
           setSyncTimestamp('SUBJECTS');
+          syncMutationToServerCache('subjects', { replace: sorted, authoritative: true });
           window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
           return sorted;
         }
       }
 
-      if (isQuotaCooldownActive(force) || !auth.currentUser) {
-        return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
-      }
-
-      const subs = await fetchAllPagesWithLimit20<Subject>(
+      const cachedSubs = await fetchAllPagesWithLimit20<Subject>(
         'subjects',
         [],
         (d) => ({ id: d.id, ...(d.data() as Omit<Subject, 'id'>) }),
-        force
-      );
-      const sorted = sortSubjects(subs);
-      setLocal(STORAGE_KEYS.SUBJECTS, sorted);
-      setSyncTimestamp('SUBJECTS');
-      if (sorted.length > 0) {
-        syncMutationToServerCache('subjects', sorted);
+        false
+      ).catch(() => []);
+      if (cachedSubs.length > 0) {
+        const sorted = sortSubjects(cachedSubs);
+        const existingLocal = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+        if (sorted.length >= existingLocal.length) {
+          setLocal(STORAGE_KEYS.SUBJECTS, sorted);
+          window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
+          return sorted;
+        }
       }
-      window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sorted }));
-      return sorted;
+
+      return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
       handleFirestoreError(err, OperationType.LIST, 'subjects');
@@ -835,10 +1069,33 @@ export function subscribeNotifications(callback: (notifications: AppNotification
 // ---------------- Paginated Admin Feeds (20 per page + startAfter) ----------------
 
 export async function fetchFeedbacksPage(
-  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  cursorDoc: PaginationCursor = null,
   force = false
 ): Promise<PaginatedPageResult<Feedback>> {
   await hydrateCacheFromIdb();
+  const backend = await ensureDbBackend();
+  if (backend === 'supabase') {
+    const offset = typeof cursorDoc === 'number' ? cursorDoc : 0;
+    try {
+      const data = await dbApiRequest<{
+        items: Feedback[];
+        nextOffset: number;
+        hasMore: boolean;
+      }>(`/api/db/feedbacks?offset=${offset}&limit=${MAX_QUERY_LIMIT}`);
+      return {
+        items: data.items || [],
+        lastDoc: data.nextOffset,
+        hasMore: Boolean(data.hasMore),
+      };
+    } catch {
+      return {
+        items: offset === 0 ? getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []) : [],
+        lastDoc: null,
+        hasMore: false,
+      };
+    }
+  }
+
   if (isQuotaCooldownActive(force)) {
     return {
       items: cursorDoc ? [] : getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []),
@@ -847,10 +1104,11 @@ export async function fetchFeedbacksPage(
     };
   }
   try {
+    const fsCursor = typeof cursorDoc === 'number' ? null : cursorDoc;
     const page = await fetchCollectionPageFromFirestore<Feedback>(
       'feedbacks',
       [orderBy('createdAt', 'desc')],
-      cursorDoc,
+      fsCursor,
       (d) => ({ id: d.id, ...(d.data() as Omit<Feedback, 'id'>) }),
       force
     );
@@ -912,10 +1170,33 @@ export function subscribeFeedbacks(callback: (feedbacks: Feedback[]) => void) {
 }
 
 export async function fetchLoginsPage(
-  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  cursorDoc: PaginationCursor = null,
   force = false
 ): Promise<PaginatedPageResult<LoginRecord>> {
   await hydrateCacheFromIdb();
+  const backend = await ensureDbBackend();
+  if (backend === 'supabase') {
+    const offset = typeof cursorDoc === 'number' ? cursorDoc : 0;
+    try {
+      const data = await dbApiRequest<{
+        items: LoginRecord[];
+        nextOffset: number;
+        hasMore: boolean;
+      }>(`/api/db/logins?offset=${offset}&limit=${MAX_QUERY_LIMIT}`);
+      return {
+        items: data.items || [],
+        lastDoc: data.nextOffset,
+        hasMore: Boolean(data.hasMore),
+      };
+    } catch {
+      return {
+        items: offset === 0 ? getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []) : [],
+        lastDoc: null,
+        hasMore: false,
+      };
+    }
+  }
+
   if (isQuotaCooldownActive(force)) {
     return {
       items: cursorDoc ? [] : getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []),
@@ -924,10 +1205,11 @@ export async function fetchLoginsPage(
     };
   }
   try {
+    const fsCursor = typeof cursorDoc === 'number' ? null : cursorDoc;
     const page = await fetchCollectionPageFromFirestore<LoginRecord>(
       'logins',
       [orderBy('timestamp', 'desc')],
-      cursorDoc,
+      fsCursor,
       (d) => ({ id: d.id, ...(d.data() as Omit<LoginRecord, 'id'>) }),
       force
     );
@@ -989,7 +1271,7 @@ export function subscribeLogins(callback: (logins: LoginRecord[]) => void) {
 }
 
 export async function fetchPresencePage(
-  cursorDoc: QueryDocumentSnapshot<DocumentData> | null = null,
+  cursorDoc: PaginationCursor = null,
   force = false
 ): Promise<PaginatedPageResult<PresenceRecord>> {
   await hydrateCacheFromIdb();
@@ -997,6 +1279,30 @@ export async function fetchPresencePage(
     const now = Date.now();
     return list.filter((item) => now - new Date(item.lastSeen).getTime() < 300000);
   };
+
+  const backend = await ensureDbBackend();
+  if (backend === 'supabase') {
+    const offset = typeof cursorDoc === 'number' ? cursorDoc : 0;
+    try {
+      const data = await dbApiRequest<{
+        items: PresenceRecord[];
+        nextOffset: number;
+        hasMore: boolean;
+      }>(`/api/db/presence?offset=${offset}&limit=${MAX_QUERY_LIMIT}`);
+      return {
+        items: filterActive(data.items || []),
+        lastDoc: data.nextOffset,
+        hasMore: Boolean(data.hasMore),
+      };
+    } catch {
+      return {
+        items: offset === 0 ? filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, [])) : [],
+        lastDoc: null,
+        hasMore: false,
+      };
+    }
+  }
+
   if (isQuotaCooldownActive(force)) {
     return {
       items: cursorDoc ? [] : filterActive(getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, [])),
@@ -1006,10 +1312,11 @@ export async function fetchPresencePage(
   }
   try {
     const fiveMinsAgoIso = new Date(Date.now() - 300000).toISOString();
+    const fsCursor = typeof cursorDoc === 'number' ? null : cursorDoc;
     const page = await fetchCollectionPageFromFirestore<PresenceRecord>(
       'presence',
       [where('lastSeen', '>=', fiveMinsAgoIso), orderBy('lastSeen', 'desc')],
-      cursorDoc,
+      fsCursor,
       (d) => ({ id: d.id, ...(d.data() as Omit<PresenceRecord, 'id'>) }),
       force
     );
@@ -1108,7 +1415,8 @@ export async function fetchOnlineCount(force = false): Promise<number> {
         return count;
       }
 
-      if (!auth.currentUser || isQuotaCooldownActive(force)) {
+      const backend = await ensureDbBackend();
+      if (backend === 'supabase' || !auth.currentUser || isQuotaCooldownActive(force)) {
         return getLocal<number>(STORAGE_KEYS.ONLINE_COUNT, 1);
       }
 
@@ -1129,7 +1437,7 @@ export async function fetchOnlineCount(force = false): Promise<number> {
 }
 
 /**
- * Aggregated Collection Counts using stats/global (1 getDoc) + getCountFromServer(limit(20))
+ * Aggregated Collection Counts via Supabase /api/db/stats or Firestore stats/global
  */
 export async function fetchGlobalStatsCached(force = false): Promise<GlobalStats> {
   await hydrateCacheFromIdb();
@@ -1141,7 +1449,26 @@ export async function fetchGlobalStatsCached(force = false): Promise<GlobalStats
     if (!force && isCacheFresh('GLOBAL_STATS', STORAGE_KEYS.GLOBAL_STATS)) {
       return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
     }
-    if (!auth.currentUser || isQuotaCooldownActive(force)) {
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    if (isOffline) {
+      return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+    }
+
+    const backend = await ensureDbBackend();
+    if (backend === 'supabase') {
+      try {
+        const res = await dbApiRequest<{ stats: GlobalStats }>('/api/db/stats');
+        const data = res.stats || {};
+        setLocal(STORAGE_KEYS.GLOBAL_STATS, data);
+        setSyncTimestamp('GLOBAL_STATS');
+        window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: data }));
+        return data;
+      } catch {
+        return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+      }
+    }
+
+    if (isQuotaCooldownActive(force)) {
       return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
     }
     try {
@@ -1152,6 +1479,9 @@ export async function fetchGlobalStatsCached(force = false): Promise<GlobalStats
         setSyncTimestamp('GLOBAL_STATS');
         window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: data }));
         return data;
+      }
+      if (!auth.currentUser) {
+        return getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
       }
 
       // Bootstrap counts via bounded getCountFromServer queries (obeying limit <= 20 rule)
@@ -1203,7 +1533,14 @@ export function subscribeGlobalStats(callback: (stats: GlobalStats) => void) {
  */
 export async function refreshCoreData() {
   const synced = await syncCoreFromServer(true);
-  if (!synced) {
+  const qs = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const subs = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+  const stats = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+  const incompleteVsStats =
+    (typeof stats.questionsCount === 'number' && qs.length < stats.questionsCount) ||
+    (typeof stats.subjectsCount === 'number' && subs.length < stats.subjectsCount);
+
+  if (!synced || qs.length === 0 || subs.length === 0 || incompleteVsStats) {
     await Promise.all([
       fetchQuestionsCached(true),
       fetchSubjectsCached(true),
@@ -1247,8 +1584,22 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
-    await setDoc(doc(db, 'questions', id), newQuestion);
-    syncMutationToServerCache('questions', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
+          method: 'POST',
+          body: JSON.stringify({ item: newQuestion }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase addQuestion note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await setDoc(doc(db, 'questions', id), newQuestion);
+    }
+    syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
     adjustGlobalStat('questionsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
@@ -1273,18 +1624,32 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < created.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      const chunk = created.slice(i, i + CHUNK_SIZE);
-      for (const q of chunk) {
-        if (q.id) {
-          batch.set(doc(db, 'questions', q.id), q);
-        }
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
+          method: 'POST',
+          body: JSON.stringify({ items: created }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase addQuestionsBatch note:', err);
       }
-      await batch.commit();
     }
-    syncMutationToServerCache('questions', next);
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < created.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = created.slice(i, i + CHUNK_SIZE);
+        for (const q of chunk) {
+          if (q.id) {
+            batch.set(doc(db, 'questions', q.id), q);
+          }
+        }
+        await batch.commit();
+      }
+    }
+    syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
     adjustGlobalStat('questionsCount', created.length);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'questions');
@@ -1303,8 +1668,25 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
-    await updateDoc(doc(db, 'questions', id), cleanUpdates);
-    syncMutationToServerCache('questions', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ updates: cleanUpdates }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase updateQuestion note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await updateDoc(doc(db, 'questions', id), cleanUpdates);
+    }
+    const updatedItem = next.find((q) => q.id === id);
+    if (updatedItem) {
+      syncMutationToServerCache('questions', { action: 'upsert', item: updatedItem });
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
   }
@@ -1318,11 +1700,87 @@ export async function deleteQuestion(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
   try {
-    await deleteDoc(doc(db, 'questions', id));
-    syncMutationToServerCache('questions', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase (in dual or supabase mode)
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deleteQuestion note:', err);
+      }
+    }
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'questions', id));
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deleteQuestion note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('questions', { action: 'delete', id });
     adjustGlobalStat('questionsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
+  }
+}
+
+export async function deleteQuestionsBatch(ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  const idSet = new Set(ids);
+  const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const next = cached.filter((q) => !q.id || !idSet.has(q.id));
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+
+  try {
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete batch in Supabase
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number; count?: number }>('/api/db/questions/delete-batch', {
+          method: 'POST',
+          body: JSON.stringify({ ids }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deleteQuestionsBatch note:', err);
+      }
+    }
+
+    // 2. Dual-delete batch in Firestore SDK (chunked by 450)
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          const CHUNK_SIZE = 450;
+          for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+            const batch = writeBatch(db);
+            for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+              batch.delete(doc(db, 'questions', id));
+            }
+            await batch.commit();
+          }
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deleteQuestionsBatch note:', err);
+        }
+      }
+    }
+
+    for (const id of ids) {
+      syncMutationToServerCache('questions', { action: 'delete', id });
+    }
+    adjustGlobalStat('questionsCount', -ids.length);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, 'questions/batch');
   }
 }
 
@@ -1347,8 +1805,22 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
-    await setDoc(doc(db, 'subjects', id), newSub);
-    syncMutationToServerCache('subjects', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
+          method: 'POST',
+          body: JSON.stringify({ item: newSub }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase addSubject note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await setDoc(doc(db, 'subjects', id), newSub);
+    }
+    syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
     adjustGlobalStat('subjectsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'subjects');
@@ -1366,8 +1838,25 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
-    await updateDoc(doc(db, 'subjects', id), cleanUpdates);
-    syncMutationToServerCache('subjects', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ updates: cleanUpdates }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase updateSubject note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await updateDoc(doc(db, 'subjects', id), cleanUpdates);
+    }
+    const updatedSub = next.find((s) => s.id === id);
+    if (updatedSub) {
+      syncMutationToServerCache('subjects', { action: 'upsert', item: updatedSub });
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
   }
@@ -1389,18 +1878,32 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
   if (changed.length === 0) return normalized;
 
   try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      const chunk = changed.slice(i, i + CHUNK_SIZE);
-      for (const sub of chunk) {
-        if (sub.id) {
-          batch.update(doc(db, 'subjects', sub.id), { order: sub.order });
-        }
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
+          method: 'POST',
+          body: JSON.stringify({ items: normalized }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase reorderSubjects note:', err);
       }
-      await batch.commit();
     }
-    syncMutationToServerCache('subjects', normalized);
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = changed.slice(i, i + CHUNK_SIZE);
+        for (const sub of chunk) {
+          if (sub.id) {
+            batch.update(doc(db, 'subjects', sub.id), { order: sub.order });
+          }
+        }
+        await batch.commit();
+      }
+    }
+    syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, 'subjects');
   }
@@ -1459,8 +1962,32 @@ export async function deleteSubject(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
   try {
-    await deleteDoc(doc(db, 'subjects', id));
-    syncMutationToServerCache('subjects', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase (in dual or supabase mode)
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deleteSubject note:', err);
+      }
+    }
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'subjects', id));
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deleteSubject note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('subjects', { action: 'delete', id });
     adjustGlobalStat('subjectsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
@@ -1482,12 +2009,25 @@ export async function recordLogin(username: string, passwordUsed: string, role: 
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
-  if (!auth.currentUser) return;
-  try {
-    await setDoc(doc(db, 'logins', id), record);
-    adjustGlobalStat('loginsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'logins');
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest('/api/db/logins', {
+        method: 'POST',
+        body: JSON.stringify(record),
+      });
+    } catch {
+      // Ignore network hiccup on non-critical audit log
+    }
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'logins', id), record);
+      adjustGlobalStat('loginsCount', 1);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'logins');
+    }
   }
 }
 
@@ -1497,12 +2037,23 @@ export async function deleteLoginRecord(id: string) {
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
-  if (!auth.currentUser) return;
-  try {
-    await deleteDoc(doc(db, 'logins', id));
-    adjustGlobalStat('loginsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `logins/${id}`);
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest(`/api/db/logins/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (err) {
+      console.warn('[Dual Delete] Supabase deleteLoginRecord note:', err);
+    }
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'logins', id));
+      adjustGlobalStat('loginsCount', -1);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `logins/${id}`);
+    }
   }
 }
 
@@ -1514,19 +2065,33 @@ export async function deleteLoginsByIds(ids: string[]) {
   setLocal(STORAGE_KEYS.LOGINS, next);
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
-  if (!auth.currentUser) return;
-  try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      for (const id of ids.slice(i, i + CHUNK_SIZE)) {
-        batch.delete(doc(db, 'logins', id));
-      }
-      await batch.commit();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest('/api/db/logins/delete-batch', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+    } catch (err) {
+      console.warn('[Dual Delete] Supabase deleteLoginsByIds note:', err);
     }
-    adjustGlobalStat('loginsCount', -ids.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'logins');
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'logins', id));
+        }
+        await batch.commit();
+      }
+      adjustGlobalStat('loginsCount', -ids.length);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'logins');
+    }
   }
 }
 
@@ -1540,19 +2105,33 @@ export async function updatePresenceHeartbeat(username: string, role: 'user' | '
   }
 
   setLocal(STORAGE_KEYS.LAST_PRESENCE_PING, { id: safeId, at: nowMs });
-  if (!auth.currentUser) return;
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
 
   const record: PresenceRecord = sanitizeData({
     id: safeId,
     username,
     role,
     lastSeen: new Date(nowMs).toISOString(),
-    uid: auth.currentUser.uid,
+    uid: auth.currentUser?.uid,
   });
-  try {
-    await setDoc(doc(db, 'presence', safeId), record, { merge: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'presence');
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest('/api/db/presence', {
+        method: 'POST',
+        body: JSON.stringify(record),
+      });
+    } catch {
+      // Ignore
+    }
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'presence', safeId), record, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'presence');
+    }
   }
 }
 
@@ -1571,17 +2150,34 @@ export async function submitFeedback(username: string, text: string) {
   setLocal(STORAGE_KEYS.FEEDBACKS, next);
   window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: next }));
 
-  if (!auth.currentUser) return item;
-  try {
-    await setDoc(doc(db, 'feedbacks', id), item);
-    adjustGlobalStat('feedbacksCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'feedbacks');
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest('/api/db/feedbacks', {
+        method: 'POST',
+        body: JSON.stringify(item),
+      });
+    } catch {
+      // Ignore
+    }
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'feedbacks', id), item);
+      adjustGlobalStat('feedbacksCount', 1);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'feedbacks');
+    }
   }
   return item;
 }
 
-export async function broadcastNotification(message: string, type: 'info' | 'success' | 'warning' = 'info') {
+export async function broadcastNotification(
+  message: string,
+  type: 'info' | 'success' | 'warning' = 'info',
+  vipWelcome = false
+) {
   const id = `notif-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   const item: AppNotification = {
     id,
@@ -1597,8 +2193,22 @@ export async function broadcastNotification(message: string, type: 'info' | 'suc
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
   try {
-    await setDoc(doc(db, 'notifications', id), item);
-    syncMutationToServerCache('notifications', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
+          method: 'POST',
+          body: JSON.stringify({ item, vipWelcome }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase broadcastNotification note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await setDoc(doc(db, 'notifications', id), item);
+    }
+    syncMutationToServerCache('notifications', { action: 'upsert', item });
     adjustGlobalStat('notificationsCount', 1);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'notifications');
@@ -1619,8 +2229,32 @@ export async function deleteNotification(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
   try {
-    await deleteDoc(doc(db, 'notifications', id));
-    syncMutationToServerCache('notifications', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase (in dual or supabase mode)
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(`/api/db/notifications/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deleteNotification note:', err);
+      }
+    }
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'notifications', id));
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deleteNotification note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('notifications', { action: 'delete', id });
     adjustGlobalStat('notificationsCount', -1);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
@@ -1638,15 +2272,40 @@ export async function deleteAllNotifications(ids: string[]) {
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: [] }));
 
   try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      for (const id of ids.slice(i, i + CHUNK_SIZE)) {
-        batch.delete(doc(db, 'notifications', id));
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
+          method: 'DELETE',
+          body: JSON.stringify({ ids }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deleteAllNotifications note:', err);
       }
-      await batch.commit();
     }
-    syncMutationToServerCache('notifications', []);
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          const CHUNK_SIZE = 450;
+          for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+            const batch = writeBatch(db);
+            for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+              batch.delete(doc(db, 'notifications', id));
+            }
+            await batch.commit();
+          }
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deleteAllNotifications note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('notifications', { action: 'clear' });
     adjustGlobalStat('notificationsCount', -ids.length);
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'notifications');
@@ -1664,6 +2323,20 @@ export async function fetchPaidUsersCached(force = false): Promise<PaidUser[]> {
     if (!force && isCacheFresh('PAID_USERS', STORAGE_KEYS.PAID_USERS)) {
       return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
     }
+    const backend = await ensureDbBackend();
+    if (backend === 'supabase') {
+      try {
+        const res = await dbApiRequest<{ items: PaidUser[] }>('/api/db/paid-users?offset=0&limit=100');
+        const items = res.items || [];
+        setLocal(STORAGE_KEYS.PAID_USERS, items);
+        setSyncTimestamp('PAID_USERS');
+        window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: items }));
+        return items;
+      } catch {
+        return getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+      }
+    }
+
     try {
       const page = await fetchCollectionPageFromFirestore<PaidUser>(
         'paid_users',
@@ -1724,7 +2397,29 @@ export async function checkIsUserPaid(rawUsername: string): Promise<PaidUser | n
   if (localMatch) return localMatch;
 
   const lastMiss = checkedNonPaidAt.get(norm) || 0;
-  if (!auth.currentUser || Date.now() - lastMiss < 5 * 60 * 1000 || isQuotaCooldownActive(false)) {
+  if (Date.now() - lastMiss < 5 * 60 * 1000) {
+    return null;
+  }
+
+  const backend = await ensureDbBackend();
+  if (backend === 'supabase') {
+    try {
+      const res = await dbApiRequest<{ isPaid: boolean; paidUser: PaidUser | null }>(
+        `/api/db/paid-check?username=${encodeURIComponent(norm)}`
+      );
+      if (res.isPaid && res.paidUser) {
+        const matched = res.paidUser;
+        setLocal(STORAGE_KEYS.PAID_USERS, [matched, ...cached.filter((u) => u.id !== matched.id)]);
+        return matched;
+      }
+      checkedNonPaidAt.set(norm, Date.now());
+    } catch {
+      // Ignore transient failure
+    }
+    return null;
+  }
+
+  if (!auth.currentUser || isQuotaCooldownActive(false)) {
     return null;
   }
 
@@ -1784,10 +2479,24 @@ export async function registerPaidUser(params: {
   window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: cached }));
 
   try {
-    await setDoc(doc(db, 'paid_users', id), sanitizeData(record), { merge: true });
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        await dbApiRequest('/api/db/paid-users', {
+          method: 'POST',
+          body: JSON.stringify({ record }),
+        });
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase registerPaidUser note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await setDoc(doc(db, 'paid_users', id), sanitizeData(record), { merge: true });
+    }
     await broadcastNotification(
       `🎉 សូមស្វាគមន៍សមាជិក VIP ថ្មី «${record.username}» បានបង់ប្រាក់ $10 ជោគជ័យ និងទទួលបានសិទ្ធិចូលប្រើប្រាស់ពេញមួយជីវិត!`,
-      'success'
+      'success',
+      true
     );
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'paid_users');
@@ -1812,7 +2521,20 @@ export async function updatePaidUserStatus(id: string, status: 'active' | 'pendi
   window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
   try {
-    await updateDoc(doc(db, 'paid_users', id), { status, permanentAccess });
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status, permanentAccess }),
+        });
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase updatePaidUserStatus note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await updateDoc(doc(db, 'paid_users', id), { status, permanentAccess });
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `paid_users/${id}`);
   }
@@ -1825,7 +2547,27 @@ export async function deletePaidUser(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
   try {
-    await deleteDoc(doc(db, 'paid_users', id));
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase (in dual or supabase mode)
+    if (useSupabase || mode === 'dual') {
+      try {
+        await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase deletePaidUser note:', err);
+      }
+    }
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'paid_users', id));
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore deletePaidUser note:', err);
+        }
+      }
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `paid_users/${id}`);
   }
@@ -1838,59 +2580,69 @@ function getBotCommandDocId(command: string): string {
 export async function fetchBotCommandsCached(force = false): Promise<Record<string, BotCommandConfig>> {
   await hydrateCacheFromIdb();
 
-  if (!force && isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS)) {
+  if (
+    !force &&
+    isCacheFresh('CORE_CHECK') &&
+    isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS, true)
+  ) {
     return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
   }
 
   const syncedFromServer = await syncCoreFromServer(force);
-  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.BOT_COMMANDS)) {
-    return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+  const afterServer = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+  if (syncedFromServer && Object.keys(afterServer).length > 0) {
+    return afterServer;
   }
 
   return runDeduplicated(`bot_commands:${force ? 'force' : 'ttl'}`, async () => {
-    if (!force && isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS)) {
+    if (
+      !force &&
+      isCacheFresh('CORE_CHECK') &&
+      isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS, true)
+    ) {
       return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
     }
     try {
-      if (!force) {
-        const cachedList = await fetchAllPagesWithLimit20<BotCommandConfig>(
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (!isOffline && !isQuotaCooldownActive(force)) {
+        const list = await fetchAllPagesWithLimit20<BotCommandConfig>(
           'bot_commands',
           [],
           (d) => d.data() as BotCommandConfig,
-          false
-        ).catch(() => []);
-        if (cachedList.length > 0) {
-          const cachedMap: Record<string, BotCommandConfig> = {};
-          for (const item of cachedList) {
-            if (item?.command) cachedMap[item.command] = item;
+          true
+        );
+        if (list.length > 0) {
+          const map: Record<string, BotCommandConfig> = {};
+          for (const item of list) {
+            if (item?.command) {
+              map[item.command] = item;
+            }
           }
-          setLocal(STORAGE_KEYS.BOT_COMMANDS, cachedMap);
+          setLocal(STORAGE_KEYS.BOT_COMMANDS, map);
           setSyncTimestamp('BOT_COMMANDS');
-          window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: cachedMap }));
-          return cachedMap;
+          syncMutationToServerCache('bot_commands', { replace: map, authoritative: true });
+          window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: map }));
+          return map;
         }
       }
 
-      if (isQuotaCooldownActive(force) || !auth.currentUser) {
-        return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
-      }
-
-      const list = await fetchAllPagesWithLimit20<BotCommandConfig>(
+      const cachedList = await fetchAllPagesWithLimit20<BotCommandConfig>(
         'bot_commands',
         [],
         (d) => d.data() as BotCommandConfig,
-        force
-      );
-      const map: Record<string, BotCommandConfig> = {};
-      for (const item of list) {
-        if (item?.command) {
-          map[item.command] = item;
+        false
+      ).catch(() => []);
+      if (cachedList.length > 0) {
+        const cachedMap: Record<string, BotCommandConfig> = {};
+        for (const item of cachedList) {
+          if (item?.command) cachedMap[item.command] = item;
         }
+        setLocal(STORAGE_KEYS.BOT_COMMANDS, cachedMap);
+        window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: cachedMap }));
+        return cachedMap;
       }
-      setLocal(STORAGE_KEYS.BOT_COMMANDS, map);
-      setSyncTimestamp('BOT_COMMANDS');
-      window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: map }));
-      return map;
+
+      return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
       handleFirestoreError(err, OperationType.LIST, 'bot_commands');
@@ -1960,8 +2712,22 @@ export async function saveBotCommandConfig(config: BotCommandConfig) {
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
   try {
-    await setDoc(doc(db, 'bot_commands', docId), payload);
-    syncMutationToServerCache('bot_commands', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
+          method: 'POST',
+          body: JSON.stringify({ config: payload }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Sync] Supabase saveBotCommandConfig note:', err);
+      }
+    }
+    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+      await setDoc(doc(db, 'bot_commands', docId), payload);
+      syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
     throw err;
@@ -1981,8 +2747,33 @@ export async function resetBotCommandConfig(command: string) {
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
   try {
-    await deleteDoc(doc(db, 'bot_commands', docId));
-    syncMutationToServerCache('bot_commands', next);
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase (in dual or supabase mode)
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>(
+          `/api/db/bot-commands/${encodeURIComponent(command)}`,
+          { method: 'DELETE' }
+        );
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase resetBotCommandConfig note:', err);
+      }
+    }
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'bot_commands', docId));
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore resetBotCommandConfig note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
   }
@@ -1996,18 +2787,925 @@ export async function resetAllBotCommands(commands: string[]) {
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: {} }));
 
   try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
-        batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+
+    // 1. Delete in Supabase
+    if (useSupabase || mode === 'dual') {
+      try {
+        const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
+          method: 'DELETE',
+          body: JSON.stringify({ commands }),
+        });
+        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+      } catch (err) {
+        console.warn('[Dual Delete] Supabase resetAllBotCommands note:', err);
       }
-      await batch.commit();
     }
-    syncMutationToServerCache('bot_commands', {});
+
+    // 2. Dual-delete in Firestore SDK
+    if (useFirestore || mode === 'dual') {
+      if (auth.currentUser) {
+        try {
+          const CHUNK_SIZE = 450;
+          for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
+            const batch = writeBatch(db);
+            for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
+              batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+            }
+            await batch.commit();
+          }
+        } catch (err) {
+          console.warn('[Dual Delete] Firestore resetAllBotCommands note:', err);
+        }
+      }
+    }
+
+    syncMutationToServerCache('bot_commands', { replace: {}, authoritative: true });
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
   }
 
   await syncTelegramBotTemplates({});
 }
+
+// ---------------- Complete Firebase -> Supabase Migration & Full JSON Backup ----------------
+
+export interface FullDatabaseBackupPayload {
+  version: number;
+  exportedAt: string;
+  source: string;
+  subjects: Subject[];
+  questions: Question[];
+  notifications: AppNotification[];
+  botCommands: Record<string, BotCommandConfig>;
+  paidUsers: PaidUser[];
+  feedbacks: Feedback[];
+  logins: LoginRecord[];
+  presence: PresenceRecord[];
+}
+
+function mergeById<T extends { id?: string }>(...lists: (T[] | undefined | null)[]): T[] {
+  const map = new Map<string, T>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const key = item.id ? String(item.id) : '';
+      if (!key) continue;
+      map.set(key, { ...(map.get(key) || ({} as T)), ...item });
+    }
+  }
+  return Array.from(map.values());
+}
+
+async function fetchDbStatusSafe(): Promise<{ backend: DbBackendType; supabaseConfigured: boolean }> {
+  try {
+    const res = await fetch('/api/db/status', { cache: 'no-store' });
+    if (!res.ok) return { backend: 'firestore', supabaseConfigured: false };
+    const data = await res.json().catch(() => null);
+    return {
+      backend: data?.backend === 'supabase' ? 'supabase' : 'firestore',
+      supabaseConfigured: Boolean(data?.supabaseConfigured),
+    };
+  } catch {
+    return { backend: 'firestore', supabaseConfigured: false };
+  }
+}
+
+export async function collectAllFirebaseAndCachedData(
+  onProgress?: (msg: string) => void
+): Promise<{
+  payload: FullDatabaseBackupPayload;
+  warnings: string[];
+  totalRecords: number;
+}> {
+  await hydrateCacheFromIdb();
+  const warnings: string[] = [];
+
+  onProgress?.('កំពុងអានទិន្នន័យពី Server Cache និង Browser Cache...');
+  let serverSnap: {
+    questions?: Question[];
+    subjects?: Subject[];
+    notifications?: AppNotification[];
+    botCommands?: Record<string, BotCommandConfig>;
+  } = {};
+
+  if (auth.currentUser) {
+    try {
+      serverSnap = await dbApiRequest('/api/db/server-cache-snapshot');
+    } catch {
+      // Fall through to public cache snapshot below
+    }
+  }
+  if (!serverSnap.questions?.length && !serverSnap.subjects?.length) {
+    try {
+      const res = await fetch('/api/cache/core', { cache: 'no-store' });
+      if (res.ok) {
+        const core = await res.json().catch(() => null);
+        if (core) serverSnap = core;
+      }
+    } catch {
+      // Ignore offline cache miss
+    }
+  }
+
+  let liveSubjects: Subject[] = [];
+  let liveQuestions: Question[] = [];
+  let liveNotifications: AppNotification[] = [];
+  let liveBotCommandsList: BotCommandConfig[] = [];
+  let livePaidUsers: PaidUser[] = [];
+  let liveFeedbacks: Feedback[] = [];
+  let liveLogins: LoginRecord[] = [];
+  let livePresence: PresenceRecord[] = [];
+
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  if (!isOffline && auth.currentUser) {
+    const tryPull = async <T>(
+      labelKh: string,
+      collectionName: string,
+      mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => T
+    ): Promise<T[]> => {
+      onProgress?.(`កំពុងទាញទិន្នន័យ ${labelKh} ពី Firebase...`);
+      try {
+        return await fetchAllPagesWithLimit20<T>(collectionName, [], mapDoc, true);
+      } catch (err) {
+        markClientQuotaCooldownIfNeeded(err);
+        const msg = err instanceof Error ? err.message : String(err || '');
+        warnings.push(`${collectionName}: ${msg}`);
+        return [];
+      }
+    };
+
+    liveSubjects = await tryPull<Subject>('មុខវិជ្ជា (subjects)', 'subjects', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Subject, 'id'>),
+    }));
+    liveQuestions = await tryPull<Question>('សំណួរ (questions)', 'questions', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Question, 'id'>),
+    }));
+    liveNotifications = await tryPull<AppNotification>(
+      'ដំណឹង (notifications)',
+      'notifications',
+      (d) => ({ id: d.id, ...(d.data() as Omit<AppNotification, 'id'>) })
+    );
+    liveBotCommandsList = await tryPull<BotCommandConfig>(
+      'ពាក្យបញ្ជា Bot (bot_commands)',
+      'bot_commands',
+      (d) => d.data() as BotCommandConfig
+    );
+    livePaidUsers = await tryPull<PaidUser>('សមាជិក VIP (paid_users)', 'paid_users', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<PaidUser, 'id'>),
+    }));
+    liveFeedbacks = await tryPull<Feedback>('មតិយោបល់ (feedbacks)', 'feedbacks', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<Feedback, 'id'>),
+    }));
+    liveLogins = await tryPull<LoginRecord>('ប្រវត្តិ Login (logins)', 'logins', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<LoginRecord, 'id'>),
+    }));
+    livePresence = await tryPull<PresenceRecord>('វត្តមាន (presence)', 'presence', (d) => ({
+      id: d.id,
+      ...(d.data() as Omit<PresenceRecord, 'id'>),
+    }));
+  } else if (!auth.currentUser) {
+    warnings.push('មិនទាន់ភ្ជាប់ Google Admin — ទាញបានតែទិន្នន័យក្នុង Cache ប៉ុណ្ណោះ');
+  }
+
+  const localSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+  const localQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const localNotifications = getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
+  const localBotCommands = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+  const localPaidUsers = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+  const localFeedbacks = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+  const localLogins = getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+  const localPresence = getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []);
+
+  const subjects = sortSubjects(
+    mergeById(localSubjects, serverSnap.subjects, liveSubjects)
+  );
+  const questions = sortQuestions(
+    mergeById(localQuestions, serverSnap.questions, liveQuestions)
+  );
+  const notifications = mergeById(
+    localNotifications,
+    serverSnap.notifications,
+    liveNotifications
+  );
+  const paidUsers = mergeById(localPaidUsers, livePaidUsers);
+  const feedbacks = mergeById(localFeedbacks, liveFeedbacks);
+  const logins = mergeById(localLogins, liveLogins);
+  const presence = mergeById(localPresence, livePresence);
+
+  const botCommands: Record<string, BotCommandConfig> = {
+    ...localBotCommands,
+    ...(serverSnap.botCommands || {}),
+  };
+  for (const item of liveBotCommandsList) {
+    if (item?.command) {
+      botCommands[item.command] = item;
+    }
+  }
+
+  const totalRecords =
+    subjects.length +
+    questions.length +
+    notifications.length +
+    Object.keys(botCommands).length +
+    paidUsers.length +
+    feedbacks.length +
+    logins.length +
+    presence.length;
+
+  const payload: FullDatabaseBackupPayload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    source: 'master-quiz-kh-full-backup',
+    subjects,
+    questions,
+    notifications,
+    botCommands,
+    paidUsers,
+    feedbacks,
+    logins,
+    presence,
+  };
+
+  return { payload, warnings, totalRecords };
+}
+
+async function uploadBackupPayloadToSupabase(
+  payload: FullDatabaseBackupPayload,
+  onProgress?: (msg: string) => void
+): Promise<Record<string, number>> {
+  const status = await fetchDbStatusSafe();
+  if (!status.supabaseConfigured) {
+    throw new Error(
+      'មិនទាន់បានកំណត់ SUPABASE_URL និង SUPABASE_SERVICE_ROLE_KEY ក្នុង AI Studio Secrets នៅឡើយទេ! សូមដំណើរការ supabase/schema.sql ក្នុង Supabase SQL Editor រួចបញ្ចូល Secrets ជាមុនសិន។'
+    );
+  }
+  if (!auth.currentUser) {
+    throw new Error(
+      'សូមចុចប៊ូតុង "ភ្ជាប់ Google Admin" (reaksmey8114@gmail.com) នៅផ្នែកខាងលើជាមុនសិន ដើម្បីផ្ទៀងផ្ទាត់សិទ្ធិផ្ទេរទិន្នន័យ!'
+    );
+  }
+
+  const imported: Record<string, number> = {};
+  const CHUNK = 200;
+
+  // Step 1: Upload metadata & core small collections first
+  const hasCoreMeta =
+    payload.subjects.length > 0 ||
+    payload.notifications.length > 0 ||
+    Object.keys(payload.botCommands || {}).length > 0 ||
+    payload.paidUsers.length > 0;
+
+  const hasChunkedArrays =
+    payload.questions.length > 0 ||
+    payload.feedbacks.length > 0 ||
+    payload.logins.length > 0 ||
+    payload.presence.length > 0;
+
+  if (hasCoreMeta || !hasChunkedArrays) {
+    onProgress?.('កំពុងផ្ទេរមុខវិជ្ជា ដំណឹង សមាជិក VIP និង Bot Commands ទៅ Supabase...');
+    const res = await dbApiRequest<{ imported?: Record<string, number> }>('/api/db/migrate', {
+      method: 'POST',
+      body: JSON.stringify({
+        subjects: payload.subjects,
+        notifications: payload.notifications,
+        botCommands: payload.botCommands,
+        paidUsers: payload.paidUsers,
+        refreshCache: !hasChunkedArrays,
+        refreshStats: !hasChunkedArrays,
+      }),
+    });
+    for (const [k, v] of Object.entries(res.imported || {})) {
+      imported[k] = (imported[k] || 0) + Number(v || 0);
+    }
+  }
+
+  // Step 2: Upload larger collections in safe 200-item chunks
+  const rawTasks: Array<{
+    key: 'questions' | 'feedbacks' | 'logins' | 'presence';
+    label: string;
+    items: any[];
+  }> = [
+    { key: 'questions', label: 'សំណួរ', items: payload.questions },
+    { key: 'feedbacks', label: 'មតិយោបល់', items: payload.feedbacks },
+    { key: 'logins', label: 'ប្រវត្តិ Login', items: payload.logins },
+    { key: 'presence', label: 'វត្តមាន', items: payload.presence },
+  ];
+  const arrayTasks = rawTasks.filter((t) => t.items.length > 0);
+
+  for (let tIdx = 0; tIdx < arrayTasks.length; tIdx++) {
+    const task = arrayTasks[tIdx];
+    const isLastTask = tIdx === arrayTasks.length - 1;
+    for (let i = 0; i < task.items.length; i += CHUNK) {
+      const slice = task.items.slice(i, i + CHUNK);
+      const isLastChunk = isLastTask && i + CHUNK >= task.items.length;
+      const done = Math.min(i + slice.length, task.items.length);
+      onProgress?.(
+        `កំពុងផ្ទេរ ${task.label}: ${done}/${task.items.length} ទៅ Supabase...`
+      );
+      const res = await dbApiRequest<{ imported?: Record<string, number> }>('/api/db/migrate', {
+        method: 'POST',
+        body: JSON.stringify({
+          [task.key]: slice,
+          refreshCache: isLastChunk,
+          refreshStats: isLastChunk,
+        }),
+      });
+      for (const [k, v] of Object.entries(res.imported || {})) {
+        imported[k] = (imported[k] || 0) + Number(v || 0);
+      }
+    }
+  }
+
+  return imported;
+}
+
+export async function migrateAllFirebaseToSupabase(onProgress?: (msg: string) => void): Promise<{
+  imported: Record<string, number>;
+  warnings: string[];
+  totalRecords: number;
+}> {
+  const status = await fetchDbStatusSafe();
+  if (!status.supabaseConfigured) {
+    throw new Error(
+      'មិនទាន់បានកំណត់ SUPABASE_URL និង SUPABASE_SERVICE_ROLE_KEY ក្នុង AI Studio Secrets នៅឡើយទេ! សូមដំណើរការ supabase/schema.sql ក្នុង Supabase SQL Editor រួចបញ្ចូល Secrets ជាមុនសិន។'
+    );
+  }
+  if (!auth.currentUser) {
+    throw new Error(
+      'សូមចុចប៊ូតុង "ភ្ជាប់ Google Admin" (reaksmey8114@gmail.com) នៅផ្នែកខាងលើជាមុនសិន ដើម្បីផ្ទៀងផ្ទាត់សិទ្ធិផ្ទេរទិន្នន័យ!'
+    );
+  }
+
+  const { payload, warnings, totalRecords } = await collectAllFirebaseAndCachedData(onProgress);
+  const imported = await uploadBackupPayloadToSupabase(payload, onProgress);
+
+  // Run server-side Firestore REST fallback sweep if client encountered partial errors or sparse counts
+  if (warnings.length > 0 || totalRecords === 0) {
+    onProgress?.('កំពុងផ្ទៀងផ្ទាត់ និងទាញបន្ថែមពី Firebase Server...');
+    try {
+      const srvRes = await dbApiRequest<{
+        imported?: Record<string, number>;
+        warnings?: string[];
+      }>('/api/db/migrate-from-firestore', { method: 'POST', body: '{}' });
+      for (const [k, v] of Object.entries(srvRes.imported || {})) {
+        imported[k] = Math.max(imported[k] || 0, Number(v || 0));
+      }
+      if (Array.isArray(srvRes.warnings)) {
+        warnings.push(...srvRes.warnings);
+      }
+    } catch {
+      // Keep client-migrated counts cleanly
+    }
+  }
+
+  detectedDbBackend = 'supabase';
+  onProgress?.('កំពុងធ្វើបច្ចុប្បន្នភាពទិន្នន័យប្រើប្រាស់...');
+  await Promise.all([refreshCoreData(), refreshAdminMonitoringData()]).catch(() => {});
+
+  return {
+    imported,
+    warnings: Array.from(new Set(warnings)),
+    totalRecords: Object.values(imported).reduce((acc, n) => acc + Number(n || 0), 0) || totalRecords,
+  };
+}
+
+export async function exportAllFirebaseDataAsJson(onProgress?: (msg: string) => void): Promise<{
+  filename: string;
+  payload: FullDatabaseBackupPayload;
+  warnings: string[];
+  totalRecords: number;
+}> {
+  const { payload, warnings, totalRecords } = await collectAllFirebaseAndCachedData(onProgress);
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  const filename = `masterquiz-firebase-backup-${dateStamp}.json`;
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: 'application/json;charset=utf-8',
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  return { filename, payload, warnings, totalRecords };
+}
+
+export async function importBackupJsonToSupabase(
+  rawJson: string,
+  onProgress?: (msg: string) => void
+): Promise<{ imported: Record<string, number>; totalRecords: number }> {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    throw new Error('ឯកសារ JSON មិនត្រឹមត្រូវទេ! សូមពិនិត្យទម្រង់ឯកសារ Backup ម្ដងទៀត។');
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('ទម្រង់ឯកសារ Backup មិនត្រឹមត្រូវ!');
+  }
+
+  const normalized: FullDatabaseBackupPayload = {
+    version: Number(parsed.version || 1),
+    exportedAt: String(parsed.exportedAt || new Date().toISOString()),
+    source: String(parsed.source || 'json-backup-import'),
+    subjects: Array.isArray(parsed.subjects) ? parsed.subjects : [],
+    questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+    notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [],
+    botCommands:
+      parsed.botCommands && typeof parsed.botCommands === 'object' && !Array.isArray(parsed.botCommands)
+        ? parsed.botCommands
+        : {},
+    paidUsers: Array.isArray(parsed.paidUsers) ? parsed.paidUsers : [],
+    feedbacks: Array.isArray(parsed.feedbacks) ? parsed.feedbacks : [],
+    logins: Array.isArray(parsed.logins) ? parsed.logins : [],
+    presence: Array.isArray(parsed.presence) ? parsed.presence : [],
+  };
+
+  const countAll =
+    normalized.subjects.length +
+    normalized.questions.length +
+    normalized.notifications.length +
+    Object.keys(normalized.botCommands).length +
+    normalized.paidUsers.length +
+    normalized.feedbacks.length +
+    normalized.logins.length +
+    normalized.presence.length;
+
+  if (countAll === 0) {
+    throw new Error('មិនមានទិន្នន័យនៅក្នុងឯកសារ Backup នេះទេ!');
+  }
+
+  const imported = await uploadBackupPayloadToSupabase(normalized, onProgress);
+  detectedDbBackend = 'supabase';
+  await Promise.all([refreshCoreData(), refreshAdminMonitoringData()]).catch(() => {});
+
+  return {
+    imported,
+    totalRecords: Object.values(imported).reduce((acc, n) => acc + Number(n || 0), 0) || countAll,
+  };
+}
+
+// ---------------- Unified Real-Time Sync Engine (SSE + Supabase Realtime + Firestore onSnapshot) ----------------
+
+function applyRealtimeDelta(event: ClientRealtimeDeltaEvent) {
+  if (!event || !event.scope || !event.action) return;
+
+  if (typeof event.version === 'number' && event.version > 0) {
+    const prevVer = getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0);
+    if (event.version > prevVer) {
+      setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, event.version);
+    }
+  }
+
+  const { scope, action, id, ids, item, items, replace, mode } = event;
+
+  if (scope === 'db_mode' && mode) {
+    detectedDbBackend = mode === 'firestore' ? 'firestore' : 'supabase';
+    window.dispatchEvent(new CustomEvent('mpq-db-mode-changed', { detail: mode }));
+    void refreshCoreData().catch(() => {});
+    return;
+  }
+
+  if (scope === 'core' && action === 'refresh') {
+    void refreshCoreData().catch(() => {});
+    return;
+  }
+
+  if (scope === 'questions') {
+    const current = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+    let next: Question[] | null = null;
+    if (action === 'replace' && Array.isArray(replace)) {
+      next = sortQuestions(replace);
+    } else if (action === 'upsert' && item?.id) {
+      const exists = current.some((q) => q.id === item.id);
+      next = sortQuestions(
+        exists
+          ? current.map((q) => (q.id === item.id ? { ...q, ...item } : q))
+          : [...current, item]
+      );
+    } else if (action === 'upsertMany' && Array.isArray(items)) {
+      const map = new Map(current.map((q) => [q.id, q]));
+      for (const it of items) {
+        if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
+      }
+      next = sortQuestions(Array.from(map.values()));
+    } else if (action === 'delete' && id) {
+      if (current.some((q) => q.id === id)) {
+        next = current.filter((q) => q.id !== id);
+      }
+    } else if (action === 'deleteMany' && Array.isArray(ids) && ids.length > 0) {
+      const idSet = new Set(ids);
+      next = current.filter((q) => !q.id || !idSet.has(q.id));
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.QUESTIONS, next);
+      setSyncTimestamp('QUESTIONS');
+      window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'subjects') {
+    const current = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+    let next: Subject[] | null = null;
+    if (action === 'replace' && Array.isArray(replace)) {
+      next = sortSubjects(replace);
+    } else if (action === 'upsert' && item?.id) {
+      const exists = current.some((s) => s.id === item.id);
+      next = sortSubjects(
+        exists
+          ? current.map((s) => (s.id === item.id ? { ...s, ...item } : s))
+          : [...current, item]
+      );
+    } else if (action === 'upsertMany' && Array.isArray(items)) {
+      const map = new Map(current.map((s) => [s.id, s]));
+      for (const it of items) {
+        if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
+      }
+      next = sortSubjects(Array.from(map.values()));
+    } else if (action === 'delete' && id) {
+      if (current.some((s) => s.id === id)) {
+        next = current.filter((s) => s.id !== id);
+      }
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.SUBJECTS, next);
+      setSyncTimestamp('SUBJECTS');
+      window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'notifications') {
+    const current = getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
+    let next: AppNotification[] | null = null;
+    if (action === 'clear') {
+      next = [];
+    } else if (action === 'replace' && Array.isArray(replace)) {
+      next = resolveNotificationsWithDismissed(replace);
+    } else if (action === 'upsert' && item?.id) {
+      const merged = [item, ...current.filter((n) => n.id !== item.id)];
+      next = resolveNotificationsWithDismissed(merged).slice(0, 50);
+    } else if (action === 'delete' && id) {
+      if (current.some((n) => n.id === id)) {
+        next = current.filter((n) => n.id !== id);
+      }
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
+      setSyncTimestamp('NOTIFICATIONS');
+      window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'bot_commands') {
+    const current = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
+    let next: Record<string, BotCommandConfig> | null = null;
+    if (action === 'clear') {
+      next = {};
+    } else if (action === 'replace' && replace && typeof replace === 'object' && !Array.isArray(replace)) {
+      next = replace;
+    } else if (action === 'upsert' && item?.command) {
+      next = { ...current, [item.command]: item };
+    } else if (action === 'delete' && id) {
+      next = { ...current };
+      delete next[id];
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.BOT_COMMANDS, next);
+      setSyncTimestamp('BOT_COMMANDS');
+      window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'global_stats') {
+    const incoming = (action === 'replace' ? replace : item) as GlobalStats | undefined;
+    if (incoming && typeof incoming === 'object') {
+      const current = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+      const merged = { ...current, ...incoming };
+      setLocal(STORAGE_KEYS.GLOBAL_STATS, merged);
+      setSyncTimestamp('GLOBAL_STATS');
+      window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: merged }));
+    }
+    return;
+  }
+
+  if (scope === 'logins') {
+    const current = getLocal<LoginRecord[]>(STORAGE_KEYS.LOGINS, []);
+    let next: LoginRecord[] | null = null;
+    if (action === 'upsert' && item?.id) {
+      const rest = current.filter((l) => l.id !== item.id);
+      next = [item, ...rest]
+        .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+        .slice(0, 100);
+    } else if (action === 'delete' && id) {
+      if (current.some((l) => l.id === id)) next = current.filter((l) => l.id !== id);
+    } else if (action === 'deleteMany' && Array.isArray(ids)) {
+      const idSet = new Set(ids);
+      next = current.filter((l) => !idSet.has(l.id));
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.LOGINS, next);
+      window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'feedbacks') {
+    const current = getLocal<Feedback[]>(STORAGE_KEYS.FEEDBACKS, []);
+    if (action === 'upsert' && item?.id) {
+      const rest = current.filter((f) => f.id !== item.id);
+      const next = [item, ...rest]
+        .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+        .slice(0, 100);
+      setLocal(STORAGE_KEYS.FEEDBACKS, next);
+      window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: next }));
+    } else if (action === 'delete' && id && current.some((f) => f.id === id)) {
+      const next = current.filter((f) => f.id !== id);
+      setLocal(STORAGE_KEYS.FEEDBACKS, next);
+      window.dispatchEvent(new CustomEvent('mpq-feedbacks-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'presence') {
+    const current = getLocal<PresenceRecord[]>(STORAGE_KEYS.PRESENCE, []);
+    const cutoff = Date.now() - 300000;
+    if (action === 'upsert' && item?.id) {
+      const rest = current.filter((p) => p.id !== item.id);
+      const next = [item, ...rest]
+        .filter((p) => new Date(p.lastSeen || 0).getTime() >= cutoff)
+        .sort((a, b) => new Date(b.lastSeen || 0).getTime() - new Date(a.lastSeen || 0).getTime())
+        .slice(0, 100);
+      setLocal(STORAGE_KEYS.PRESENCE, next);
+      window.dispatchEvent(new CustomEvent('mpq-presence-changed', { detail: next }));
+      window.dispatchEvent(
+        new CustomEvent('mpq-online-count-changed', { detail: Math.max(1, next.length) })
+      );
+    } else if (action === 'delete' && id && current.some((p) => p.id === id)) {
+      const next = current.filter((p) => p.id !== id);
+      setLocal(STORAGE_KEYS.PRESENCE, next);
+      window.dispatchEvent(new CustomEvent('mpq-presence-changed', { detail: next }));
+    }
+    return;
+  }
+
+  if (scope === 'paid_users') {
+    const current = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+    let next: PaidUser[] | null = null;
+    if (action === 'upsert' && item?.id) {
+      const exists = current.some((u) => u.id === item.id);
+      next = exists
+        ? current.map((u) => (u.id === item.id ? { ...u, ...item } : u))
+        : [item, ...current];
+    } else if (action === 'delete' && id) {
+      if (current.some((u) => u.id === id)) next = current.filter((u) => u.id !== id);
+    }
+    if (next !== null) {
+      setLocal(STORAGE_KEYS.PAID_USERS, next);
+      window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
+    }
+  }
+}
+
+export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => void {
+  if (typeof window === 'undefined') return () => {};
+
+  let disposed = false;
+  let sse: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectDelayMs = 2000;
+  let unsubSupabase: (() => void) | null = null;
+  const firestoreUnsubs: Array<() => void> = [];
+
+  const detachFirestoreListeners = () => {
+    while (firestoreUnsubs.length > 0) {
+      const fn = firestoreUnsubs.pop();
+      try {
+        fn?.();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  };
+
+  // Layer 1: Express Server-Sent Events (SSE) for instant push across all clients
+  const connectSse = () => {
+    if (disposed || typeof EventSource === 'undefined') return;
+    try {
+      sse = new EventSource('/api/realtime/events');
+
+      sse.addEventListener('connected', (evt: MessageEvent) => {
+        reconnectDelayMs = 2000;
+        try {
+          const data = JSON.parse(evt.data);
+          if (typeof data?.onlineCount === 'number' && data.onlineCount > 0) {
+            window.dispatchEvent(
+              new CustomEvent('mpq-online-count-changed', { detail: data.onlineCount })
+            );
+          }
+          if (typeof data?.version === 'number') {
+            const localVer = getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0);
+            if (data.version > localVer) {
+              void syncCoreFromServer(false).catch(() => {});
+            }
+          }
+        } catch {
+          // Ignore malformed frame
+        }
+      });
+
+      sse.addEventListener('db_change', (evt: MessageEvent) => {
+        try {
+          const payload = JSON.parse(evt.data) as ClientRealtimeDeltaEvent;
+          applyRealtimeDelta(payload);
+        } catch {
+          // Ignore malformed frame
+        }
+      });
+
+      sse.onerror = () => {
+        if (sse) {
+          try {
+            sse.close();
+          } catch {
+            // Ignore
+          }
+          sse = null;
+        }
+        if (!disposed) {
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          const delay = reconnectDelayMs;
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+          reconnectTimer = setTimeout(connectSse, delay);
+        }
+      };
+    } catch {
+      // Ignore if EventSource unavailable
+    }
+  };
+
+  connectSse();
+
+  // Layer 2 & Layer 3: Supabase Realtime + Firebase Firestore onSnapshot
+  void fetchRealtimeConfig(true).then((cfg) => {
+    if (disposed || !cfg) return;
+
+    // Layer 2: Supabase Realtime WebSockets (postgres_changes + broadcast)
+    if (cfg.supabase?.configured && cfg.mode !== 'firestore') {
+      unsubSupabase = connectSupabaseRealtime(
+        (delta) => {
+          if (!disposed) applyRealtimeDelta(delta);
+        },
+        { includeAdminTables: Boolean(options?.isAdmin) }
+      );
+    }
+
+    // Layer 3: Firebase Firestore onSnapshot (strict limit(20) aligned with firestore.rules)
+    if (cfg.mode !== 'supabase' && auth.currentUser && !isQuotaCooldownActive(false)) {
+      const onFsError = (path: string) => (err: unknown) => {
+        markClientQuotaCooldownIfNeeded(err);
+        handleFirestoreError(err, OperationType.LIST, path);
+        if (isQuotaCooldownActive(false)) {
+          detachFirestoreListeners();
+        }
+      };
+
+      const attachCollectionDelta = (
+        colName: ClientRealtimeDeltaEvent['scope'],
+        constraints: QueryConstraint[],
+        mapDoc: (d: QueryDocumentSnapshot<DocumentData>) => any
+      ) => {
+        let isInitialSnapshot = true;
+        const q = query(collection(db, colName), ...constraints, limit(MAX_QUERY_LIMIT));
+        const unsub = onSnapshot(
+          q,
+          (snap) => {
+            if (disposed) return;
+            // Skip initial snapshot if it's from local cache only; apply real server deltas via docChanges()
+            const changes = snap.docChanges();
+            if (isInitialSnapshot) {
+              isInitialSnapshot = false;
+              if (snap.metadata.fromCache) return;
+            }
+            for (const change of changes) {
+              if (change.type === 'removed') {
+                applyRealtimeDelta({
+                  scope: colName,
+                  action: 'delete',
+                  id:
+                    colName === 'bot_commands'
+                      ? String(change.doc.data()?.command || change.doc.id)
+                      : change.doc.id,
+                  source: 'firestore',
+                  ts: Date.now(),
+                });
+              } else {
+                const mapped = mapDoc(change.doc);
+                applyRealtimeDelta({
+                  scope: colName,
+                  action: 'upsert',
+                  id: mapped?.id || mapped?.command || change.doc.id,
+                  item: mapped,
+                  source: 'firestore',
+                  ts: Date.now(),
+                });
+              }
+            }
+          },
+          onFsError(colName)
+        );
+        firestoreUnsubs.push(unsub);
+      };
+
+      attachCollectionDelta('subjects', [], (d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Subject, 'id'>),
+      }));
+      attachCollectionDelta('questions', [], (d) => ({
+        id: d.id,
+        ...(d.data() as Omit<Question, 'id'>),
+      }));
+      attachCollectionDelta('notifications', [orderBy('timestamp', 'desc')], (d) => ({
+        id: d.id,
+        ...(d.data() as Omit<AppNotification, 'id'>),
+      }));
+      attachCollectionDelta('bot_commands', [], (d) => d.data() as BotCommandConfig);
+
+      // Single-document global stats listener (1 read only when changed)
+      const unsubStatsDoc = onSnapshot(
+        doc(db, 'stats', 'global'),
+        (snap) => {
+          if (disposed || !snap.exists()) return;
+          applyRealtimeDelta({
+            scope: 'global_stats',
+            action: 'replace',
+            replace: snap.data() as GlobalStats,
+            source: 'firestore',
+            ts: Date.now(),
+          });
+        },
+        onFsError('stats/global')
+      );
+      firestoreUnsubs.push(unsubStatsDoc);
+
+      // Admin monitoring real-time listeners (strictly when Admin panel is open)
+      if (options?.isAdmin) {
+        attachCollectionDelta('logins', [orderBy('timestamp', 'desc')], (d) => ({
+          id: d.id,
+          ...(d.data() as Omit<LoginRecord, 'id'>),
+        }));
+        attachCollectionDelta('presence', [orderBy('lastSeen', 'desc')], (d) => ({
+          id: d.id,
+          ...(d.data() as Omit<PresenceRecord, 'id'>),
+        }));
+        attachCollectionDelta('feedbacks', [orderBy('createdAt', 'desc')], (d) => ({
+          id: d.id,
+          ...(d.data() as Omit<Feedback, 'id'>),
+        }));
+        attachCollectionDelta('paid_users', [orderBy('paidAt', 'desc')], (d) => ({
+          id: d.id,
+          ...(d.data() as Omit<PaidUser, 'id'>),
+        }));
+      }
+    }
+  });
+
+  return () => {
+    disposed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (sse) {
+      try {
+        sse.close();
+      } catch {
+        // Ignore
+      }
+      sse = null;
+    }
+    if (unsubSupabase) {
+      try {
+        unsubSupabase();
+      } catch {
+        // Ignore
+      }
+      unsubSupabase = null;
+    }
+    detachFirestoreListeners();
+  };
+}
+
+

@@ -37,11 +37,32 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
   const [isSuccess, setIsSuccess] = useState(false);
 
   // Sync default username when prop updates
+  const closeTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
   React.useEffect(() => {
     if (defaultUsername) {
       setUsername(defaultUsername);
     }
   }, [defaultUsername]);
+
+  React.useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) {
+        clearTimeout(closeTimerRef.current);
+      }
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isSubmitting) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, isSubmitting, onClose]);
 
   if (!isOpen) return null;
 
@@ -68,12 +89,13 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
 
       setIsSuccess(true);
 
+      const isApproved = paidRecord.status === 'active' && Boolean(paidRecord.permanentAccess);
       const session: UserSession = {
         username: cleanUsername,
         role: 'user',
         loggedInAt: new Date().toISOString(),
-        isPaid: true,
-        permanentAccess: true,
+        isPaid: isApproved,
+        permanentAccess: isApproved,
         paidAt: paidRecord.paidAt,
         transactionRef: paidRecord.transactionRef,
       };
@@ -81,7 +103,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
       // Store in localStorage for persistent session
       localStorage.setItem('master_pro_quiz_session', JSON.stringify(session));
 
-      setTimeout(() => {
+      closeTimerRef.current = setTimeout(() => {
         onPaymentSuccess(session);
         onClose();
       }, 1500);
@@ -93,14 +115,22 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md animate-fadeIn overflow-y-auto">
-      <div className="relative bg-slate-900 border border-amber-500/40 w-full max-w-xl rounded-3xl p-5 sm:p-7 shadow-2xl text-slate-150 my-auto max-h-[95vh] overflow-y-auto">
+    <div
+      onClick={() => {
+        if (!isSubmitting) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md animate-fadeIn overflow-y-auto"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative bg-slate-900 border border-amber-500/40 w-full max-w-xl rounded-3xl p-5 sm:p-7 shadow-2xl text-slate-200 my-auto max-h-[95vh] overflow-y-auto"
+      >
         {/* Close Button */}
         <button
           type="button"
           onClick={onClose}
           disabled={isSubmitting}
-          className="absolute top-4 right-4 text-slate-400 hover:text-white p-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 transition cursor-pointer"
+          className="absolute top-4 right-4 text-slate-400 hover:text-white p-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 transition cursor-pointer"
         >
           <X className="w-5 h-5" />
         </button>
@@ -182,7 +212,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
 
               {/* Instructions & Details */}
               <div className="flex-1 space-y-3 text-xs">
-                <div className="bg-slate-900/90 rounded-xl p-3 border border-slate-750 space-y-1.5">
+                <div className="bg-slate-900/90 rounded-xl p-3 border border-slate-700 space-y-1.5">
                   <div className="flex items-center justify-between text-slate-300">
                     <span>ឈ្មោះគណនីទទួល៖</span>
                     <strong className="text-slate-100 font-semibold">KHOUN NARET Master QuizKH</strong>

@@ -110,6 +110,7 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
   const [isReviewMode, setIsReviewMode] = useState(false);
   const [reviewFilter, setReviewFilter] = useState<'all' | 'correct' | 'wrong' | 'unanswered'>('all');
   const [shareModalMode, setShareModalMode] = useState<null | 'question' | 'result'>(null);
+  const [pendingReviewScrollIdx, setPendingReviewScrollIdx] = useState<number | null>(null);
 
   useEffect(() => {
     setPreparedQuestions(prepareRandomizedQuiz(questions));
@@ -120,7 +121,20 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
     setIsCompleted(false);
     setIsReviewMode(false);
     setReviewFilter('all');
+    setPendingReviewScrollIdx(null);
   }, [questions]);
+
+  useEffect(() => {
+    if (!isReviewMode || pendingReviewScrollIdx === null) return;
+    const targetIdx = pendingReviewScrollIdx;
+    setPendingReviewScrollIdx(null);
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`review-question-${targetIdx}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  }, [isReviewMode, pendingReviewScrollIdx]);
 
   const currentItem = preparedQuestions[currentIndex];
   const currentQ = currentItem?.original;
@@ -200,6 +214,45 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
       }
     }
   };
+
+  // Keyboard shortcuts during active quiz (1-4 for MCQ options, Left/Right arrows for navigation)
+  useEffect(() => {
+    if (isCompleted || isReviewMode || shareModalMode !== null || !currentQ) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (currentQ.type === 'mcq' && userAnswers[currentIndex] === undefined) {
+        const num = Number(e.key);
+        if (num >= 1 && num <= qOptionsData.options.length) {
+          e.preventDefault();
+          handleSelectOption(num - 1);
+          return;
+        }
+      }
+
+      if (e.key === 'ArrowLeft' && currentIndex > 0) {
+        e.preventDefault();
+        setCurrentIndex((prev) => Math.max(0, prev - 1));
+      } else if (e.key === 'ArrowRight') {
+        if (currentIndex < totalQuestions - 1) {
+          e.preventDefault();
+          setCurrentIndex((prev) => Math.min(totalQuestions - 1, prev + 1));
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isCompleted, isReviewMode, shareModalMode, currentQ, currentIndex, totalQuestions, userAnswers, qOptionsData]);
 
   const handleRetry = () => {
     setPreparedQuestions(prepareRandomizedQuiz(questions));
@@ -464,7 +517,8 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
               return (
                 <div
                   key={q.id ? `${q.id}-${idx}` : idx}
-                  className="khmer-frame-card rounded-2xl p-4 sm:p-6 space-y-3.5"
+                  id={`review-question-${idx}`}
+                  className="khmer-frame-card rounded-2xl p-4 sm:p-6 space-y-3.5 scroll-mt-24"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b app-border">
                     <div className="flex items-center gap-2 text-xs sm:text-sm">
@@ -695,6 +749,7 @@ export const QuizGameScreen: React.FC<QuizGameScreenProps> = ({
                   type="button"
                   onClick={() => {
                     setReviewFilter('all');
+                    setPendingReviewScrollIdx(idx);
                     setIsReviewMode(true);
                   }}
                   title={`សំណួរទី ${toKhmerNum(idx + 1)} — ចុចដើម្បី Preview ចម្លើយ`}

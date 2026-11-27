@@ -142,9 +142,10 @@ service cloud.firestore {
     }
 
     // ---------------- Collection Match Blocks ----------------
+    // Non-PII public quiz catalog collections: readable in <=20-item pages for members & server cache; admin-only writes
     match /questions/{questionId} {
-      allow get: if isSignedIn() && isValidId(questionId);
-      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow get: if isValidId(questionId);
+      allow list: if isWithinQueryLimit();
       allow create: if isAdmin() && isValidId(questionId) && isValidQuestion(incoming());
       allow update: if isAdmin() && isValidId(questionId) && isValidQuestion(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['subject', 'question', 'type', 'options', 'correct', 'answer', 'isActive', 'order']);
@@ -152,8 +153,8 @@ service cloud.firestore {
     }
 
     match /subjects/{subjectId} {
-      allow get: if isSignedIn() && isValidId(subjectId);
-      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow get: if isValidId(subjectId);
+      allow list: if isWithinQueryLimit();
       allow create: if isAdmin() && isValidId(subjectId) && isValidSubject(incoming());
       allow update: if isAdmin() && isValidId(subjectId) && isValidSubject(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'type', 'isActive', 'order']);
@@ -161,8 +162,8 @@ service cloud.firestore {
     }
 
     match /notifications/{notificationId} {
-      allow get: if isSignedIn() && isValidId(notificationId);
-      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow get: if isValidId(notificationId);
+      allow list: if isWithinQueryLimit();
       allow create: if isAdmin() && isValidId(notificationId) && isValidNotification(incoming());
       allow update: if isAdmin() && isValidId(notificationId) && isValidNotification(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['message', 'timestamp', 'type']);
@@ -170,14 +171,15 @@ service cloud.firestore {
     }
 
     match /bot_commands/{commandId} {
-      allow get: if isSignedIn() && isValidId(commandId);
-      allow list: if isSignedIn() && isWithinQueryLimit();
+      allow get: if isValidId(commandId);
+      allow list: if isWithinQueryLimit();
       allow create: if isAdmin() && isValidId(commandId) && isValidBotCommand(incoming());
       allow update: if isAdmin() && isValidId(commandId) && isValidBotCommand(incoming())
         && incoming().diff(existing()).affectedKeys().hasOnly(['command', 'titleKh', 'descriptionKh', 'title', 'body', 'imageUrl', 'imageAlt', 'actions', 'updatedAt']);
       allow delete: if isAdmin() && isValidId(commandId);
     }
 
+    // User/PII/Monitoring collections remain strictly authenticated
     match /feedbacks/{feedbackId} {
       allow get: if isSignedIn() && isValidId(feedbackId) && (isAdmin() || existing().uid == request.auth.uid);
       allow list: if isSignedIn() && isWithinQueryLimit() && (isAdmin() || existing().uid == request.auth.uid);
@@ -219,7 +221,7 @@ service cloud.firestore {
     }
 
     match /stats/{statId} {
-      allow get: if isSignedIn() && isValidId(statId);
+      allow get: if isValidId(statId);
       allow list: if false;
       allow create, update: if isSignedIn() && isValidId(statId) && isValidGlobalStats(incoming());
       allow delete: if false;

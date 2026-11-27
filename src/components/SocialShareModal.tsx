@@ -122,6 +122,15 @@ export const SocialShareModal: React.FC<SocialShareModalProps> = ({
     return map;
   }, [batchCandidates]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
+
   // Reset modal state on open
   useEffect(() => {
     if (!isOpen) return;
@@ -485,12 +494,16 @@ export const SocialShareModal: React.FC<SocialShareModalProps> = ({
 
   return (
     <div
+      onClick={onClose}
       className="fixed inset-0 z-[70] flex items-center justify-center p-3 sm:p-5 bg-black/65 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
       aria-labelledby="social-share-modal-title"
     >
-      <div className="relative khmer-ornate-card w-full max-w-4xl max-h-[92vh] overflow-y-auto rounded-2xl p-5 sm:p-7 shadow-2xl">
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative khmer-ornate-card w-full max-w-4xl max-h-[92vh] overflow-y-auto rounded-2xl p-5 sm:p-7 shadow-2xl"
+      >
         <KhmerCornerMotif position="tl" size={28} />
         <KhmerCornerMotif position="tr" size={28} />
         <KhmerCornerMotif position="bl" size={28} />

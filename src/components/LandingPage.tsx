@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, CheckCircle2 } from 'lucide-react';
-import { recordLogin, subscribeBotCommands, signInWithGoogle } from '../services/firebase';
+import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
@@ -54,6 +54,17 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     });
   }, [activeModal, isThemeModalOpen]);
 
+  useEffect(() => {
+    if (!activeModal) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setActiveModal(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [activeModal]);
+
   const currentThemeConfig = APP_THEMES.find((t) => t.id === currentTheme) || APP_THEMES[0];
 
   // Member form state
@@ -70,33 +81,57 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     return /^20\d{2}26$/.test(code);
   };
 
+  const [isCheckingMember, setIsCheckingMember] = useState(false);
+
   const handleMemberLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isCheckingMember) return;
     setMemberError('');
 
-    if (!username.trim()) {
+    const cleanUsername = username.trim();
+    if (!cleanUsername) {
       setMemberError('សូមបញ្ចូលឈ្មោះអ្នកប្រើប្រាស់ (Username)!');
       return;
     }
 
-    if (!password.trim()) {
-      setMemberError('សូមបញ្ចូលលេខសម្ងាត់ ៦ខ្ទង់!');
-      return;
+    setIsCheckingMember(true);
+    try {
+      const paidRecord = await checkIsUserPaid(cleanUsername).catch(() => null);
+      const isActiveVip = Boolean(
+        paidRecord && paidRecord.status === 'active' && paidRecord.permanentAccess
+      );
+
+      if (!isActiveVip) {
+        if (!password.trim()) {
+          setMemberError('សូមបញ្ចូលលេខសម្ងាត់ ៦ខ្ទង់!');
+          return;
+        }
+
+        if (!validateMemberPasscode(password.trim())) {
+          setMemberError('លេខសម្ងាត់មិនត្រឹមត្រូវទេ! សូមពិនិត្យម្ដងទៀត ឬទាក់ទង Admin ដើម្បីទទួលបានកូដសមាជិក។');
+          return;
+        }
+      }
+
+      const session: UserSession = {
+        username: cleanUsername,
+        role: 'user',
+        loggedInAt: new Date().toISOString(),
+        ...(isActiveVip && paidRecord
+          ? {
+              isPaid: true,
+              permanentAccess: true,
+              paidAt: paidRecord.paidAt,
+              transactionRef: paidRecord.transactionRef,
+            }
+          : {}),
+      };
+
+      await recordLogin(session.username, isActiveVip ? 'VIP Access' : '••••••', 'user');
+      onLoginSuccess(session);
+    } finally {
+      setIsCheckingMember(false);
     }
-
-    if (!validateMemberPasscode(password)) {
-      setMemberError('លេខសម្ងាត់មិនត្រឹមត្រូវទេ! សូមពិនិត្យម្ដងទៀត ឬទាក់ទង Admin ដើម្បីទទួលបានកូដសមាជិក។');
-      return;
-    }
-
-    const session: UserSession = {
-      username: username.trim(),
-      role: 'user',
-      loggedInAt: new Date().toISOString(),
-    };
-
-    await recordLogin(session.username, password, 'user');
-    onLoginSuccess(session);
   };
 
   const handleAdminLogin = async (e: React.FormEvent) => {
@@ -114,7 +149,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       loggedInAt: new Date().toISOString(),
     };
 
-    await recordLogin('Admin Master', adminCode, 'admin');
+    await recordLogin('Admin Master', 'Admin Auth', 'admin');
     onLoginSuccess(session);
   };
 
@@ -318,8 +353,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       {/* Modal: Member Login */}
       {activeModal === 'member' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-md rounded-2xl p-6 sm:p-8 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+        <div
+          onClick={() => setActiveModal(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="khmer-ornate-card w-full max-w-md rounded-2xl p-6 sm:p-8 shadow-2xl relative max-h-[90vh] overflow-y-auto"
+          >
             <KhmerCornerMotif position="tl" size={28} />
             <button
               type="button"
@@ -381,9 +422,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+                disabled={isCheckingMember}
+                className="w-full py-3 rounded-xl khmer-btn-primary font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-60 cursor-pointer"
               >
-                <span>ផ្ទៀងផ្ទាត់ និងចូលធ្វើតេស្ត</span>
+                <span>{isCheckingMember ? 'កំពុងផ្ទៀងផ្ទាត់...' : 'ផ្ទៀងផ្ទាត់ និងចូលធ្វើតេស្ត'}</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </form>
@@ -462,8 +504,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       {/* Modal: Admin Login */}
       {activeModal === 'admin' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-md rounded-2xl p-6 sm:p-8 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+        <div
+          onClick={() => setActiveModal(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="khmer-ornate-card w-full max-w-md rounded-2xl p-6 sm:p-8 shadow-2xl relative max-h-[90vh] overflow-y-auto"
+          >
             <KhmerCornerMotif position="tl" size={28} />
             <button
               type="button"

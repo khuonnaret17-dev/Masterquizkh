@@ -63,6 +63,10 @@ export default defineConfig(() => {
           navigateFallbackDenylist: [/^\/api\//, /^\/s\//],
           runtimeCaching: [
             {
+              urlPattern: ({ url }) => url.pathname.startsWith('/api/'),
+              handler: 'NetworkOnly',
+            },
+            {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
               options: {

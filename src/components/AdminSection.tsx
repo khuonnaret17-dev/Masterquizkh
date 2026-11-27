@@ -56,6 +56,7 @@ import {
   addQuestionsBatch,
   updateQuestion,
   deleteQuestion,
+  deleteQuestionsBatch,
   swapQuestions,
   addSubject,
   updateSubject,
@@ -73,6 +74,12 @@ import {
   refreshCoreData,
   refreshAdminMonitoringData,
   signInWithGoogle,
+  migrateAllFirebaseToSupabase,
+  exportAllFirebaseDataAsJson,
+  importBackupJsonToSupabase,
+  fetchDbMode,
+  setDbMode,
+  DbModeType,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
@@ -296,6 +303,57 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [isExportingPDF, setIsExportingPDF] = useState(false);
   const [pdfProgress, setPdfProgress] = useState<{ current: number; total: number } | null>(null);
   const [exportStatusMsg, setExportStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
+
+  const [isMigratingDb, setIsMigratingDb] = useState(false);
+  const [migrationProgressText, setMigrationProgressText] = useState('');
+  const [migrationStatusMsg, setMigrationStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
+  const [schemaSqlPreview, setSchemaSqlPreview] = useState<string | null>(null);
+  const [dbMode, setDbModeState] = useState<DbModeType>('dual');
+  const [isChangingMode, setIsChangingMode] = useState(false);
+  const backupImportFileRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    void fetchDbMode().then((info) => {
+      if (info?.mode) setDbModeState(info.mode);
+    }).catch(() => {});
+
+    const handleModeChanged = (e: Event) => {
+      const next = (e as CustomEvent<DbModeType>).detail;
+      if (next === 'dual' || next === 'supabase' || next === 'firestore') {
+        setDbModeState(next);
+      }
+    };
+    window.addEventListener('mpq-db-mode-changed', handleModeChanged);
+    return () => {
+      window.removeEventListener('mpq-db-mode-changed', handleModeChanged);
+    };
+  }, []);
+
+  const handleSelectDbMode = async (mode: DbModeType) => {
+    if (isChangingMode || dbMode === mode) return;
+    setIsChangingMode(true);
+    setMigrationStatusMsg(null);
+    try {
+      await setDbMode(mode);
+      setDbModeState(mode);
+      const modeNames: Record<DbModeType, string> = {
+        dual: 'ដំណើរការទ្វេរដង (Dual-Sync ទាំង Supabase និង Firebase)',
+        supabase: 'ប្រើប្រាស់ Supabase ទាំងស្រុង',
+        firestore: 'ប្រើប្រាស់ Firebase (Firestore) ទាំងស្រុង',
+      };
+      setMigrationStatusMsg({
+        text: `បានប្ដូររបៀប Database ទៅជា៖ ${modeNames[mode]} ជោគជ័យ!`,
+        success: true,
+      });
+    } catch (err: any) {
+      setMigrationStatusMsg({
+        text: err?.message || 'បរាជ័យក្នុងការប្ដូររបៀប Database',
+        success: false,
+      });
+    } finally {
+      setIsChangingMode(false);
+    }
+  };
 
   useEffect(() => {
     try {
@@ -800,14 +858,13 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       isOpen: true,
       title: `លុបមុខវិជ្ជា "${sub.name}"`,
       message: `តើអ្នកពិតជាចង់លុបមុខវិជ្ជា "${sub.name}"${countStr} មែនទេ?`,
-      subMessage: 'ការលុបនេះនឹងលុបចេញពីប្រព័ន្ធទាំងស្រុង និងមិនអាចត្រឡប់វិញបានទេ។',
+      subMessage: 'ការលុបនេះនឹងលុបចេញពីប្រព័ន្ធទាំងស្រុង (ទាំង Firebase និង Supabase) និងមិនអាចត្រឡប់វិញបានទេ។',
       onConfirm: async () => {
-        await deleteSubject(sub.id);
-        for (const q of matchingQuestions) {
-          if (q.id) {
-            await deleteQuestion(q.id);
-          }
+        const matchingIds = matchingQuestions.map((q) => q.id).filter(Boolean) as string[];
+        if (matchingIds.length > 0) {
+          await deleteQuestionsBatch(matchingIds);
         }
+        await deleteSubject(sub.id);
         if (selectedSubjectToManage === sub.name) {
           const remaining = subjects.filter((s) => s.id !== sub.id);
           setSelectedSubjectToManage(remaining[0]?.name || '');
@@ -840,12 +897,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       isOpen: true,
       title: `លុបសំណួរទាំងអស់ក្នុងមុខវិជ្ជា "${subjectName}"`,
       message: `តើអ្នកពិតជាចង់លុបសំណួរទាំង ${toKhmerNum(filtered.length)} សំណួរ មែនទេ?`,
-      subMessage: 'រាល់សំណួរ និងចម្លើយទាំងអស់ក្នុងមុខវិជ្ជានេះនឹងត្រូវបានលុបចេញពីប្រព័ន្ធ។',
+      subMessage: 'រាល់សំណួរ និងចម្លើយទាំងអស់ក្នុងមុខវិជ្ជានេះនឹងត្រូវបានលុបចេញពីប្រព័ន្ធ (ទាំង Firebase និង Supabase)។',
       onConfirm: async () => {
-        for (const q of filtered) {
-          if (q.id) {
-            await deleteQuestion(q.id);
-          }
+        const ids = filtered.map((q) => q.id).filter(Boolean) as string[];
+        if (ids.length > 0) {
+          await deleteQuestionsBatch(ids);
         }
       },
     });
@@ -1919,6 +1975,149 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       text: `បានទាញយកឯកសារ JSON («${titleLabel}» — ${toKhmerNum(targetQuestions.length)} សំណួរ) ជោគជ័យ!`,
       success: true,
     });
+  };
+
+  const formatImportedSummaryKh = (imported: Record<string, number>) => {
+    const labels: Record<string, string> = {
+      subjects: 'មុខវិជ្ជា',
+      questions: 'សំណួរ',
+      notifications: 'ដំណឹង',
+      botCommands: 'Bot Commands',
+      paidUsers: 'សមាជិក VIP',
+      feedbacks: 'មតិយោបល់',
+      logins: 'ប្រវត្តិ Login',
+      presence: 'វត្តមាន',
+    };
+    return Object.entries(imported)
+      .filter(([, count]) => Number(count) > 0)
+      .map(([key, count]) => `${labels[key] || key}: ${toKhmerNum(Number(count))}`)
+      .join(' · ');
+  };
+
+  const handleMigrateAllToSupabase = async () => {
+    if (isMigratingDb) return;
+    setIsMigratingDb(true);
+    setMigrationStatusMsg(null);
+    setMigrationProgressText('កំពុងរៀបចំទាញទិន្នន័យទាំងអស់...');
+    try {
+      const result = await migrateAllFirebaseToSupabase((msg) => setMigrationProgressText(msg));
+      const summary = formatImportedSummaryKh(result.imported);
+      const warnNote =
+        result.warnings.length > 0
+          ? ` (កំណត់ចំណាំ៖ ទិន្នន័យខ្លះប្រើ Cache ដោយសារ Firebase ជាប់ដែនកំណត់)`
+          : '';
+      setMigrationStatusMsg({
+        text: `ផ្ទេរទិន្នន័យទៅ Supabase ជោគជ័យ! (${summary || `សរុប ${toKhmerNum(result.totalRecords)}`})${warnNote}`,
+        success: true,
+      });
+    } catch (err: any) {
+      setMigrationStatusMsg({
+        text: err?.message || 'បរាជ័យក្នុងការផ្ទេរទិន្នន័យទៅ Supabase',
+        success: false,
+      });
+    } finally {
+      setIsMigratingDb(false);
+      setMigrationProgressText('');
+    }
+  };
+
+  const handleExportFullBackupJson = async () => {
+    if (isMigratingDb) return;
+    setIsMigratingDb(true);
+    setMigrationStatusMsg(null);
+    setMigrationProgressText('កំពុងប្រមូលទិន្នន័យទាំងអស់ជាឯកសារ Backup...');
+    try {
+      const res = await exportAllFirebaseDataAsJson((msg) => setMigrationProgressText(msg));
+      setMigrationStatusMsg({
+        text: `បានទាញយកឯកសារ Backup ទាំងអស់ (${res.filename} · សរុប ${toKhmerNum(res.totalRecords)} ទិន្នន័យ) ជោគជ័យ!`,
+        success: true,
+      });
+    } catch (err: any) {
+      setMigrationStatusMsg({
+        text: err?.message || 'បរាជ័យក្នុងការទាញយក Backup JSON',
+        success: false,
+      });
+    } finally {
+      setIsMigratingDb(false);
+      setMigrationProgressText('');
+    }
+  };
+
+  const handleImportFullBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || isMigratingDb) return;
+
+    setIsMigratingDb(true);
+    setMigrationStatusMsg(null);
+    setMigrationProgressText('កំពុងអានឯកសារ Backup...');
+    try {
+      const rawText = await file.text();
+      const res = await importBackupJsonToSupabase(rawText, (msg) => setMigrationProgressText(msg));
+      const summary = formatImportedSummaryKh(res.imported);
+      setMigrationStatusMsg({
+        text: `បញ្ចូលទិន្នន័យពី Backup ទៅ Supabase ជោគជ័យ! (${summary || `សរុប ${toKhmerNum(res.totalRecords)}`})`,
+        success: true,
+      });
+    } catch (err: any) {
+      setMigrationStatusMsg({
+        text: err?.message || 'បរាជ័យក្នុងការបញ្ចូលឯកសារ Backup ទៅ Supabase',
+        success: false,
+      });
+    } finally {
+      setIsMigratingDb(false);
+      setMigrationProgressText('');
+    }
+  };
+
+  const copyTextSafe = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fallback for restricted iframes / Safari
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return copied;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleCopySupabaseSchemaSql = async () => {
+    setMigrationStatusMsg(null);
+    try {
+      const res = await fetch('/api/db/schema-sql?raw=1', { cache: 'no-store' });
+      const rawSql = await res.text();
+      if (!res.ok || !rawSql.includes('CREATE TABLE') || rawSql.trim().startsWith('{')) {
+        throw new Error('មិនអាចទាញយកកូដ SQL បានទេ');
+      }
+      setSchemaSqlPreview(rawSql);
+      const copied = await copyTextSafe(rawSql);
+      setMigrationStatusMsg({
+        text: copied
+          ? 'បានចម្លង SQL (CREATE TABLE...) រួចរាល់! សូមលុបកូដចាស់ក្នុង Supabase SQL Editor រួច Paste និងចុច Run។'
+          : 'សូមចុច Select All & Copy កូដ SQL ខាងក្រោម (កុំ Paste ឯកសារ .json) ទៅ Run ក្នុង Supabase → SQL Editor។',
+        success: true,
+      });
+    } catch (err: any) {
+      setMigrationStatusMsg({
+        text: err?.message || 'មិនអាចចម្លង SQL បានទេ — សូមបើកឯកសារ supabase/schema.sql ដោយផ្ទាល់។',
+        success: false,
+      });
+    }
   };
 
   const [broadcastStatusMsg, setBroadcastStatusMsg] = useState<{ text: string; success: boolean } | null>(null);
@@ -3969,6 +4168,178 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                     <Download className="w-4 h-4 shrink-0" />
                     <span>Export JSON ទាំងអស់ ({toKhmerNum(questions.length)} សំណួរ)</span>
                   </button>
+                </div>
+
+                {/* Full Firebase -> Supabase Migration & Full Backup Section */}
+                <div className="pt-4 mt-4 border-t app-border space-y-4">
+                  {/* Database Mode Selector Card */}
+                  <div className="p-4 rounded-2xl app-subcard border app-border space-y-3">
+                    <div>
+                      <h4 className="font-bold text-sm app-text-primary flex items-center gap-2">
+                        <Layers className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                        <span>ជ្រើសរើសរបៀបដំណើរការ Database (Backend Mode)</span>
+                      </h4>
+                      <p className="text-xs app-text-muted mt-1 leading-relaxed">
+                        អ្នកអាចកំណត់ឱ្យប្រព័ន្ធដំណើរការលើ Supabase, Firebase (Firestore) ឬដំណើរការទ្វេរដងព្រមគ្នា (Dual-Sync)។ រាល់ការលុប ឬបន្ថែមទិន្នន័យ នឹងធ្វើសមកាលកម្មទាំង Firebase និង Supabase ដោយស្វ័យប្រវត្តិ។
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {[
+                        { id: 'dual', label: 'Dual-Sync (ទាំងពីរ)' },
+                        { id: 'supabase', label: 'Supabase ទាំងស្រុង' },
+                        { id: 'firestore', label: 'Firebase ទាំងស្រុង' },
+                      ].map((item) => {
+                        const isActive = dbMode === item.id;
+                        return (
+                          <button
+                            type="button"
+                            key={item.id}
+                            disabled={isChangingMode}
+                            onClick={() => handleSelectDbMode(item.id as DbModeType)}
+                            className={`py-2.5 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 ${
+                              isActive
+                                ? 'khmer-btn-crimson shadow-sm'
+                                : 'app-subcard hover:opacity-85 app-text-primary border app-border'
+                            }`}
+                          >
+                            {isActive && <Check className="w-3.5 h-3.5 shrink-0" />}
+                            <span>{item.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h4 className="font-bold text-sm app-text-primary flex items-center gap-2">
+                      <Cloud className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>ផ្ទេរ និងបម្រុងទុកទិន្នន័យទាំងអស់ (Firebase ⇄ Supabase)</span>
+                    </h4>
+                    <p className="text-xs app-text-muted mt-1 leading-relaxed">
+                      ផ្ទេរមុខវិជ្ជា សំណួរ ដំណឹង សមាជិក VIP មតិយោបល់ ប្រវត្តិ Login និង Bot Commands ទាំងអស់ទៅ Supabase ឬទាញយកឯកសារ Backup ពេញលេញ (.json)។
+                    </p>
+                  </div>
+
+                  <input
+                    ref={backupImportFileRef}
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={handleImportFullBackupFile}
+                    className="hidden"
+                  />
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleMigrateAllToSupabase}
+                      disabled={isMigratingDb}
+                      className="w-full py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      {isMigratingDb ? (
+                        <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                      ) : (
+                        <Cloud className="w-4 h-4 shrink-0" />
+                      )}
+                      <span>ផ្ទេរទិន្នន័យ Firebase → Supabase ទាំងអស់</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleCopySupabaseSchemaSql}
+                      disabled={isMigratingDb}
+                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      <FileText className="w-4 h-4 shrink-0" />
+                      <span>ចម្លង SQL បង្កើតតារា (schema.sql)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleExportFullBackupJson}
+                      disabled={isMigratingDb}
+                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      <Download className="w-4 h-4 shrink-0" />
+                      <span>ទាញយក Backup ទាំងអស់ (.json)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => backupImportFileRef.current?.click()}
+                      disabled={isMigratingDb}
+                      className="w-full py-3 px-3 rounded-xl app-subcard hover:opacity-85 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span>បញ្ចូល Backup ទៅ Supabase (.json)</span>
+                    </button>
+                  </div>
+
+                  {isMigratingDb && migrationProgressText && (
+                    <div className="px-3.5 py-2.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-xs flex items-center gap-2">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                      <span>{migrationProgressText}</span>
+                    </div>
+                  )}
+
+                  {migrationStatusMsg && (
+                    <div
+                      className={`px-3.5 py-2.5 rounded-xl text-xs font-medium flex items-start gap-2 border ${
+                        migrationStatusMsg.success
+                          ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
+                          : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200'
+                      }`}
+                    >
+                      {migrationStatusMsg.success ? (
+                        <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                      )}
+                      <span>{migrationStatusMsg.text}</span>
+                    </div>
+                  )}
+
+                  {schemaSqlPreview && (
+                    <div className="p-3 rounded-xl app-subcard border app-border space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold app-text-primary">
+                          កូដ SQL សម្រាប់ Supabase SQL Editor (ចាប់ផ្ដើមដោយ -- Master Quiz KH)
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const ok = await copyTextSafe(schemaSqlPreview);
+                              if (ok) {
+                                setMigrationStatusMsg({
+                                  text: 'បានចម្លង SQL ម្ដងទៀតជោគជ័យ!',
+                                  success: true,
+                                });
+                              }
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold cursor-pointer"
+                          >
+                            ចម្លង SQL
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSchemaSqlPreview(null)}
+                            className="p-1 rounded-lg app-text-muted hover:opacity-80 cursor-pointer"
+                            title="បិទ"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                      <textarea
+                        readOnly
+                        value={schemaSqlPreview}
+                        onFocus={(e) => e.currentTarget.select()}
+                        rows={7}
+                        className="w-full p-2.5 rounded-lg app-input text-[11px] font-mono leading-relaxed"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

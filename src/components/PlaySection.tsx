@@ -13,6 +13,7 @@ import {
   ChevronUp,
   RefreshCw,
   Cloud,
+  AlertTriangle,
 } from 'lucide-react';
 import { Question, Subject, UserSession, QuizContext, GlobalStats } from '../types';
 import { toKhmerNum, khmerAlphabetSort, shuffleArray, getOptionLabel } from '../utils/khmer';
@@ -63,27 +64,51 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [expandedWords, setExpandedWords] = useState<Record<string, boolean>>({});
 
-  // Filter active subjects
+  // Filter active subjects and defensively synthesize any subject referenced by active questions
   const activeSubjects = useMemo(() => {
-    return subjects.filter((s) => s.isActive !== false);
-  }, [subjects]);
+    const base = subjects.filter((s) => s.isActive !== false);
+    const knownNames = new Set(base.map((s) => (s.name || '').trim().toLowerCase()));
+    const hiddenNames = new Set(
+      subjects.filter((s) => s.isActive === false).map((s) => (s.name || '').trim().toLowerCase())
+    );
+    const extra: Subject[] = [];
+    let nextOrder = base.length;
+    for (const q of questions) {
+      if (q.isActive === false) continue;
+      const name = (q.subject || '').trim();
+      if (!name) continue;
+      const norm = name.toLowerCase();
+      if (knownNames.has(norm) || hiddenNames.has(norm)) continue;
+      knownNames.add(norm);
+      extra.push({
+        id: `virtual-sub-${nextOrder}-${name}`,
+        name,
+        type: q.type === 'short' || q.type === 'explanation' ? q.type : 'mcq',
+        isActive: true,
+        order: nextOrder++,
+      });
+    }
+    return [...base, ...extra];
+  }, [subjects, questions]);
 
-  // Map questions by subject name
+  // Map questions by normalized subject name so trailing whitespace never hides questions
   const questionsBySubject = useMemo(() => {
     const map: Record<string, Question[]> = {};
     for (const q of questions) {
       if (q.isActive === false) continue;
-      if (!map[q.subject]) {
-        map[q.subject] = [];
+      const key = (q.subject || '').trim();
+      if (!key) continue;
+      if (!map[key]) {
+        map[key] = [];
       }
-      map[q.subject].push(q);
+      map[key].push(q);
     }
     return map;
   }, [questions]);
 
   // Dictionary words (Type === 'explanation')
   const dictionaryWords = useMemo(() => {
-    const list = questions.filter((q) => q.type === 'explanation');
+    const list = questions.filter((q) => q.type === 'explanation' && q.isActive !== false);
     const sorted = [...list].sort((a, b) => khmerAlphabetSort(a.question, b.question));
     if (!searchTerm.trim()) return sorted;
     const term = searchTerm.toLowerCase();
@@ -103,7 +128,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
   };
 
   const handleStartPart = (subject: Subject, partIndex: number) => {
-    const allSubjectQuestions = questionsBySubject[subject.name] || [];
+    const allSubjectQuestions = questionsBySubject[subject.name.trim()] || [];
     const totalParts = Math.ceil(allSubjectQuestions.length / 10);
     const startIndex = partIndex * 10;
     const partQuestions = allSubjectQuestions.slice(startIndex, startIndex + 10);
@@ -136,16 +161,47 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
     setSelectedSubjectIds([]);
   };
 
+  const mixedPoolCount = useMemo(() => {
+    const validSubjectNames = new Set(
+      activeSubjects
+        .filter((s) => selectedSubjectIds.includes(s.id))
+        .map((s) => s.name.trim())
+    );
+    if (validSubjectNames.size === 0) {
+      return questions.filter((q) => q.isActive !== false).length;
+    }
+    return questions.filter(
+      (q) => q.isActive !== false && validSubjectNames.has((q.subject || '').trim())
+    ).length;
+  }, [activeSubjects, selectedSubjectIds, questions]);
+
+  React.useEffect(() => {
+    if (!selectedSubjectForParts && !viewingSubject) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setSelectedSubjectForParts(null);
+        setViewingSubject(null);
+        setPaperPdfCountLimit('all');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedSubjectForParts, viewingSubject]);
+
   const handleStartMixedQuiz = () => {
-    const validSubjectNames = activeSubjects
-      .filter((s) => selectedSubjectIds.includes(s.id))
-      .map((s) => s.name);
+    const validSubjectNames = new Set(
+      activeSubjects
+        .filter((s) => selectedSubjectIds.includes(s.id))
+        .map((s) => s.name.trim())
+    );
 
     let pool: Question[] = [];
-    if (validSubjectNames.length === 0) {
+    if (validSubjectNames.size === 0) {
       pool = questions.filter((q) => q.isActive !== false);
     } else {
-      pool = questions.filter((q) => q.isActive !== false && validSubjectNames.includes(q.subject));
+      pool = questions.filter(
+        (q) => q.isActive !== false && validSubjectNames.has((q.subject || '').trim())
+      );
     }
 
     if (pool.length === 0) return;
@@ -159,7 +215,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
   const handleDownloadPDF = async () => {
     if (!viewingSubject) return;
-    const allSubjectQuestions = questionsBySubject[viewingSubject.name] || [];
+    const allSubjectQuestions = questionsBySubject[viewingSubject.name.trim()] || [];
     if (allSubjectQuestions.length === 0) return;
 
     const targetQuestions =
@@ -304,12 +360,89 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
             ))}
           </div>
 
+          {/* Partial or Missing Question Data Recovery Banner */}
+          {!isSyncingCore && activeSubjects.length > 0 && questions.length === 0 && (
+            <div className="rounded-2xl khmer-frame-card border-amber-500/40 bg-amber-500/10 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="font-moul text-sm app-text-primary mb-1">
+                    ទិន្នន័យសំណួរមិនទាន់បានផ្ទុកចូលទូរស័ព្ទនេះពេញលេញទេ
+                  </h4>
+                  <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
+                    {!firebaseUserEmail
+                      ? 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ឬភ្ជាប់គណនី Google ដើម្បីផ្ទុកសំណួរទាំងអស់ចូលមុខវិជ្ជានីមួយៗ។'
+                      : 'សូមចុច «ទាញទិន្នន័យឡើងវិញ» ដើម្បីទាញយកសំណួរទាំងអស់ពី Cloud មកប្រើប្រាស់។'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {onSyncNow && (
+                  <button
+                    type="button"
+                    onClick={() => void onSyncNow()}
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl khmer-btn-primary text-xs sm:text-sm font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw className="w-4 h-4 shrink-0" />
+                    <span>ទាញទិន្នន័យឡើងវិញ</span>
+                  </button>
+                )}
+                {!firebaseUserEmail && onConnectGoogle && (
+                  <button
+                    type="button"
+                    onClick={() => void onConnectGoogle()}
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl app-subcard border app-border text-xs sm:text-sm font-semibold khmer-accent-text hover:opacity-85 flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Cloud className="w-4 h-4 shrink-0" />
+                    <span>ភ្ជាប់ Google Sync</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!isSyncingCore &&
+            questions.length > 0 &&
+            typeof globalStats?.questionsCount === 'number' &&
+            questions.length < globalStats.questionsCount && (
+              <div className="rounded-2xl app-subcard border app-border px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <p className="text-xs sm:text-sm app-text-secondary">
+                  ទិន្នន័យក្នុងឧបករណ៍នេះមាន{' '}
+                  <strong className="app-text-primary">{toKhmerNum(questions.length)}</strong> /{' '}
+                  <strong className="khmer-accent-text">{toKhmerNum(globalStats.questionsCount)}</strong>{' '}
+                  សំណួរ។ ចុចប៊ូតុងដើម្បីផ្ទុកសំណួរឱ្យគ្រប់ចំនួន។
+                </p>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {onSyncNow && (
+                    <button
+                      type="button"
+                      onClick={() => void onSyncNow()}
+                      className="min-h-[36px] px-3 py-1.5 rounded-xl khmer-btn-primary text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                      <span>ទាញសំណួរឱ្យគ្រប់</span>
+                    </button>
+                  )}
+                  {!firebaseUserEmail && onConnectGoogle && (
+                    <button
+                      type="button"
+                      onClick={() => void onConnectGoogle()}
+                      className="min-h-[36px] px-3 py-1.5 rounded-xl app-card border app-border text-xs font-semibold khmer-accent-text hover:opacity-85 flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Cloud className="w-3.5 h-3.5 shrink-0" />
+                      <span>ភ្ជាប់ Google Sync</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
           {/* Subjects Grid */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
             {activeSubjects
               .filter((sub) => typeFilter === 'all' || sub.type === typeFilter)
               .map((sub) => {
-                const count = (questionsBySubject[sub.name] || []).length;
+                const count = (questionsBySubject[sub.name.trim()] || []).length;
                 const partsCount = Math.ceil(count / 10);
 
                 return (
@@ -473,7 +606,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-64 overflow-y-auto pr-1">
                 {activeSubjects.map((sub) => {
                   const isSelected = selectedSubjectIds.includes(sub.id);
-                  const count = (questionsBySubject[sub.name] || []).length;
+                  const count = (questionsBySubject[sub.name.trim()] || []).length;
 
                   return (
                     <div
@@ -530,10 +663,15 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
           <button
             type="button"
             onClick={handleStartMixedQuiz}
-            className="w-full py-3.5 rounded-xl khmer-btn-primary font-bold text-sm sm:text-base shadow-sm flex items-center justify-center gap-2 cursor-pointer"
+            disabled={mixedPoolCount === 0}
+            className="w-full py-3.5 rounded-xl khmer-btn-primary font-bold text-sm sm:text-base shadow-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
             <Shuffle className="w-5 h-5" />
-            <span>ចាប់ផ្ដើមតេស្តចម្រុះ ({toKhmerNum(mixedCount)} សំណួរ)</span>
+            <span>
+              {mixedPoolCount === 0
+                ? 'មិនមានសំណួរសម្រាប់មុខវិជ្ជាដែលបានជ្រើសរើសទេ'
+                : `ចាប់ផ្ដើមតេស្តចម្រុះ (${toKhmerNum(Math.min(mixedCount, mixedPoolCount))} សំណួរ)`}
+            </span>
           </button>
         </div>
       )}
@@ -629,8 +767,14 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
       {/* MODAL: SELECT PART (១ភាគ = ១០សំណួរ) */}
       {selectedSubjectForParts && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-lg max-h-[90dvh] overflow-y-auto rounded-2xl p-5 sm:p-8 shadow-2xl relative">
+        <div
+          onClick={() => setSelectedSubjectForParts(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="khmer-ornate-card w-full max-w-lg max-h-[90dvh] overflow-y-auto rounded-2xl p-5 sm:p-8 shadow-2xl relative"
+          >
             <KhmerCornerMotif position="tl" size={28} />
             <button
               type="button"
@@ -648,19 +792,19 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                 {selectedSubjectForParts.name}
               </h3>
               <p className="text-sm app-text-secondary mt-1">
-                សរុប {toKhmerNum((questionsBySubject[selectedSubjectForParts.name] || []).length)} សំណួរ (១ភាគ = ១០សំណួរ)
+                សរុប {toKhmerNum((questionsBySubject[selectedSubjectForParts.name.trim()] || []).length)} សំណួរ (១ភាគ = ១០សំណួរ)
               </p>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-80 overflow-y-auto pr-1">
               {Array.from({
                 length: Math.ceil(
-                  (questionsBySubject[selectedSubjectForParts.name] || []).length / 10
+                  (questionsBySubject[selectedSubjectForParts.name.trim()] || []).length / 10
                 ),
               }).map((_, idx) => {
                 const countInPart = Math.min(
                   10,
-                  (questionsBySubject[selectedSubjectForParts.name] || []).length - idx * 10
+                  (questionsBySubject[selectedSubjectForParts.name.trim()] || []).length - idx * 10
                 );
 
                 return (
@@ -686,8 +830,17 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
 
       {/* MODAL: VIEW FULL PAPER */}
       {viewingSubject && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-sm">
-          <div className="khmer-ornate-card w-full max-w-4xl max-h-[90dvh] rounded-2xl flex flex-col shadow-2xl relative overflow-hidden">
+        <div
+          onClick={() => {
+            setViewingSubject(null);
+            setPaperPdfCountLimit('all');
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="khmer-ornate-card w-full max-w-4xl max-h-[90dvh] rounded-2xl flex flex-col shadow-2xl relative overflow-hidden"
+          >
             <div className="p-4 sm:p-6 border-b app-border flex flex-col md:flex-row md:items-center justify-between gap-3 app-subcard">
               <div className="min-w-0">
                 <span className="text-xs font-bold khmer-gold-text">
@@ -699,7 +852,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
               </div>
               <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
                 {session.role === 'admin' && (() => {
-                  const totalAvail = (questionsBySubject[viewingSubject.name] || []).length;
+                  const totalAvail = (questionsBySubject[viewingSubject.name.trim()] || []).length;
                   const resolvedLimit =
                     paperPdfCountLimit === 'all'
                       ? totalAvail
@@ -777,7 +930,7 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                 </h2>
               </div>
 
-              {(questionsBySubject[viewingSubject.name] || []).map((q, idx) => (
+              {(questionsBySubject[viewingSubject.name.trim()] || []).map((q, idx) => (
                 <div
                   key={q.id || idx}
                   className="p-4 sm:p-5 rounded-xl app-subcard"
@@ -811,6 +964,17 @@ export const PlaySection: React.FC<PlaySectionProps> = ({
                           </div>
                         );
                       })}
+                    </div>
+                  )}
+
+                  {q.type === 'mcq' && q.answer && q.answer.trim() && (
+                    <div className="mt-3 pl-0 sm:pl-6">
+                      <div className="p-3 rounded-xl app-answer-box text-xs sm:text-sm font-siemreap leading-relaxed whitespace-pre-line">
+                        <span className="font-moul text-[11px] app-answer-title block mb-1">
+                          ឯកសារយោង / ការបកស្រាយ៖
+                        </span>
+                        {q.answer}
+                      </div>
                     </div>
                   )}
 

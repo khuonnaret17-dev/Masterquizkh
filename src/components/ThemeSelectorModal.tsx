@@ -16,6 +16,15 @@ export const ThemeSelectorModal: React.FC<ThemeSelectorModalProps> = ({
   currentTheme,
   onThemeSelect,
 }) => {
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   const handleSelect = (themeId: AppThemeId) => {
@@ -24,8 +33,14 @@ export const ThemeSelectorModal: React.FC<ThemeSelectorModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-sm">
-      <div className="relative w-full max-w-2xl rounded-2xl khmer-ornate-card shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-sm"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative w-full max-w-2xl rounded-2xl khmer-ornate-card shadow-2xl overflow-hidden max-h-[92vh] flex flex-col"
+      >
         {/* Modal Header */}
         <div className="flex items-center justify-between p-5 sm:p-6 border-b app-border">
           <div className="flex items-center gap-3">

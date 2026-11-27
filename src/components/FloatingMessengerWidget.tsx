@@ -43,6 +43,21 @@ interface BotChatMessage {
   timestamp: string;
 }
 
+function sanitizeSafeExternalUrl(raw?: string): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = ({
   notifications,
   session = null,
@@ -143,6 +158,17 @@ export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = (
       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [botMessages, isOpen, activeTab]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen]);
 
   const handleBotSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -393,19 +419,24 @@ export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = (
 
                         {msg.reply.actions.length > 0 && (
                           <div className="pt-2 border-t app-border flex flex-col gap-1.5">
-                            {msg.reply.actions.map((act, idx) =>
-                              act.type === 'url' ? (
-                                <a
-                                  key={idx}
-                                  href={act.value}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="w-full py-2 px-3 rounded-xl app-card text-xs font-bold khmer-accent-text hover:opacity-85 flex items-center justify-between gap-2 transition"
-                                >
-                                  <span>{act.label}</span>
-                                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                                </a>
-                              ) : (
+                            {msg.reply.actions.map((act, idx) => {
+                              if (act.type === 'url') {
+                                const safeHref = sanitizeSafeExternalUrl(act.value);
+                                if (!safeHref) return null;
+                                return (
+                                  <a
+                                    key={idx}
+                                    href={safeHref}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="w-full py-2 px-3 rounded-xl app-card text-xs font-bold khmer-accent-text hover:opacity-85 flex items-center justify-between gap-2 transition"
+                                  >
+                                    <span>{act.label}</span>
+                                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                                  </a>
+                                );
+                              }
+                              return (
                                 <button
                                   key={idx}
                                   type="button"
@@ -419,8 +450,8 @@ export const FloatingMessengerWidget: React.FC<FloatingMessengerWidgetProps> = (
                                   <span>{act.label}</span>
                                   <ArrowRight className="w-3.5 h-3.5 shrink-0" />
                                 </button>
-                              )
-                            )}
+                              );
+                            })}
                           </div>
                         )}
                       </div>
