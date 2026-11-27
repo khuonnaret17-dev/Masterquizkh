@@ -31,6 +31,8 @@ import {
   fetchSubjectsCached,
   signInWithGoogle,
   startCoreRealtimeSync,
+  clearAdminSessionToken,
+  verifyAdminSession,
   PaginationCursor,
 } from './services/firebase';
 import { syncTelegramBotTemplates } from './services/telegram';
@@ -82,6 +84,48 @@ export default function App() {
       return null;
     }
   });
+
+  // Verify restored Admin sessions actually have a valid server token (or Firebase Admin auth)
+  // Keep offline PWA Admin sessions active when offline / network_error and re-verify once back online.
+  useEffect(() => {
+    if (session?.role !== 'admin') return;
+    let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearInvalidAdminSession = () => {
+      clearAdminSessionToken();
+      try {
+        localStorage.removeItem('master_pro_quiz_session');
+      } catch {
+        // Ignore
+      }
+      setSession(null);
+    };
+
+    const runVerification = () => {
+      void verifyAdminSession().then((status) => {
+        if (!active || status === 'valid' || status === 'network_error') return;
+        // Wait briefly if Firebase Auth is still initializing on page load
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          if (!active) return;
+          void verifyAdminSession().then((retryStatus) => {
+            if (!active || retryStatus !== 'invalid') return;
+            clearInvalidAdminSession();
+          });
+        }, 1200);
+      });
+    };
+
+    runVerification();
+    window.addEventListener('online', runVerification);
+
+    return () => {
+      active = false;
+      if (retryTimer) clearTimeout(retryTimer);
+      window.removeEventListener('online', runVerification);
+    };
+  }, [session?.role, firebaseUser?.uid]);
 
   // App View State
   const [activeTab, setActiveTab] = useState<'play' | 'admin'>('play');
@@ -382,6 +426,7 @@ export default function App() {
     setSession(null);
     setActiveQuizQuestions(null);
     setActiveQuizContext(null);
+    clearAdminSessionToken();
     try {
       localStorage.removeItem('master_pro_quiz_session');
     } catch {

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, CheckCircle2 } from 'lucide-react';
-import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid } from '../services/firebase';
+import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid, loginAdminWithPasscode } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
@@ -134,23 +134,35 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     }
   };
 
+  const [isCheckingAdmin, setIsCheckingAdmin] = useState(false);
+
   const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isCheckingAdmin) return;
     setAdminError('');
 
-    if (adminCode.trim() !== '168') {
-      setAdminError('លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។');
+    const trimmed = adminCode.trim();
+    if (!trimmed) {
+      setAdminError('សូមបញ្ចូលលេខកូដ Master Code របស់អ្នកគ្រប់គ្រង!');
       return;
     }
 
-    const session: UserSession = {
-      username: 'Admin Master',
-      role: 'admin',
-      loggedInAt: new Date().toISOString(),
-    };
+    setIsCheckingAdmin(true);
+    try {
+      await loginAdminWithPasscode(trimmed);
+      const session: UserSession = {
+        username: 'Admin Master',
+        role: 'admin',
+        loggedInAt: new Date().toISOString(),
+      };
 
-    await recordLogin('Admin Master', 'Admin Auth', 'admin');
-    onLoginSuccess(session);
+      await recordLogin('Admin Master', 'Admin Auth', 'admin');
+      onLoginSuccess(session);
+    } catch (err: any) {
+      setAdminError(err?.message || 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។');
+    } finally {
+      setIsCheckingAdmin(false);
+    }
   };
 
   const handleConnectGoogle = async () => {
@@ -556,10 +568,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-xl khmer-btn-crimson font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer"
+                disabled={isCheckingAdmin}
+                className="w-full py-3 rounded-xl khmer-btn-crimson font-semibold text-sm flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 <Lock className="w-4 h-4" />
-                <span>ផ្ទៀងផ្ទាត់ និងចូលគ្រប់គ្រង</span>
+                <span>{isCheckingAdmin ? 'កំពុងផ្ទៀងផ្ទាត់...' : 'ផ្ទៀងផ្ទាត់ និងចូលគ្រប់គ្រង'}</span>
               </button>
             </form>
 

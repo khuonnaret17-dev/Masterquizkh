@@ -351,6 +351,18 @@ export async function sbUpdateQuestion(id: string, updates: any) {
   if (error) throw new Error(`Supabase update question failed: ${error.message}`);
 }
 
+export async function sbRenameQuestionsSubject(oldSubject: string, newSubject: string) {
+  const cleanOld = oldSubject.trim();
+  const cleanNew = newSubject.trim().slice(0, 200);
+  if (!cleanOld || !cleanNew || cleanOld === cleanNew) return;
+  const sb = getSupabaseAdmin();
+  const { error } = await sb
+    .from('questions')
+    .update({ subject: cleanNew })
+    .eq('subject', cleanOld);
+  if (error) throw new Error(`Supabase rename questions subject failed: ${error.message}`);
+}
+
 export async function sbDeleteQuestion(id: string) {
   const sb = getSupabaseAdmin();
   const { error } = await sb.from('questions').delete().eq('id', id);
@@ -771,10 +783,13 @@ function mapRealtimeRow(table: string, row: any): any {
   }
 }
 
-export function startServerSupabaseRealtime(
-  onEvent: (event: SupabaseRealtimeServerEvent) => void
-): () => void {
-  if (!isSupabaseConfigured()) return () => {};
+let serverRealtimeStop = false;
+let serverRealtimeReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let serverRealtimeRetryMs = 2500;
+let serverRealtimeCallback: ((event: SupabaseRealtimeServerEvent) => void) | null = null;
+
+function attachServerSupabaseChannel() {
+  if (serverRealtimeStop || !isSupabaseConfigured() || !serverRealtimeCallback) return;
   try {
     const sb = getSupabaseAdmin();
     if (realtimeChannel) {
@@ -798,6 +813,8 @@ export function startServerSupabaseRealtime(
       'paid_users',
       'global_stats',
     ];
+
+    const onEvent = serverRealtimeCallback;
 
     let ch = sb.channel(SUPABASE_REALTIME_CHANNEL, {
       config: {
@@ -835,30 +852,70 @@ export function startServerSupabaseRealtime(
     });
 
     realtimeChannel = ch.subscribe((status) => {
-      realtimeSubscribed = status === 'SUBSCRIBED';
+      if (serverRealtimeStop) return;
       if (status === 'SUBSCRIBED') {
+        realtimeSubscribed = true;
+        serverRealtimeRetryMs = 2500;
         console.log('[Supabase Realtime] Server channel connected & listening.');
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        realtimeSubscribed = false;
+        if (!serverRealtimeReconnectTimer) {
+          const delay = serverRealtimeRetryMs;
+          serverRealtimeRetryMs = Math.min(serverRealtimeRetryMs * 2, 30000);
+          serverRealtimeReconnectTimer = setTimeout(() => {
+            serverRealtimeReconnectTimer = null;
+            attachServerSupabaseChannel();
+          }, delay);
+        }
       }
     });
-
-    return () => {
-      if (realtimeChannel) {
-        try {
-          sb.removeChannel(realtimeChannel);
-        } catch {
-          // Ignore
-        }
-        realtimeChannel = null;
-        realtimeSubscribed = false;
-      }
-    };
   } catch (err) {
     console.warn('[Supabase Realtime] Server setup note:', err);
-    return () => {};
   }
 }
 
+export function startServerSupabaseRealtime(
+  onEvent: (event: SupabaseRealtimeServerEvent) => void
+): () => void {
+  if (!isSupabaseConfigured()) return () => {};
+  serverRealtimeStop = false;
+  serverRealtimeCallback = onEvent;
+  if (serverRealtimeReconnectTimer) {
+    clearTimeout(serverRealtimeReconnectTimer);
+    serverRealtimeReconnectTimer = null;
+  }
+  attachServerSupabaseChannel();
+
+  return () => {
+    serverRealtimeStop = true;
+    serverRealtimeCallback = null;
+    if (serverRealtimeReconnectTimer) {
+      clearTimeout(serverRealtimeReconnectTimer);
+      serverRealtimeReconnectTimer = null;
+    }
+    if (realtimeChannel) {
+      try {
+        getSupabaseAdmin().removeChannel(realtimeChannel);
+      } catch {
+        // Ignore
+      }
+      realtimeChannel = null;
+      realtimeSubscribed = false;
+    }
+  };
+}
+
 export async function broadcastSupabaseRealtime(payload: Record<string, any>): Promise<void> {
+  if (!isSupabaseConfigured()) return;
+  if (!realtimeChannel || !realtimeSubscribed) {
+    if (!serverRealtimeStop && serverRealtimeCallback && !serverRealtimeReconnectTimer) {
+      attachServerSupabaseChannel();
+    }
+    for (let i = 0; i < 6; i++) {
+      if (realtimeChannel && realtimeSubscribed) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
   if (!realtimeChannel || !realtimeSubscribed) return;
   try {
     await realtimeChannel.send({

@@ -55,6 +55,7 @@ import {
   addQuestion,
   addQuestionsBatch,
   updateQuestion,
+  renameQuestionsSubject,
   deleteQuestion,
   deleteQuestionsBatch,
   swapQuestions,
@@ -769,15 +770,20 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [editQuestionOptions, setEditQuestionOptions] = useState<string[]>(['', '', '', '']);
   const [editQuestionCorrect, setEditQuestionCorrect] = useState<number>(0);
   const [editQuestionAnswer, setEditQuestionAnswer] = useState('');
+  const [isSavingQuestionEdit, setIsSavingQuestionEdit] = useState(false);
+  const [editQuestionError, setEditQuestionError] = useState<string | null>(null);
 
   // Subject Edit Modal State
   const [editingSubject, setEditingSubject] = useState<Subject | null>(null);
   const [editSubjectName, setEditSubjectName] = useState('');
   const [editSubjectType, setEditSubjectType] = useState<QuestionType>('mcq');
   const [editSubjectIsActive, setEditSubjectIsActive] = useState<boolean>(true);
+  const [isSavingSubjectEdit, setIsSavingSubjectEdit] = useState(false);
+  const [editSubjectError, setEditSubjectError] = useState<string | null>(null);
 
   // Open & save handlers for editing questions
   const handleOpenEditQuestionModal = (q: Question) => {
+    setEditQuestionError(null);
     setEditingQuestion(q);
     setEditQuestionSubject(q.subject || subjects[0]?.name || '');
     setEditQuestionText(q.question || '');
@@ -793,7 +799,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
   const handleSaveQuestionEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingQuestion || !editingQuestion.id) return;
+    if (!editingQuestion || !editingQuestion.id || isSavingQuestionEdit) return;
     if (!editQuestionText.trim()) return;
 
     const updates: Partial<Question> = {
@@ -805,12 +811,21 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       answer: editQuestionAnswer.trim() || undefined,
     };
 
-    await updateQuestion(editingQuestion.id, updates);
-    setEditingQuestion(null);
+    setIsSavingQuestionEdit(true);
+    setEditQuestionError(null);
+    try {
+      await updateQuestion(editingQuestion.id, updates);
+      setEditingQuestion(null);
+    } catch (err: any) {
+      setEditQuestionError(err?.message || 'បរាជ័យក្នុងការរក្សាទុកការកែប្រែសំណួរ!');
+    } finally {
+      setIsSavingQuestionEdit(false);
+    }
   };
 
   // Open & save handlers for editing subjects
   const handleOpenEditSubjectModal = (sub: Subject) => {
+    setEditSubjectError(null);
     setEditingSubject(sub);
     setEditSubjectName(sub.name);
     setEditSubjectType(sub.type);
@@ -819,27 +834,53 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
 
   const handleSaveSubjectEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingSubject || !editingSubject.id) return;
+    if (!editingSubject || !editingSubject.id || isSavingSubjectEdit) return;
     const newName = editSubjectName.trim();
     if (!newName) return;
 
     const oldName = editingSubject.name;
-    await updateSubject(editingSubject.id, {
-      name: newName,
-      type: editSubjectType,
-      isActive: editSubjectIsActive,
-    });
+    setIsSavingSubjectEdit(true);
+    setEditSubjectError(null);
+    try {
+      await updateSubject(editingSubject.id, {
+        name: newName,
+        type: editSubjectType,
+        isActive: editSubjectIsActive,
+      });
 
-    if (oldName !== newName) {
-      const matchingQuestions = questions.filter((q) => q.subject === oldName);
-      for (const q of matchingQuestions) {
-        if (q.id) {
-          await updateQuestion(q.id, { subject: newName });
+      if (oldName !== newName) {
+        const matchingQuestions = questions.filter((q) => q.subject === oldName);
+        if (matchingQuestions.length > 0) {
+          await renameQuestionsSubject(oldName, newName, matchingQuestions);
         }
       }
-    }
 
-    setEditingSubject(null);
+      setEditingSubject(null);
+    } catch (err: any) {
+      setEditSubjectError(err?.message || 'បរាជ័យក្នុងការរក្សាទុកការកែប្រែមុខវិជ្ជា!');
+    } finally {
+      setIsSavingSubjectEdit(false);
+    }
+  };
+
+  const handleToggleSubjectActive = async (sub: Subject) => {
+    if (!sub.id) return;
+    setSubjectOrderStatusMsg(null);
+    try {
+      const nextActive = sub.isActive === false;
+      await updateSubject(sub.id, { isActive: nextActive });
+      setSubjectOrderStatusMsg({
+        text: nextActive
+          ? `បានបើកដំណើរការមុខវិជ្ជា "${sub.name}" ជោគជ័យ!`
+          : `បានបិទមុខវិជ្ជា "${sub.name}" ជាបណ្ដោះអាសន្ន!`,
+        success: true,
+      });
+    } catch (err: any) {
+      setSubjectOrderStatusMsg({
+        text: err?.message || `បរាជ័យក្នុងការកែប្រែស្ថានភាពមុខវិជ្ជា "${sub.name}"!`,
+        success: false,
+      });
+    }
   };
 
   // In-App Confirmation Dialog State (avoids iframe window.confirm blocking)
@@ -850,6 +891,8 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
     subMessage?: string;
     onConfirm: () => Promise<void> | void;
   } | null>(null);
+  const [isConfirmDeleting, setIsConfirmDeleting] = useState(false);
+  const [deleteConfirmError, setDeleteConfirmError] = useState<string | null>(null);
 
   const handleDeleteSubjectClick = (sub: Subject) => {
     const matchingQuestions = questions.filter((q) => q.subject === sub.name);
@@ -3246,7 +3289,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                           <td className="py-3 px-3 whitespace-nowrap">
                             <button
                               type="button"
-                              onClick={() => updateSubject(sub.id, { isActive: !sub.isActive })}
+                              onClick={() => void handleToggleSubjectActive(sub)}
                               className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer whitespace-nowrap ${
                                 sub.isActive !== false
                                   ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-200 border border-emerald-400 dark:border-emerald-700'
@@ -6308,15 +6351,23 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 />
               </div>
 
+              {editQuestionError && (
+                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{editQuestionError}</span>
+                </div>
+              )}
+
               <div className="flex items-center justify-between pt-4 border-t app-border">
                 <button
                   type="button"
+                  disabled={isSavingQuestionEdit}
                   onClick={() => {
                     if (editingQuestion) {
                       handleDeleteQuestionClick(editingQuestion);
                     }
                   }}
-                  className="px-4 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
                 >
                   <Trash2 className="w-4 h-4" />
                   <span>លុបសំណួរនេះ</span>
@@ -6325,16 +6376,18 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={isSavingQuestionEdit}
                     onClick={() => setEditingQuestion(null)}
-                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
+                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
                   >
                     បោះបង់
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition cursor-pointer"
+                    disabled={isSavingQuestionEdit}
+                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition disabled:opacity-60 cursor-pointer"
                   >
-                    រក្សាទុកការកែប្រែ
+                    {isSavingQuestionEdit ? 'កំពុងរក្សាទុក...' : 'រក្សាទុកការកែប្រែ'}
                   </button>
                 </div>
               </div>
@@ -6405,15 +6458,23 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 </button>
               </div>
 
+              {editSubjectError && (
+                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{editSubjectError}</span>
+                </div>
+              )}
+
               <div className="flex items-center justify-between pt-4 border-t app-border">
                 <button
                   type="button"
+                  disabled={isSavingSubjectEdit}
                   onClick={() => {
                     if (editingSubject) {
                       handleDeleteSubjectClick(editingSubject);
                     }
                   }}
-                  className="px-3.5 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer"
+                  className="px-3.5 py-2 rounded-xl bg-red-50 dark:bg-red-950/60 hover:opacity-80 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 font-bold text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
                 >
                   <Trash2 className="w-4 h-4" />
                   <span>លុបមុខវិជ្ជា</span>
@@ -6422,16 +6483,18 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={isSavingSubjectEdit}
                     onClick={() => setEditingSubject(null)}
-                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
+                    className="px-4 py-2 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
                   >
                     បោះបង់
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition cursor-pointer"
+                    disabled={isSavingSubjectEdit}
+                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition disabled:opacity-60 cursor-pointer"
                   >
-                    រក្សាទុក
+                    {isSavingSubjectEdit ? 'កំពុងរក្សាទុក...' : 'រក្សាទុក'}
                   </button>
                 </div>
               </div>
@@ -6771,25 +6834,45 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               </p>
             )}
 
+            {deleteConfirmError && (
+              <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 text-xs sm:text-sm flex items-center justify-center gap-2 mb-4">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{deleteConfirmError}</span>
+              </div>
+            )}
+
             <div className="flex items-center justify-center gap-3 mt-4">
               <button
                 type="button"
-                onClick={() => setDeleteConfirmDialog(null)}
-                className="flex-1 py-2.5 rounded-xl app-subcard app-text-primary text-sm font-semibold transition cursor-pointer"
+                disabled={isConfirmDeleting}
+                onClick={() => {
+                  setDeleteConfirmError(null);
+                  setDeleteConfirmDialog(null);
+                }}
+                className="flex-1 py-2.5 rounded-xl app-subcard app-text-primary text-sm font-semibold transition disabled:opacity-50 cursor-pointer"
               >
                 បោះបង់
               </button>
               <button
                 type="button"
+                disabled={isConfirmDeleting}
                 onClick={async () => {
-                  const action = deleteConfirmDialog.onConfirm;
-                  setDeleteConfirmDialog(null);
-                  await action();
+                  if (isConfirmDeleting) return;
+                  setIsConfirmDeleting(true);
+                  setDeleteConfirmError(null);
+                  try {
+                    await deleteConfirmDialog.onConfirm();
+                    setDeleteConfirmDialog(null);
+                  } catch (err: any) {
+                    setDeleteConfirmError(err?.message || 'បរាជ័យក្នុងការលុបទិន្នន័យលើ Server!');
+                  } finally {
+                    setIsConfirmDeleting(false);
+                  }
                 }}
-                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm transition flex items-center justify-center gap-1.5 cursor-pointer"
+                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm transition flex items-center justify-center gap-1.5 disabled:opacity-60 cursor-pointer"
               >
                 <Trash2 className="w-4 h-4" />
-                <span>យល់ព្រមលុប</span>
+                <span>{isConfirmDeleting ? 'កំពុងលុប...' : 'យល់ព្រមលុប'}</span>
               </button>
             </div>
           </div>

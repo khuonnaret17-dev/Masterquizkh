@@ -60,6 +60,7 @@ import {
 } from './localCacheDb';
 import {
   connectSupabaseRealtime,
+  broadcastClientSupabaseSync,
   fetchRealtimeConfig,
   ClientRealtimeDeltaEvent,
 } from './supabaseClient';
@@ -153,17 +154,101 @@ async function ensureDbBackend(): Promise<DbBackendType> {
   return backendDetectPromise;
 }
 
+const ADMIN_SESSION_TOKEN_KEY = 'mpq_admin_session_token_v1';
+const LOCAL_BROADCAST_CHANNEL_NAME = 'master-quiz-kh-sync';
+
+export function getAdminSessionToken(): string | null {
+  try {
+    const token = localStorage.getItem(ADMIN_SESSION_TOKEN_KEY);
+    return token && token.trim() ? token.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearAdminSessionToken(): void {
+  try {
+    localStorage.removeItem(ADMIN_SESSION_TOKEN_KEY);
+  } catch {
+    // Ignore storage error
+  }
+}
+
+export async function loginAdminWithPasscode(passcode: string): Promise<boolean> {
+  const res = await fetch('/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ passcode: passcode.trim() }),
+    cache: 'no-store',
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data?.success || !data?.token) {
+    throw new Error(data?.error || 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ!');
+  }
+  try {
+    localStorage.setItem(ADMIN_SESSION_TOKEN_KEY, String(data.token));
+  } catch {
+    // Ignore storage error
+  }
+  return true;
+}
+
+export type AdminSessionVerification = 'valid' | 'invalid' | 'network_error';
+
+export async function verifyAdminSession(): Promise<AdminSessionVerification> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return 'network_error';
+  }
+  try {
+    const authHeader = await getAuthBearerHeader();
+    const adminToken = getAdminSessionToken();
+    if (!authHeader && !adminToken) return 'invalid';
+    const headers: Record<string, string> = {};
+    if (authHeader) headers['Authorization'] = authHeader;
+    if (adminToken) headers['X-Admin-Token'] = adminToken;
+    const res = await fetch('/api/admin/verify', { headers, cache: 'no-store' });
+    if (res.ok) return 'valid';
+    if (res.status === 401 || res.status === 403) return 'invalid';
+    return 'network_error';
+  } catch {
+    return 'network_error';
+  }
+}
+
+function notifyRealtimeMutation(event: ClientRealtimeDeltaEvent) {
+  const payload: ClientRealtimeDeltaEvent = {
+    ...event,
+    ts: event.ts ?? Date.now(),
+  };
+  // Instant <5ms sync across tabs in the same browser
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const bc = new BroadcastChannel(LOCAL_BROADCAST_CHANNEL_NAME);
+      bc.postMessage(payload);
+      bc.close();
+    } catch {
+      // Ignore BroadcastChannel unavailability
+    }
+  }
+  // Instant cross-device / cross-instance sync via Supabase Realtime Broadcast
+  void broadcastClientSupabaseSync(payload);
+}
+
 async function dbApiRequest<T = any>(
   url: string,
   options: RequestInit = {}
 ): Promise<T> {
   const authHeader = await getAuthBearerHeader();
+  const adminToken = getAdminSessionToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...((options.headers as Record<string, string>) || {}),
   };
   if (authHeader) {
     headers['Authorization'] = authHeader;
+  }
+  if (adminToken) {
+    headers['X-Admin-Token'] = adminToken;
   }
   const res = await fetch(url, {
     ...options,
@@ -442,16 +527,19 @@ function syncMutationToServerCache(
   scope: 'questions' | 'subjects' | 'notifications' | 'bot_commands',
   payload: ServerCacheMutationPayload
 ) {
-  if (typeof fetch === 'undefined' || !auth.currentUser) return;
+  const adminToken = getAdminSessionToken();
+  if (typeof fetch === 'undefined' || (!auth.currentUser && !adminToken)) return;
   void getAuthBearerHeader()
     .then((authHeader) => {
-      if (!authHeader) return null;
+      if (!authHeader && !adminToken) return null;
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authHeader) headers['Authorization'] = authHeader;
+      if (adminToken) headers['X-Admin-Token'] = adminToken;
       return fetch('/api/cache/mutate', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: authHeader,
-        },
+        headers,
         body: JSON.stringify({ scope, ...payload }),
       });
     })
@@ -632,20 +720,22 @@ function adjustGlobalStat(field: keyof Omit<GlobalStats, 'updatedAt'>, delta: nu
  * Fetches questions, subjects, notifications, and bot_commands from Node server RAM cache first
  * (0 Firestore reads for 99.9% of users), with IndexedDB + Firestore limit(20) fallback.
  */
-async function syncCoreFromServer(force = false): Promise<boolean> {
+async function syncCoreFromServer(force = false, bypassLocalTtl = false): Promise<boolean> {
   await hydrateCacheFromIdb();
 
   if (
     !force &&
+    !bypassLocalTtl &&
     hasNonEmptyCoreArrays() &&
     (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
   ) {
     return true;
   }
 
-  return runDeduplicated(`core_server:${force ? 'force' : 'ttl'}`, async () => {
+  return runDeduplicated(`core_server:${force ? 'force' : bypassLocalTtl ? 'check' : 'ttl'}`, async () => {
     if (
       !force &&
+      !bypassLocalTtl &&
       hasNonEmptyCoreArrays() &&
       (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
     ) {
@@ -655,11 +745,11 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
     const requestCore = async (useSince: boolean) => {
       const localQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
       const localSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
-      const localBotCommands = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
       const hasAllLocal =
         localQuestions.length > 0 &&
         localSubjects.length > 0 &&
-        Object.keys(localBotCommands).length > 0;
+        hasCachedValue(STORAGE_KEYS.NOTIFICATIONS) &&
+        hasCachedValue(STORAGE_KEYS.BOT_COMMANDS);
       const savedVersion = hasAllLocal
         ? getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0)
         : 0;
@@ -669,8 +759,10 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
       if (useSince && !force && savedVersion > 0) params.set('since', String(savedVersion));
 
       const authHeader = await getAuthBearerHeader();
+      const adminToken = getAdminSessionToken();
       const headers: Record<string, string> = {};
       if (authHeader) headers['Authorization'] = authHeader;
+      if (adminToken) headers['X-Admin-Token'] = adminToken;
 
       const res = await fetch(`/api/cache/core?${params.toString()}`, {
         cache: 'no-store',
@@ -699,9 +791,12 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
         auth.currentUser?.email?.toLowerCase() === 'reaksmey8114@gmail.com' &&
         auth.currentUser?.emailVerified;
       if (
+        !payload?.unchanged &&
+        !payload?.partial &&
         payload?.backend === 'supabase' &&
         isAdminEmail &&
-        (!Array.isArray(payload?.questions) || payload.questions.length === 0)
+        Array.isArray(payload?.questions) &&
+        payload.questions.length === 0
       ) {
         const localQ = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
         const localS = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
@@ -739,18 +834,34 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
         }
       }
 
-      if (Array.isArray(payload?.questions) && payload.questions.length > 0) {
+      let updatedQuestionsCount: number | null = null;
+      let updatedSubjectsCount: number | null = null;
+
+      if (Array.isArray(payload?.questions) && (payload.questions.length > 0 || !payload?.partial)) {
         const sortedQ = sortQuestions(payload.questions);
         setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
         setSyncTimestamp('QUESTIONS');
+        updatedQuestionsCount = sortedQ.length;
         window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
       }
 
-      if (Array.isArray(payload?.subjects) && payload.subjects.length > 0) {
+      if (Array.isArray(payload?.subjects) && (payload.subjects.length > 0 || !payload?.partial)) {
         const sortedSub = sortSubjects(payload.subjects);
         setLocal(STORAGE_KEYS.SUBJECTS, sortedSub);
         setSyncTimestamp('SUBJECTS');
+        updatedSubjectsCount = sortedSub.length;
         window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedSub }));
+      }
+
+      if (updatedQuestionsCount !== null || updatedSubjectsCount !== null) {
+        const prevStats = getLocal<GlobalStats>(STORAGE_KEYS.GLOBAL_STATS, {});
+        const nextStats: GlobalStats = {
+          ...prevStats,
+          ...(updatedQuestionsCount !== null ? { questionsCount: updatedQuestionsCount } : {}),
+          ...(updatedSubjectsCount !== null ? { subjectsCount: updatedSubjectsCount } : {}),
+        };
+        setLocal(STORAGE_KEYS.GLOBAL_STATS, nextStats);
+        window.dispatchEvent(new CustomEvent('mpq-global-stats-changed', { detail: nextStats }));
       }
 
       if (Array.isArray(payload?.notifications)) {
@@ -788,18 +899,19 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   await hydrateCacheFromIdb();
 
+  // Always perform a zero-DB-cost server version check (?since=<ver>) so refreshes pick up Admin changes immediately
+  const syncedFromServer = await syncCoreFromServer(force, true);
+  const afterServer = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  if (syncedFromServer && afterServer.length > 0) {
+    return afterServer;
+  }
+
   if (
     !force &&
     isCacheFresh('CORE_CHECK') &&
     isCacheFresh('QUESTIONS', STORAGE_KEYS.QUESTIONS, true)
   ) {
     return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
-  }
-
-  const syncedFromServer = await syncCoreFromServer(force);
-  const afterServer = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
-  if (syncedFromServer && afterServer.length > 0) {
-    return afterServer;
   }
 
   return runDeduplicated(`questions:${force ? 'force' : 'ttl'}`, async () => {
@@ -890,18 +1002,18 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
 export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   await hydrateCacheFromIdb();
 
+  const syncedFromServer = await syncCoreFromServer(force, true);
+  const afterServer = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  if (syncedFromServer && afterServer.length > 0) {
+    return afterServer;
+  }
+
   if (
     !force &&
     isCacheFresh('CORE_CHECK') &&
     isCacheFresh('SUBJECTS', STORAGE_KEYS.SUBJECTS, true)
   ) {
     return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
-  }
-
-  const syncedFromServer = await syncCoreFromServer(force);
-  const afterServer = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
-  if (syncedFromServer && afterServer.length > 0) {
-    return afterServer;
   }
 
   return runDeduplicated(`subjects:${force ? 'force' : 'ttl'}`, async () => {
@@ -996,12 +1108,12 @@ export async function fetchNotificationsCached(force = false): Promise<AppNotifi
     ? []
     : INITIAL_NOTIFICATIONS.filter((n) => !dismissed.has(n.id));
 
-  if (!force && isCacheFresh('NOTIFICATIONS', STORAGE_KEYS.NOTIFICATIONS)) {
+  const syncedFromServer = await syncCoreFromServer(force, true);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.NOTIFICATIONS)) {
     return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
   }
 
-  const syncedFromServer = await syncCoreFromServer(force);
-  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.NOTIFICATIONS)) {
+  if (!force && isCacheFresh('CORE_CHECK') && isCacheFresh('NOTIFICATIONS', STORAGE_KEYS.NOTIFICATIONS)) {
     return getLocal<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, fallbackDefaults);
   }
 
@@ -1583,27 +1695,48 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
-          method: 'POST',
-          body: JSON.stringify({ item: newQuestion }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase addQuestion note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
+        method: 'POST',
+        body: JSON.stringify({ item: newQuestion }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase addQuestion note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
-      await setDoc(doc(db, 'questions', id), newQuestion);
-    }
-    syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
-    adjustGlobalStat('questionsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'questions', id), newQuestion);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, 'questions');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចបន្ថែមសំណួរលើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចបន្ថែមសំណួរលើ Server បានទេ! សូមចេញរួចចូល Admin ម្ដងទៀត!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
+  }
+  notifyRealtimeMutation({ scope: 'questions', action: 'upsert', id, item: newQuestion, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('questionsCount', 1);
   return newQuestion;
 }
 
@@ -1623,20 +1756,26 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
-          method: 'POST',
-          body: JSON.stringify({ items: created }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase addQuestionsBatch note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/questions', {
+        method: 'POST',
+        body: JSON.stringify({ items: created }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase addQuestionsBatch note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
       const CHUNK_SIZE = 450;
       for (let i = 0; i < created.length; i += CHUNK_SIZE) {
         const batch = writeBatch(db);
@@ -1648,12 +1787,27 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
         }
         await batch.commit();
       }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, 'questions');
     }
-    syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
-    adjustGlobalStat('questionsCount', created.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចបន្ថែមសំណួរជាបាច់លើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចបន្ថែមសំណួរជាបាច់លើ Server បានទេ! សូមចេញរួចចូល Admin ម្ដងទៀត!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
+  }
+  notifyRealtimeMutation({ scope: 'questions', action: 'upsertMany', items: created, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('questionsCount', created.length);
 
   return created;
 }
@@ -1667,29 +1821,136 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ updates: cleanUpdates }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase updateQuestion note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ updates: cleanUpdates }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase updateQuestion note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
       await updateDoc(doc(db, 'questions', id), cleanUpdates);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
     }
-    const updatedItem = next.find((q) => q.id === id);
-    if (updatedItem) {
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចកែសម្រួលសំណួរលើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចកែសម្រួលសំណួរលើ Server បានទេ!'
+    );
+  }
+
+  const updatedItem = next.find((q) => q.id === id);
+  if (updatedItem) {
+    if (!supabaseOk) {
       syncMutationToServerCache('questions', { action: 'upsert', item: updatedItem });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
+    notifyRealtimeMutation({ scope: 'questions', action: 'upsert', id, item: updatedItem, source: supabaseOk ? 'supabase' : 'firestore' });
   }
+}
+
+export async function renameQuestionsSubject(
+  oldSubject: string,
+  newSubject: string,
+  matchingQuestions: Question[]
+): Promise<Question[]> {
+  const cleanOld = oldSubject.trim();
+  const cleanNew = newSubject.trim();
+  if (!cleanOld || !cleanNew || cleanOld === cleanNew) return [];
+
+  const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const targetIds = new Set(matchingQuestions.map((q) => q.id).filter(Boolean) as string[]);
+  const updatedQuestions: Question[] = [];
+  const next = cached.map((q) => {
+    if ((q.id && targetIds.has(q.id)) || q.subject === cleanOld) {
+      const updated = { ...q, subject: cleanNew };
+      updatedQuestions.push(updated);
+      return updated;
+    }
+    return q;
+  });
+
+  if (updatedQuestions.length === 0) return [];
+
+  setLocal(STORAGE_KEYS.QUESTIONS, next);
+  setSyncTimestamp('QUESTIONS');
+  window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/questions/rename-subject', {
+        method: 'POST',
+        body: JSON.stringify({ oldSubject: cleanOld, newSubject: cleanNew }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase renameQuestionsSubject note:', err);
+    }
+  }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < updatedQuestions.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const q of updatedQuestions.slice(i, i + CHUNK_SIZE)) {
+          if (q.id) {
+            batch.update(doc(db, 'questions', q.id), { subject: cleanNew });
+          }
+        }
+        await batch.commit();
+      }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.UPDATE, 'questions');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចប្តូរឈ្មោះមុខវិជ្ជាលើសំណួរបានទេ (${lastError.message})។`
+        : 'មិនអាចប្តូរឈ្មោះមុខវិជ្ជាលើសំណួរបានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('questions', { action: 'upsertMany', items: updatedQuestions });
+  }
+  notifyRealtimeMutation({
+    scope: 'questions',
+    action: 'upsertMany',
+    items: updatedQuestions,
+    source: supabaseOk ? 'supabase' : 'firestore',
+  });
+  return updatedQuestions;
 }
 
 export async function deleteQuestion(id: string) {
@@ -1699,37 +1960,50 @@ export async function deleteQuestion(id: string) {
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase (in dual or supabase mode)
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deleteQuestion note:', err);
-      }
+  // 1. Delete in Supabase (in dual or supabase mode)
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(`/api/db/questions/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deleteQuestion note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          await deleteDoc(doc(db, 'questions', id));
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deleteQuestion note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('questions', { action: 'delete', id });
-    adjustGlobalStat('questionsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
   }
+
+  // 2. Dual-delete in Firestore SDK
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'questions', id));
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Firestore deleteQuestion note:', err);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបសំណួរលើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចលុបសំណួរលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('questions', { action: 'delete', id });
+  }
+  notifyRealtimeMutation({ scope: 'questions', action: 'delete', id, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('questionsCount', -1);
 }
 
 export async function deleteQuestionsBatch(ids: string[]): Promise<void> {
@@ -1741,47 +2015,60 @@ export async function deleteQuestionsBatch(ids: string[]): Promise<void> {
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete batch in Supabase
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number; count?: number }>('/api/db/questions/delete-batch', {
-          method: 'POST',
-          body: JSON.stringify({ ids }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deleteQuestionsBatch note:', err);
-      }
+  // 1. Delete batch in Supabase
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number; count?: number }>('/api/db/questions/delete-batch', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deleteQuestionsBatch note:', err);
     }
+  }
 
-    // 2. Dual-delete batch in Firestore SDK (chunked by 450)
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          const CHUNK_SIZE = 450;
-          for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-            const batch = writeBatch(db);
-            for (const id of ids.slice(i, i + CHUNK_SIZE)) {
-              batch.delete(doc(db, 'questions', id));
-            }
-            await batch.commit();
-          }
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deleteQuestionsBatch note:', err);
+  // 2. Dual-delete batch in Firestore SDK (chunked by 450)
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'questions', id));
         }
+        await batch.commit();
       }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Firestore deleteQuestionsBatch note:', err);
     }
+  }
 
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបសំណួរជាបាច់លើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចលុបសំណួរជាបាច់លើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
     for (const id of ids) {
       syncMutationToServerCache('questions', { action: 'delete', id });
     }
-    adjustGlobalStat('questionsCount', -ids.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'questions/batch');
   }
+  notifyRealtimeMutation({ scope: 'questions', action: 'deleteMany', ids, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('questionsCount', -ids.length);
 }
 
 export async function swapQuestions(q1: Question, q2: Question) {
@@ -1804,27 +2091,48 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
-          method: 'POST',
-          body: JSON.stringify({ item: newSub }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase addSubject note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
+        method: 'POST',
+        body: JSON.stringify({ item: newSub }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase addSubject note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
-      await setDoc(doc(db, 'subjects', id), newSub);
-    }
-    syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
-    adjustGlobalStat('subjectsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'subjects');
   }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'subjects', id), newSub);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, 'subjects');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចបន្ថែមមុខវិជ្ជាលើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចបន្ថែមមុខវិជ្ជាលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
+  }
+  notifyRealtimeMutation({ scope: 'subjects', action: 'upsert', id, item: newSub, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('subjectsCount', 1);
   return newSub;
 }
 
@@ -1837,28 +2145,49 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ updates: cleanUpdates }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase updateSubject note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ updates: cleanUpdates }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase updateSubject note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
       await updateDoc(doc(db, 'subjects', id), cleanUpdates);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
     }
-    const updatedSub = next.find((s) => s.id === id);
-    if (updatedSub) {
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចកែសម្រួលមុខវិជ្ជាលើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចកែសម្រួលមុខវិជ្ជាលើ Server បានទេ!'
+    );
+  }
+
+  const updatedSub = next.find((s) => s.id === id);
+  if (updatedSub) {
+    if (!supabaseOk) {
       syncMutationToServerCache('subjects', { action: 'upsert', item: updatedSub });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
+    notifyRealtimeMutation({ scope: 'subjects', action: 'upsert', id, item: updatedSub, source: supabaseOk ? 'supabase' : 'firestore' });
   }
 }
 
@@ -1877,20 +2206,26 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
   const changed = normalized.filter((sub, idx) => orderedSubjects[idx]?.order !== idx);
   if (changed.length === 0) return normalized;
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
-          method: 'POST',
-          body: JSON.stringify({ items: normalized }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase reorderSubjects note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/subjects', {
+        method: 'POST',
+        body: JSON.stringify({ items: normalized }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase reorderSubjects note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
       const CHUNK_SIZE = 450;
       for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
         const batch = writeBatch(db);
@@ -1902,11 +2237,24 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
         }
         await batch.commit();
       }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.UPDATE, 'subjects');
     }
-    syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, 'subjects');
   }
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចរៀបចំលំដាប់មុខវិជ្ជាលើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចរៀបចំលំដាប់មុខវិជ្ជាលើ Server បានទេ!'
+    );
+  }
+  if (!supabaseOk) {
+    syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
+  }
+  notifyRealtimeMutation({ scope: 'subjects', action: 'upsertMany', items: normalized, source: supabaseOk ? 'supabase' : 'firestore' });
 
   return normalized;
 }
@@ -1961,37 +2309,50 @@ export async function deleteSubject(id: string) {
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase (in dual or supabase mode)
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deleteSubject note:', err);
-      }
+  // 1. Delete in Supabase (in dual or supabase mode)
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(`/api/db/subjects/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deleteSubject note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          await deleteDoc(doc(db, 'subjects', id));
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deleteSubject note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('subjects', { action: 'delete', id });
-    adjustGlobalStat('subjectsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
   }
+
+  // 2. Dual-delete in Firestore SDK
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'subjects', id));
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Firestore deleteSubject note:', err);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបមុខវិជ្ជាលើ Server បានទេ (${lastError.message})។ សូមចេញរួចចូល Admin ម្ដងទៀត!`
+        : 'មិនអាចលុបមុខវិជ្ជាលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('subjects', { action: 'delete', id });
+  }
+  notifyRealtimeMutation({ scope: 'subjects', action: 'delete', id, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('subjectsCount', -1);
 }
 
 export async function recordLogin(username: string, passwordUsed: string, role: 'user' | 'admin') {
@@ -2038,11 +2399,16 @@ export async function deleteLoginRecord(id: string) {
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
   const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
   if (useSupabase || mode === 'dual') {
     try {
       await dbApiRequest(`/api/db/logins/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      supabaseOk = true;
     } catch (err) {
+      lastError = err;
       console.warn('[Dual Delete] Supabase deleteLoginRecord note:', err);
     }
   }
@@ -2050,11 +2416,24 @@ export async function deleteLoginRecord(id: string) {
   if ((useFirestore || mode === 'dual') && auth.currentUser) {
     try {
       await deleteDoc(doc(db, 'logins', id));
-      adjustGlobalStat('loginsCount', -1);
+      firestoreOk = true;
     } catch (err) {
+      lastError = err;
       handleFirestoreError(err, OperationType.DELETE, `logins/${id}`);
     }
   }
+
+  if (!supabaseOk && !firestoreOk) {
+    void fetchLoginsCached(true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបប្រវត្តិ Login លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចលុបប្រវត្តិ Login លើ Server បានទេ!'
+    );
+  }
+
+  notifyRealtimeMutation({ scope: 'logins', action: 'delete', id, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('loginsCount', -1);
 }
 
 export async function deleteLoginsByIds(ids: string[]) {
@@ -2066,6 +2445,9 @@ export async function deleteLoginsByIds(ids: string[]) {
   window.dispatchEvent(new CustomEvent('mpq-logins-changed', { detail: next }));
 
   const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
   if (useSupabase || mode === 'dual') {
     try {
@@ -2073,7 +2455,9 @@ export async function deleteLoginsByIds(ids: string[]) {
         method: 'POST',
         body: JSON.stringify({ ids }),
       });
+      supabaseOk = true;
     } catch (err) {
+      lastError = err;
       console.warn('[Dual Delete] Supabase deleteLoginsByIds note:', err);
     }
   }
@@ -2088,11 +2472,24 @@ export async function deleteLoginsByIds(ids: string[]) {
         }
         await batch.commit();
       }
-      adjustGlobalStat('loginsCount', -ids.length);
+      firestoreOk = true;
     } catch (err) {
+      lastError = err;
       handleFirestoreError(err, OperationType.DELETE, 'logins');
     }
   }
+
+  if (!supabaseOk && !firestoreOk) {
+    void fetchLoginsCached(true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបប្រវត្តិ Login ជាបាច់លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចលុបប្រវត្តិ Login ជាបាច់លើ Server បានទេ!'
+    );
+  }
+
+  notifyRealtimeMutation({ scope: 'logins', action: 'deleteMany', ids, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('loginsCount', -ids.length);
 }
 
 export async function updatePresenceHeartbeat(username: string, role: 'user' | 'admin') {
@@ -2192,27 +2589,48 @@ export async function broadcastNotification(
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
-          method: 'POST',
-          body: JSON.stringify({ item, vipWelcome }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase broadcastNotification note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
+        method: 'POST',
+        body: JSON.stringify({ item, vipWelcome }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase broadcastNotification note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
-      await setDoc(doc(db, 'notifications', id), item);
-    }
-    syncMutationToServerCache('notifications', { action: 'upsert', item });
-    adjustGlobalStat('notificationsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'notifications');
   }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'notifications', id), item);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, 'notifications');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចផ្សាយដំណឹងលើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចផ្សាយដំណឹងលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('notifications', { action: 'upsert', item });
+  }
+  notifyRealtimeMutation({ scope: 'notifications', action: 'upsert', id, item, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('notificationsCount', 1);
   return item;
 }
 
@@ -2228,37 +2646,48 @@ export async function deleteNotification(id: string) {
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase (in dual or supabase mode)
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(`/api/db/notifications/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deleteNotification note:', err);
-      }
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(`/api/db/notifications/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deleteNotification note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          await deleteDoc(doc(db, 'notifications', id));
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deleteNotification note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('notifications', { action: 'delete', id });
-    adjustGlobalStat('notificationsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
   }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'notifications', id));
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបដំណឹងលើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចលុបដំណឹងលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('notifications', { action: 'delete', id });
+  }
+  notifyRealtimeMutation({ scope: 'notifications', action: 'delete', id, source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('notificationsCount', -1);
 }
 
 export async function deleteAllNotifications(ids: string[]) {
@@ -2271,45 +2700,56 @@ export async function deleteAllNotifications(ids: string[]) {
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: [] }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
-          method: 'DELETE',
-          body: JSON.stringify({ ids }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deleteAllNotifications note:', err);
-      }
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/notifications', {
+        method: 'DELETE',
+        body: JSON.stringify({ ids }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deleteAllNotifications note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          const CHUNK_SIZE = 450;
-          for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-            const batch = writeBatch(db);
-            for (const id of ids.slice(i, i + CHUNK_SIZE)) {
-              batch.delete(doc(db, 'notifications', id));
-            }
-            await batch.commit();
-          }
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deleteAllNotifications note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('notifications', { action: 'clear' });
-    adjustGlobalStat('notificationsCount', -ids.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'notifications');
   }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'notifications', id));
+        }
+        await batch.commit();
+      }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.DELETE, 'notifications');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបដំណឹងទាំងអស់លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចលុបដំណឹងទាំងអស់លើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('notifications', { action: 'clear' });
+  }
+  notifyRealtimeMutation({ scope: 'notifications', action: 'clear', source: supabaseOk ? 'supabase' : 'firestore' });
+  adjustGlobalStat('notificationsCount', -ids.length);
 }
 
 export async function fetchPaidUsersCached(force = false): Promise<PaidUser[]> {
@@ -2468,41 +2908,72 @@ export async function registerPaidUser(params: {
     uid: auth.currentUser?.uid,
   });
 
+  let finalRecord: PaidUser = record;
   const cached = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
-  const existingIdx = cached.findIndex((u) => u.id === id);
-  if (existingIdx >= 0) {
-    cached[existingIdx] = record;
-  } else {
-    cached.unshift(record);
-  }
-  setLocal(STORAGE_KEYS.PAID_USERS, cached);
-  window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: cached }));
+  const upsertCachedPaidUser = (rec: PaidUser) => {
+    const cur = getLocal<PaidUser[]>(STORAGE_KEYS.PAID_USERS, []);
+    const idx = cur.findIndex((u) => u.id === rec.id);
+    const nextList = idx >= 0 ? cur.map((u, i) => (i === idx ? rec : u)) : [rec, ...cur];
+    setLocal(STORAGE_KEYS.PAID_USERS, nextList);
+    window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: nextList }));
+  };
+  upsertCachedPaidUser(cached.find((u) => u.id === id) ? record : record);
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        await dbApiRequest('/api/db/paid-users', {
-          method: 'POST',
-          body: JSON.stringify({ record }),
-        });
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase registerPaidUser note:', err);
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ record?: PaidUser }>('/api/db/paid-users', {
+        method: 'POST',
+        body: JSON.stringify({ record }),
+      });
+      supabaseOk = true;
+      if (res?.record) {
+        finalRecord = res.record;
+        upsertCachedPaidUser(finalRecord);
       }
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase registerPaidUser note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
-      await setDoc(doc(db, 'paid_users', id), sanitizeData(record), { merge: true });
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'paid_users', id), sanitizeData(finalRecord), { merge: true });
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, 'paid_users');
     }
-    await broadcastNotification(
-      `🎉 សូមស្វាគមន៍សមាជិក VIP ថ្មី «${record.username}» បានបង់ប្រាក់ $10 ជោគជ័យ និងទទួលបានសិទ្ធិចូលប្រើប្រាស់ពេញមួយជីវិត!`,
-      'success',
-      true
-    );
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'paid_users');
   }
 
-  return record;
+  if (!supabaseOk && !firestoreOk) {
+    void fetchPaidUsersCached(true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចរក្សាទុកព័ត៌មានសមាជិក VIP លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចរក្សាទុកព័ត៌មានសមាជិក VIP លើ Server បានទេ!'
+    );
+  }
+
+  notifyRealtimeMutation({
+    scope: 'paid_users',
+    action: 'upsert',
+    id,
+    item: finalRecord,
+    source: supabaseOk ? 'supabase' : 'firestore',
+  });
+
+  const welcomeMessage =
+    finalRecord.status === 'active'
+      ? `🎉 សូមស្វាគមន៍សមាជិក VIP ថ្មី «${finalRecord.username}» បានបង់ប្រាក់ $10 ជោគជ័យ និងទទួលបានសិទ្ធិចូលប្រើប្រាស់ពេញមួយជីវិត!`
+      : `💳 សមាជិក «${finalRecord.username}» បានបញ្ជូនសំណើបង់ប្រាក់ VIP ($10) — កំពុងរង់ចាំ Admin ផ្ទៀងផ្ទាត់!`;
+  await broadcastNotification(welcomeMessage, finalRecord.status === 'active' ? 'success' : 'info', true).catch(() => {});
+
+  return finalRecord;
 }
 
 export async function grantManualPermanentAccess(username: string, note?: string): Promise<PaidUser> {
@@ -2520,23 +2991,45 @@ export async function updatePaidUserStatus(id: string, status: 'active' | 'pendi
   setLocal(STORAGE_KEYS.PAID_USERS, next);
   window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ status, permanentAccess }),
-        });
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase updatePaidUserStatus note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status, permanentAccess }),
+      });
+      supabaseOk = true;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase updatePaidUserStatus note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
+  }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
       await updateDoc(doc(db, 'paid_users', id), { status, permanentAccess });
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.UPDATE, `paid_users/${id}`);
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `paid_users/${id}`);
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void fetchPaidUsersCached(true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចកែស្ថានភាពសមាជិក VIP លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចកែស្ថានភាពសមាជិក VIP លើ Server បានទេ!'
+    );
+  }
+
+  const updated = next.find((u) => u.id === id);
+  if (updated) {
+    notifyRealtimeMutation({ scope: 'paid_users', action: 'upsert', id, item: updated, source: supabaseOk ? 'supabase' : 'firestore' });
   }
 }
 
@@ -2546,31 +3039,41 @@ export async function deletePaidUser(id: string) {
   setLocal(STORAGE_KEYS.PAID_USERS, next);
   window.dispatchEvent(new CustomEvent('mpq-paid-users-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase (in dual or supabase mode)
-    if (useSupabase || mode === 'dual') {
-      try {
-        await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase deletePaidUser note:', err);
-      }
+  if (useSupabase || mode === 'dual') {
+    try {
+      await dbApiRequest(`/api/db/paid-users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      supabaseOk = true;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase deletePaidUser note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          await deleteDoc(doc(db, 'paid_users', id));
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore deletePaidUser note:', err);
-        }
-      }
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `paid_users/${id}`);
   }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'paid_users', id));
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.DELETE, `paid_users/${id}`);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void fetchPaidUsersCached(true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចលុបសមាជិក VIP លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចលុបសមាជិក VIP លើ Server បានទេ!'
+    );
+  }
+
+  notifyRealtimeMutation({ scope: 'paid_users', action: 'delete', id, source: supabaseOk ? 'supabase' : 'firestore' });
 }
 
 function getBotCommandDocId(command: string): string {
@@ -2580,18 +3083,17 @@ function getBotCommandDocId(command: string): string {
 export async function fetchBotCommandsCached(force = false): Promise<Record<string, BotCommandConfig>> {
   await hydrateCacheFromIdb();
 
-  if (
-    !force &&
-    isCacheFresh('CORE_CHECK') &&
-    isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS, true)
-  ) {
+  const syncedFromServer = await syncCoreFromServer(force, true);
+  if (syncedFromServer && hasCachedValue(STORAGE_KEYS.BOT_COMMANDS)) {
     return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
   }
 
-  const syncedFromServer = await syncCoreFromServer(force);
-  const afterServer = getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
-  if (syncedFromServer && Object.keys(afterServer).length > 0) {
-    return afterServer;
+  if (
+    !force &&
+    isCacheFresh('CORE_CHECK') &&
+    isCacheFresh('BOT_COMMANDS', STORAGE_KEYS.BOT_COMMANDS)
+  ) {
+    return getLocal<Record<string, BotCommandConfig>>(STORAGE_KEYS.BOT_COMMANDS, {});
   }
 
   return runDeduplicated(`bot_commands:${force ? 'force' : 'ttl'}`, async () => {
@@ -2711,27 +3213,47 @@ export async function saveBotCommandConfig(config: BotCommandConfig) {
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
-          method: 'POST',
-          body: JSON.stringify({ config: payload }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Sync] Supabase saveBotCommandConfig note:', err);
-      }
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
+
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
+        method: 'POST',
+        body: JSON.stringify({ config: payload }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Sync] Supabase saveBotCommandConfig note:', err);
     }
-    if ((useFirestore || mode === 'dual') && auth.currentUser) {
-      await setDoc(doc(db, 'bot_commands', docId), payload);
-      syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
-    throw err;
   }
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await setDoc(doc(db, 'bot_commands', docId), payload);
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចរក្សាទុក Command Bot លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចរក្សាទុក Command Bot លើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
+  }
+  notifyRealtimeMutation({ scope: 'bot_commands', action: 'upsert', id: payload.command, item: payload, source: supabaseOk ? 'supabase' : 'firestore' });
 
   await syncTelegramBotTemplates(next);
   return payload;
@@ -2746,37 +3268,48 @@ export async function resetBotCommandConfig(command: string) {
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase (in dual or supabase mode)
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>(
-          `/api/db/bot-commands/${encodeURIComponent(command)}`,
-          { method: 'DELETE' }
-        );
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase resetBotCommandConfig note:', err);
-      }
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>(
+        `/api/db/bot-commands/${encodeURIComponent(command)}`,
+        { method: 'DELETE' }
+      );
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase resetBotCommandConfig note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          await deleteDoc(doc(db, 'bot_commands', docId));
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore resetBotCommandConfig note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
   }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      await deleteDoc(doc(db, 'bot_commands', docId));
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចកំណត់ Command Bot លំនាំដើមលើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចកំណត់ Command Bot លំនាំដើមលើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
+  }
+  notifyRealtimeMutation({ scope: 'bot_commands', action: 'delete', id: command, source: supabaseOk ? 'supabase' : 'firestore' });
 
   await syncTelegramBotTemplates(next);
 }
@@ -2786,44 +3319,55 @@ export async function resetAllBotCommands(commands: string[]) {
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: {} }));
 
-  try {
-    const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  const { mode, useSupabase, useFirestore } = await getDbExecutionTargets();
+  let supabaseOk = false;
+  let firestoreOk = false;
+  let lastError: unknown = null;
 
-    // 1. Delete in Supabase
-    if (useSupabase || mode === 'dual') {
-      try {
-        const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
-          method: 'DELETE',
-          body: JSON.stringify({ commands }),
-        });
-        if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
-      } catch (err) {
-        console.warn('[Dual Delete] Supabase resetAllBotCommands note:', err);
-      }
+  if (useSupabase || mode === 'dual') {
+    try {
+      const res = await dbApiRequest<{ version?: number }>('/api/db/bot-commands', {
+        method: 'DELETE',
+        body: JSON.stringify({ commands }),
+      });
+      supabaseOk = true;
+      if (typeof res?.version === 'number') setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, res.version);
+    } catch (err) {
+      lastError = err;
+      console.warn('[Dual Delete] Supabase resetAllBotCommands note:', err);
     }
-
-    // 2. Dual-delete in Firestore SDK
-    if (useFirestore || mode === 'dual') {
-      if (auth.currentUser) {
-        try {
-          const CHUNK_SIZE = 450;
-          for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
-            const batch = writeBatch(db);
-            for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
-              batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
-            }
-            await batch.commit();
-          }
-        } catch (err) {
-          console.warn('[Dual Delete] Firestore resetAllBotCommands note:', err);
-        }
-      }
-    }
-
-    syncMutationToServerCache('bot_commands', { replace: {}, authoritative: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
   }
+
+  if ((useFirestore || mode === 'dual') && auth.currentUser) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+        }
+        await batch.commit();
+      }
+      firestoreOk = true;
+    } catch (err) {
+      lastError = err;
+      handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
+    }
+  }
+
+  if (!supabaseOk && !firestoreOk) {
+    void syncCoreFromServer(false, true).catch(() => {});
+    throw new Error(
+      lastError instanceof Error
+        ? `មិនអាចកំណត់ Command Bot ទាំងអស់លើ Server បានទេ (${lastError.message})។`
+        : 'មិនអាចកំណត់ Command Bot ទាំងអស់លើ Server បានទេ!'
+    );
+  }
+
+  if (!supabaseOk) {
+    syncMutationToServerCache('bot_commands', { replace: {}, authoritative: true });
+  }
+  notifyRealtimeMutation({ scope: 'bot_commands', action: 'clear', source: supabaseOk ? 'supabase' : 'firestore' });
 
   await syncTelegramBotTemplates({});
 }
@@ -3046,9 +3590,9 @@ async function uploadBackupPayloadToSupabase(
       'មិនទាន់បានកំណត់ SUPABASE_URL និង SUPABASE_SERVICE_ROLE_KEY ក្នុង AI Studio Secrets នៅឡើយទេ! សូមដំណើរការ supabase/schema.sql ក្នុង Supabase SQL Editor រួចបញ្ចូល Secrets ជាមុនសិន។'
     );
   }
-  if (!auth.currentUser) {
+  if (!auth.currentUser && !getAdminSessionToken()) {
     throw new Error(
-      'សូមចុចប៊ូតុង "ភ្ជាប់ Google Admin" (reaksmey8114@gmail.com) នៅផ្នែកខាងលើជាមុនសិន ដើម្បីផ្ទៀងផ្ទាត់សិទ្ធិផ្ទេរទិន្នន័យ!'
+      'សូមចូលប្រើជា Admin (Passcode ឬ ភ្ជាប់ Google Admin) ជាមុនសិន ដើម្បីផ្ទៀងផ្ទាត់សិទ្ធិផ្ទេរទិន្នន័យ!'
     );
   }
 
@@ -3272,7 +3816,7 @@ function applyRealtimeDelta(event: ClientRealtimeDeltaEvent) {
   const { scope, action, id, ids, item, items, replace, mode } = event;
 
   if (scope === 'db_mode' && mode) {
-    detectedDbBackend = mode === 'firestore' ? 'firestore' : 'supabase';
+    detectedDbBackend = null;
     window.dispatchEvent(new CustomEvent('mpq-db-mode-changed', { detail: mode }));
     void refreshCoreData().catch(() => {});
     return;
@@ -3511,6 +4055,21 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
     }
   };
 
+  // Layer 0: Instant Same-Browser Multi-Tab Sync (<5ms via BroadcastChannel)
+  let localBc: BroadcastChannel | null = null;
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      localBc = new BroadcastChannel(LOCAL_BROADCAST_CHANNEL_NAME);
+      localBc.onmessage = (evt: MessageEvent) => {
+        if (!disposed && evt.data?.scope && evt.data?.action) {
+          applyRealtimeDelta(evt.data as ClientRealtimeDeltaEvent);
+        }
+      };
+    } catch {
+      localBc = null;
+    }
+  }
+
   // Layer 1: Express Server-Sent Events (SSE) for instant push across all clients
   const connectSse = () => {
     if (disposed || typeof EventSource === 'undefined') return;
@@ -3536,8 +4095,8 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
           }
           if (typeof data?.version === 'number') {
             const localVer = getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0);
-            if (data.version > localVer) {
-              void syncCoreFromServer(false).catch(() => {});
+            if (data.version !== localVer) {
+              void syncCoreFromServer(false, true).catch(() => {});
             }
           }
         } catch {
@@ -3607,11 +4166,11 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
       connectSse();
     }
 
-    // Throttled lightweight catch-up sync to fetch deltas missed while phone was asleep
+    // Lightweight version catch-up (bypasses 5m TTL; 0 DB reads if unchanged!)
     const now = Date.now();
-    if (now - lastWakeSyncAt > 8000) {
+    if (now - lastWakeSyncAt > 5000) {
       lastWakeSyncAt = now;
-      void syncCoreFromServer(false).catch(() => {});
+      void syncCoreFromServer(false, true).catch(() => {});
     }
   };
 
@@ -3624,6 +4183,14 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
   document.addEventListener('visibilitychange', handleVisibilityChange);
   window.addEventListener('pageshow', handleWakeOrOnline);
   window.addEventListener('online', handleWakeOrOnline);
+
+  // Layer 4 Safety Net: 30s lightweight version check (0 DB reads if unchanged; heals proxies that buffer SSE)
+  const versionCheckInterval = setInterval(() => {
+    if (disposed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    void syncCoreFromServer(false, true).catch(() => {});
+  }, 30000);
 
   // Layer 2 & Layer 3: Supabase Realtime + Firebase Firestore onSnapshot
   void fetchRealtimeConfig(true).then((cfg) => {
@@ -3751,6 +4318,15 @@ export function startCoreRealtimeSync(options?: { isAdmin?: boolean }): () => vo
 
   return () => {
     disposed = true;
+    clearInterval(versionCheckInterval);
+    if (localBc) {
+      try {
+        localBc.close();
+      } catch {
+        // Ignore
+      }
+      localBc = null;
+    }
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('pageshow', handleWakeOrOnline);
     window.removeEventListener('online', handleWakeOrOnline);

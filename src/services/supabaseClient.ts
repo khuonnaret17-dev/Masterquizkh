@@ -108,7 +108,12 @@ function mapSupabaseRowToApp(table: string, row: any): any {
         answer: row.answer ?? undefined,
         explanation: row.explanation ?? undefined,
         isActive: row.is_active !== false,
-        order: typeof row.order_index === 'number' ? row.order_index : 0,
+        order:
+          typeof row.sort_order === 'number'
+            ? row.sort_order
+            : typeof row.order_index === 'number'
+              ? row.order_index
+              : Number(row.sort_order ?? row.order_index ?? 0),
       };
     case 'subjects':
       return {
@@ -116,7 +121,12 @@ function mapSupabaseRowToApp(table: string, row: any): any {
         name: row.name ?? '',
         type: row.type ?? 'mcq',
         isActive: row.is_active !== false,
-        order: typeof row.order_index === 'number' ? row.order_index : 0,
+        order:
+          typeof row.sort_order === 'number'
+            ? row.sort_order
+            : typeof row.order_index === 'number'
+              ? row.order_index
+              : Number(row.sort_order ?? row.order_index ?? 0),
       };
     case 'notifications':
       return {
@@ -358,6 +368,13 @@ export function connectSupabaseRealtime(
 export async function broadcastClientSupabaseSync(
   event: ClientRealtimeDeltaEvent
 ): Promise<void> {
+  if (!activeRealtimeChannel || !activeChannelSubscribed) {
+    // Wait briefly if the channel is still connecting
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (activeRealtimeChannel && activeChannelSubscribed) break;
+    }
+  }
   if (!activeRealtimeChannel || !activeChannelSubscribed) return;
   try {
     await activeRealtimeChannel.send({

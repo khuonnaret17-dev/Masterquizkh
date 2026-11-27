@@ -18,6 +18,7 @@ import {
   sbFetchGlobalStats,
   sbUpsertQuestions,
   sbUpdateQuestion,
+  sbRenameQuestionsSubject,
   sbDeleteQuestion,
   sbDeleteQuestionsByIds,
   sbUpsertSubjects,
@@ -1809,6 +1810,7 @@ export interface RealtimeBroadcastEvent {
   ts: number;
 }
 
+const SERVER_INSTANCE_ID = crypto.randomUUID();
 const sseClients = new Set<express.Response>();
 
 function broadcastSsePayload(eventName: string, payload: unknown) {
@@ -1843,7 +1845,10 @@ function emitRealtimeChange(
   broadcastSsePayload('db_change', fullEvent);
 
   if (!event.skipSupabaseBroadcast && isSupabaseConfigured()) {
-    void broadcastSupabaseRealtime(fullEvent);
+    void broadcastSupabaseRealtime({
+      ...fullEvent,
+      serverInstanceId: SERVER_INSTANCE_ID,
+    });
   }
 }
 
@@ -2103,8 +2108,9 @@ app.get('/api/cache/core', async (req, res) => {
     const usingSupabase = shouldUseSupabaseOnServer();
     const backend = usingSupabase ? 'supabase' : 'firestore';
     const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined;
+    const hasAdminToken = Boolean(typeof req.headers['x-admin-token'] === 'string' && req.headers['x-admin-token'].trim());
     const rawForce = req.query.force === '1';
-    const forceCooldownMs = authHeader ? 2000 : 10000;
+    const forceCooldownMs = authHeader || hasAdminToken ? 2000 : 10000;
     const allowForce =
       rawForce &&
       (usingSupabase || now >= serverCoreCache.quotaCooldownUntil) &&
@@ -2368,8 +2374,73 @@ app.post('/api/cache/invalidate', async (req, res) => {
   res.json({ ok: true, version: serverCoreCache.version });
 });
 
-// ---------------- Supabase Database API Routes & Firebase Admin Token Guard ----------------
+// ---------------- Supabase Database API Routes & Admin Token Guard ----------------
 const ADMIN_EMAIL = 'reaksmey8114@gmail.com';
+const ADMIN_MASTER_CODE = (process.env.ADMIN_MASTER_CODE || '168').trim();
+const ADMIN_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const ADMIN_TOKEN_SECRET = crypto
+  .createHash('sha256')
+  .update(
+    String(
+      process.env.ADMIN_SESSION_SECRET ||
+        process.env.SUPABASE_SERVICE_ROLE_KEY ||
+        serverFbConfig?.apiKey ||
+        'master-quiz-kh-admin-secret-v1'
+    )
+  )
+  .digest();
+
+function safeCompareStrings(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function signAdminSessionToken(): { token: string; expiresAt: number } {
+  const now = Date.now();
+  const expiresAt = now + ADMIN_TOKEN_TTL_MS;
+  const payloadB64 = Buffer.from(
+    JSON.stringify({ role: 'admin', iat: now, exp: expiresAt })
+  ).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', ADMIN_TOKEN_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  return { token: `mpqa.${payloadB64}.${sig}`, expiresAt };
+}
+
+function verifyAdminSessionToken(rawToken: string): { role: 'admin'; iat: number; exp: number } | null {
+  if (!rawToken || typeof rawToken !== 'string') return null;
+  const parts = rawToken.trim().split('.');
+  if (parts.length !== 3 || parts[0] !== 'mpqa') return null;
+  const [, payloadB64, sig] = parts;
+  if (!payloadB64 || !sig) return null;
+  const expectedSig = crypto
+    .createHmac('sha256', ADMIN_TOKEN_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  if (!safeCompareStrings(sig, expectedSig)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (parsed?.role !== 'admin' || typeof parsed?.exp !== 'number' || parsed.exp <= Date.now()) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function extractAdminSessionToken(req: express.Request): string {
+  const headerToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : '';
+  if (headerToken) return headerToken;
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization.trim() : '';
+  if (authHeader.startsWith('Admin ')) {
+    return authHeader.slice(6).trim();
+  }
+  return '';
+}
+
 const firebaseAdminApp = serverFbConfig?.projectId
   ? (getApps().length ? getApp() : initializeApp({ projectId: serverFbConfig.projectId }))
   : null;
@@ -2387,29 +2458,197 @@ async function verifyBearerUser(req: express.Request) {
   }
 }
 
-async function requireAdmin(req: express.Request, res: express.Response) {
+async function resolveAdminIdentity(
+  req: express.Request
+): Promise<{ via: 'firebase' | 'passcode'; email?: string; uid?: string } | null> {
   const decoded = await verifyBearerUser(req);
-  if (!decoded) {
-    res.status(401).json({ success: false, error: 'Unauthorized: Missing or invalid token' });
-    return null;
+  if (decoded) {
+    const email = String(decoded.email || '').toLowerCase();
+    if (email === ADMIN_EMAIL && decoded.email_verified === true) {
+      return { via: 'firebase', email, uid: decoded.uid };
+    }
   }
-  const email = String(decoded.email || '').toLowerCase();
-  if (email !== ADMIN_EMAIL || decoded.email_verified !== true) {
-    res.status(403).json({ success: false, error: 'Forbidden: Admin privileges required' });
-    return null;
+  const adminToken = extractAdminSessionToken(req);
+  const verifiedPasscodeSession = verifyAdminSessionToken(adminToken);
+  if (verifiedPasscodeSession) {
+    return { via: 'passcode', email: ADMIN_EMAIL };
   }
-  return decoded;
+  return null;
 }
+
+async function requireAdmin(req: express.Request, res: express.Response) {
+  const admin = await resolveAdminIdentity(req);
+  if (!admin) {
+    res.status(401).json({
+      success: false,
+      error: 'Unauthorized: Admin authentication required',
+    });
+    return null;
+  }
+  return admin;
+}
+
+app.post('/api/admin/login', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+  if (!passcode || !safeCompareStrings(passcode, ADMIN_MASTER_CODE)) {
+    return res.status(401).json({
+      success: false,
+      error: 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ!',
+    });
+  }
+  const { token, expiresAt } = signAdminSessionToken();
+  return res.json({ success: true, token, expiresAt });
+});
+
+app.get('/api/admin/verify', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const admin = await resolveAdminIdentity(req);
+  if (!admin) {
+    return res.status(401).json({ authenticated: false });
+  }
+  return res.json({ authenticated: true, via: admin.via });
+});
 
 function updateLocalServerCacheScope(
   scope: 'questions' | 'subjects' | 'notifications' | 'bot_commands',
   mutateFn: (current: any) => any
 ) {
   const now = Date.now();
-  const next = mutateFn(serverCoreCache[scope]?.data);
-  serverCoreCache[scope] = { data: next, fetchedAt: now };
-  serverCoreCache.version = now;
+  const prev = serverCoreCache[scope]?.data;
+  const hasWarmScope =
+    scope === 'questions' || scope === 'subjects' || scope === 'notifications'
+      ? Array.isArray(prev)
+      : Boolean(prev && typeof prev === 'object');
+
+  if (hasWarmScope) {
+    const next = mutateFn(prev);
+    serverCoreCache[scope] = { data: next, fetchedAt: now };
+  } else {
+    serverCoreCache[scope] = null;
+  }
+  serverCoreCache.version = Math.max(now, serverCoreCache.version + 1);
   schedulePersistServerCoreCache();
+}
+
+function applyRealtimeDeltaToServerCache(payload: {
+  scope?: string;
+  action?: string;
+  id?: string;
+  ids?: string[];
+  item?: any;
+  items?: any[];
+  replace?: any;
+  mode?: DbModeType;
+  version?: number;
+}) {
+  const now = Date.now();
+  const { scope, action, id, ids, item, items, replace, mode, version } = payload;
+  const bumpVersion = () => {
+    serverCoreCache.version = Math.max(now, serverCoreCache.version + 1, Number(version || 0));
+    schedulePersistServerCoreCache();
+  };
+
+  if (scope === 'db_mode' && (mode === 'dual' || mode === 'supabase' || mode === 'firestore')) {
+    currentDbMode = mode;
+    saveDbMode(mode);
+    serverCoreCache.questions = null;
+    serverCoreCache.subjects = null;
+    serverCoreCache.notifications = null;
+    serverCoreCache.bot_commands = null;
+    bumpVersion();
+    return;
+  }
+
+  if (scope === 'core' && action === 'refresh') {
+    serverCoreCache.questions = null;
+    serverCoreCache.subjects = null;
+    serverCoreCache.notifications = null;
+    serverCoreCache.bot_commands = null;
+    bumpVersion();
+    return;
+  }
+
+  if (scope === 'questions' || scope === 'subjects') {
+    updateLocalServerCacheScope(scope, (prev) => {
+      const arr = Array.isArray(prev) ? prev : [];
+      if (action === 'replace' && Array.isArray(replace)) {
+        return [...replace].sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
+      }
+      if (action === 'upsert' && item?.id) {
+        const map = new Map(arr.map((x: any) => [x.id, x]));
+        map.set(item.id, { ...(map.get(item.id) || {}), ...item });
+        return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
+      }
+      if (action === 'upsertMany' && Array.isArray(items)) {
+        const map = new Map(arr.map((x: any) => [x.id, x]));
+        for (const it of items) {
+          if (it?.id) map.set(it.id, { ...(map.get(it.id) || {}), ...it });
+        }
+        return Array.from(map.values()).sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
+      }
+      if (action === 'delete' && id) {
+        return arr.filter((x: any) => x.id !== id);
+      }
+      if (action === 'deleteMany' && Array.isArray(ids)) {
+        const idSet = new Set(ids);
+        return arr.filter((x: any) => !idSet.has(x.id));
+      }
+      return arr;
+    });
+    if (typeof version === 'number' && version > serverCoreCache.version) {
+      serverCoreCache.version = version;
+      schedulePersistServerCoreCache();
+    }
+    return;
+  }
+
+  if (scope === 'notifications') {
+    updateLocalServerCacheScope('notifications', (prev) => {
+      const arr = Array.isArray(prev) ? prev : [];
+      const sortNotifs = (list: any[]) =>
+        [...list]
+          .sort((a: any, b: any) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+          .slice(0, 50);
+      if (action === 'clear') return [];
+      if (action === 'replace' && Array.isArray(replace)) return sortNotifs(replace);
+      if (action === 'upsert' && item?.id) {
+        return sortNotifs([item, ...arr.filter((x: any) => x.id !== item.id)]);
+      }
+      if (action === 'delete' && id) {
+        return arr.filter((x: any) => x.id !== id);
+      }
+      return arr;
+    });
+    if (typeof version === 'number' && version > serverCoreCache.version) {
+      serverCoreCache.version = version;
+      schedulePersistServerCoreCache();
+    }
+    return;
+  }
+
+  if (scope === 'bot_commands') {
+    updateLocalServerCacheScope('bot_commands', (prev) => {
+      const next = { ...(prev && typeof prev === 'object' ? prev : {}) };
+      if (action === 'clear') return {};
+      if (action === 'replace' && replace && typeof replace === 'object' && !Array.isArray(replace)) {
+        return replace;
+      }
+      if (action === 'upsert' && item?.command) {
+        next[item.command] = item;
+        return next;
+      }
+      if (action === 'delete' && id) {
+        delete next[id];
+        return next;
+      }
+      return next;
+    });
+    if (typeof version === 'number' && version > serverCoreCache.version) {
+      serverCoreCache.version = version;
+      schedulePersistServerCoreCache();
+    }
+  }
 }
 
 app.get('/api/db/status', (_req, res) => {
@@ -2474,10 +2713,8 @@ app.post('/api/db/logins', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid login record' });
     }
     const decoded = await verifyBearerUser(req);
-    const isAdminCaller =
-      Boolean(decoded) &&
-      String(decoded?.email || '').toLowerCase() === ADMIN_EMAIL &&
-      decoded?.email_verified === true;
+    const adminIdentity = await resolveAdminIdentity(req);
+    const isAdminCaller = Boolean(adminIdentity);
     const role: 'user' | 'admin' = raw.role === 'admin' && isAdminCaller ? 'admin' : 'user';
     const record = {
       id,
@@ -2510,10 +2747,8 @@ app.post('/api/db/presence', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid presence record' });
     }
     const decoded = await verifyBearerUser(req);
-    const isAdminCaller =
-      Boolean(decoded) &&
-      String(decoded?.email || '').toLowerCase() === ADMIN_EMAIL &&
-      decoded?.email_verified === true;
+    const adminIdentity = await resolveAdminIdentity(req);
+    const isAdminCaller = Boolean(adminIdentity);
     const record = {
       id,
       username,
@@ -2572,10 +2807,8 @@ app.post('/api/db/paid-users', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid paid user payload' });
     }
     const decoded = await verifyBearerUser(req);
-    const isAdminCaller =
-      Boolean(decoded) &&
-      String(decoded?.email || '').toLowerCase() === ADMIN_EMAIL &&
-      decoded?.email_verified === true;
+    const adminIdentity = await resolveAdminIdentity(req);
+    const isAdminCaller = Boolean(adminIdentity);
 
     const allowedStatuses = new Set(['active', 'pending', 'revoked']);
     const safeStatus: 'active' | 'pending' | 'revoked' =
@@ -2659,6 +2892,50 @@ app.patch('/api/db/questions/:id', async (req, res) => {
     res.json({ success: true, version: serverCoreCache.version });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || 'Update question error' });
+  }
+});
+
+app.post('/api/db/questions/rename-subject', async (req, res) => {
+  if (!isSupabaseConfigured()) return res.status(501).json({ success: false, error: 'Supabase not configured' });
+  if (!(await requireAdmin(req, res))) return;
+  try {
+    const oldSubject = typeof req.body?.oldSubject === 'string' ? req.body.oldSubject.trim() : '';
+    const newSubject = typeof req.body?.newSubject === 'string' ? req.body.newSubject.trim() : '';
+    if (!oldSubject || !newSubject) {
+      return res.status(400).json({ success: false, error: 'Missing oldSubject or newSubject' });
+    }
+    await sbRenameQuestionsSubject(oldSubject, newSubject);
+
+    const updatedItems: any[] = [];
+    updateLocalServerCacheScope('questions', (prev) =>
+      (Array.isArray(prev) ? prev : []).map((q: any) => {
+        if ((q.subject || '').trim() === oldSubject) {
+          const nextQ = { ...q, subject: newSubject };
+          updatedItems.push(nextQ);
+          return nextQ;
+        }
+        return q;
+      })
+    );
+
+    if (updatedItems.length > 0) {
+      emitRealtimeChange({
+        scope: 'questions',
+        action: 'upsertMany',
+        items: updatedItems,
+        source: 'supabase',
+      });
+    } else {
+      emitRealtimeChange({
+        scope: 'core',
+        action: 'refresh',
+        source: 'supabase',
+      });
+    }
+
+    res.json({ success: true, updatedCount: updatedItems.length, version: serverCoreCache.version });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Rename questions subject error' });
   }
 });
 
@@ -3382,10 +3659,12 @@ function handleServerSupabaseRealtimeEvent(evt: {
 }) {
   if (evt.eventType === 'BROADCAST') {
     const payload = evt.broadcastPayload;
-    if (!payload || payload.origin === 'server') return;
+    if (!payload) return;
+    if (payload.serverInstanceId && payload.serverInstanceId === SERVER_INSTANCE_ID) return;
     const scope = payload.scope;
     const action = payload.action;
     if (!scope || !action) return;
+    applyRealtimeDeltaToServerCache(payload);
     emitRealtimeChange({
       scope,
       action,
@@ -3395,6 +3674,7 @@ function handleServerSupabaseRealtimeEvent(evt: {
       items: payload.items,
       replace: payload.replace,
       mode: payload.mode,
+      version: serverCoreCache.version,
       source: 'supabase',
       skipSupabaseBroadcast: true,
     });
