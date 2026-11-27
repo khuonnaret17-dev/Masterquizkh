@@ -1,5 +1,6 @@
 import { authorizeAdminRequest } from '../_lib/adminAuth.js';
 import {
+  formatGitHubMissingError,
   getGitHubStoreConfig,
   sanitizeBundledCodePayload,
   saveBundledStoreToGitHub,
@@ -47,11 +48,13 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       ok: false,
       readOnly: true,
       githubRequired: true,
+      hasToken: cfg.hasToken,
+      hasRepo: cfg.hasRepo,
+      missingVars: cfg.missingVars,
       githubRepo: cfg.fullRepo || null,
       githubBranch: cfg.branch || null,
       ...(authResult.adminToken ? { adminToken: authResult.adminToken } : {}),
-      error:
-        'មិនទាន់បានភ្ជាប់ GITHUB_TOKEN លើ Vercel ទេ! សូមកំណត់ GITHUB_TOKEN និង GITHUB_REPO ក្នុង Vercel Settings → Environment Variables ដើម្បីឱ្យរក្សាទុក និងបញ្ជូន Real-Time ស្វ័យប្រវត្តិ។',
+      error: formatGitHubMissingError(cfg),
     });
   }
 

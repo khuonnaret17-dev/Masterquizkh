@@ -3162,6 +3162,9 @@ export interface CodeStoreStatus {
   questionsCount: number;
   writable: boolean;
   githubConfigured?: boolean;
+  hasToken?: boolean;
+  hasRepo?: boolean;
+  missingVars?: string[];
   githubRepo?: string | null;
   githubBranch?: string | null;
   storageMode?: 'github' | 'disk' | 'hybrid' | 'readonly';
@@ -3173,6 +3176,9 @@ export interface SaveToCodeStoreResult {
   requiresPasscode?: boolean;
   githubRequired?: boolean;
   githubConfigured?: boolean;
+  hasToken?: boolean;
+  hasRepo?: boolean;
+  missingVars?: string[];
   githubSynced?: boolean;
   diskSaved?: boolean;
   githubRepo?: string | null;
@@ -3200,6 +3206,9 @@ export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
           questionsCount: Number(data.questionsCount ?? INITIAL_QUESTIONS.length),
           writable: Boolean(data.writable),
           githubConfigured: Boolean(data.githubConfigured),
+          hasToken: typeof data.hasToken === 'boolean' ? data.hasToken : undefined,
+          hasRepo: typeof data.hasRepo === 'boolean' ? data.hasRepo : undefined,
+          missingVars: Array.isArray(data.missingVars) ? data.missingVars : undefined,
           githubRepo: data.githubRepo || null,
           githubBranch: data.githubBranch || null,
           storageMode: data.storageMode,

@@ -2472,9 +2472,34 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               {isGithubLive
                 ? `រាល់ពេល Admin បន្ថែម លុប ឬកែប្រែសំណួរ-ចម្លើយ ប្រព័ន្ធនឹង Commit ទៅ GitHub (${codeStoreStatus?.githubRepo || 'Repo'} · ${codeStoreStatus?.githubBranch || 'main'}) និងបញ្ជូន Real-Time ដល់សមាជិកគ្រប់គ្នាលើ Vercel ភ្លាមៗ!`
                 : isVercelReadOnly
-                  ? 'ដើម្បីឱ្យរក្សាទុក និង Update Real-Time លើ GitHub + Vercel បាន សូមបន្ថែម GITHUB_TOKEN (Contents: Read & Write) ក្នុង Vercel Environment Variables រួច Redeploy។'
+                  ? 'ដើម្បីឱ្យរក្សាទុក និង Update Real-Time លើ GitHub + Vercel បាន សូមពិនិត្យ Environment Variables លើ Vercel រួចចុច Deployments → Redeploy។'
                   : 'រាល់សំណួរដែលរក្សាទុកក្នុង Code នឹងផ្ទុកមកជាមួយកម្មវិធីភ្លាមៗទាំង Online និង Offline ដោយមិនពឹងផ្អែកលើ Database ខាងក្រៅឡើយ។'}
             </p>
+            {isVercelReadOnly && (
+              <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px] font-mono">
+                <span
+                  className={`px-2 py-0.5 rounded-md border ${
+                    codeStoreStatus?.hasToken
+                      ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 text-emerald-800 dark:text-emerald-200'
+                      : 'bg-red-50 dark:bg-red-950/60 border-red-400 text-red-800 dark:text-red-200'
+                  }`}
+                >
+                  GITHUB_TOKEN: {codeStoreStatus?.hasToken ? 'មាន ✓' : 'មិនទាន់មាន ✗'}
+                </span>
+                <span
+                  className={`px-2 py-0.5 rounded-md border ${
+                    codeStoreStatus?.hasRepo
+                      ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 text-emerald-800 dark:text-emerald-200'
+                      : 'bg-red-50 dark:bg-red-950/60 border-red-400 text-red-800 dark:text-red-200'
+                  }`}
+                >
+                  GITHUB_REPO: {codeStoreStatus?.hasRepo ? `${codeStoreStatus.githubRepo} ✓` : 'មិនទាន់មាន ✗'}
+                </span>
+                <span className="px-2 py-0.5 rounded-md border app-border app-subcard app-text-secondary">
+                  BRANCH: {codeStoreStatus?.githubBranch || 'main'}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 shrink-0">

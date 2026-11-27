@@ -14,6 +14,9 @@ export interface BundledCodeStoreData {
 
 export interface GitHubStoreConfig {
   configured: boolean;
+  hasToken: boolean;
+  hasRepo: boolean;
+  missingVars: string[];
   token: string;
   owner: string;
   repo: string;
@@ -25,23 +28,32 @@ export interface GitHubStoreConfig {
 const REPO_SEGMENT_REGEX = /^[A-Za-z0-9_.-]+$/;
 const BRANCH_REGEX = /^[A-Za-z0-9_./-]+$/;
 
+function cleanEnvValue(raw: string | undefined): string {
+  return (raw || '').trim().replace(/^["']+|["']+$/g, '').trim();
+}
+
 export function getGitHubStoreConfig(): GitHubStoreConfig {
-  const token = (process.env.GITHUB_TOKEN || '').trim();
-  const explicitRepo = (process.env.GITHUB_REPO || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+|\/+$/g, '');
+  const token = cleanEnvValue(process.env.GITHUB_TOKEN) || cleanEnvValue(process.env.GH_TOKEN);
+  const explicitRepo = (
+    cleanEnvValue(process.env.GITHUB_REPO) || cleanEnvValue(process.env.GITHUB_REPOSITORY)
+  )
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/^\/+|\/+$/g, '');
 
   let owner = '';
   let repo = '';
   if (explicitRepo.includes('/')) {
     const parts = explicitRepo.split('/').filter(Boolean);
-    if (parts.length === 2 && REPO_SEGMENT_REGEX.test(parts[0]) && REPO_SEGMENT_REGEX.test(parts[1])) {
+    if (parts.length >= 2 && REPO_SEGMENT_REGEX.test(parts[0]) && REPO_SEGMENT_REGEX.test(parts[1])) {
       owner = parts[0];
       repo = parts[1];
     }
   }
 
   if (!owner || !repo) {
-    const vercelOwner = (process.env.VERCEL_GIT_REPO_OWNER || '').trim();
-    const vercelSlug = (process.env.VERCEL_GIT_REPO_SLUG || '').trim();
+    const vercelOwner = cleanEnvValue(process.env.VERCEL_GIT_REPO_OWNER);
+    const vercelSlug = cleanEnvValue(process.env.VERCEL_GIT_REPO_SLUG);
     if (
       vercelOwner &&
       vercelSlug &&
@@ -53,25 +65,45 @@ export function getGitHubStoreConfig(): GitHubStoreConfig {
     }
   }
 
-  const rawBranch = (
-    process.env.GITHUB_BRANCH ||
-    process.env.VERCEL_GIT_COMMIT_REF ||
-    'main'
-  ).trim();
+  const rawBranch =
+    cleanEnvValue(process.env.GITHUB_BRANCH) ||
+    cleanEnvValue(process.env.VERCEL_GIT_COMMIT_REF) ||
+    'main';
   const branch =
     rawBranch && BRANCH_REGEX.test(rawBranch) && !rawBranch.includes('..') ? rawBranch : 'main';
 
-  const configured = Boolean(token && owner && repo);
+  const hasToken = Boolean(token);
+  const hasRepo = Boolean(owner && repo);
+  const configured = hasToken && hasRepo;
+  const missingVars: string[] = [];
+  if (!hasToken) missingVars.push('GITHUB_TOKEN');
+  if (!hasRepo) missingVars.push('GITHUB_REPO');
 
   return {
     configured,
+    hasToken,
+    hasRepo,
+    missingVars,
     token,
     owner,
     repo,
-    fullRepo: owner && repo ? `${owner}/${repo}` : '',
+    fullRepo: hasRepo ? `${owner}/${repo}` : '',
     branch,
     filePath: BUNDLED_FILE_REPO_PATH,
   };
+}
+
+export function formatGitHubMissingError(cfg: GitHubStoreConfig): string {
+  if (!cfg.hasToken && !cfg.hasRepo) {
+    return 'Vercel មិនទាន់ទទួលបាន GITHUB_TOKEN និង GITHUB_REPO ទេ! សូមពិនិត្យថាបានបន្ថែមក្នុង Vercel Settings → Environment Variables (ជ្រើស Production & Preview) ហើយចុច Deployments → Redeploy ម្ដងទៀត។';
+  }
+  if (!cfg.hasToken) {
+    return 'ខ្វះ GITHUB_TOKEN ក្នុង Vercel Environment Variables (ឬមិនទាន់ Redeploy ក្រោយពេលបន្ថែម)! សូមពិនិត្យហើយចុច Redeploy លើ Vercel។';
+  }
+  if (!cfg.hasRepo) {
+    return 'បានភ្ជាប់ GITHUB_TOKEN រួចហើយ ប៉ុន្តែខ្វះ GITHUB_REPO! សូមបន្ថែម GITHUB_REPO ជាទម្រង់ username/repo-name ក្នុង Vercel Environment Variables រួចចុច Redeploy។';
+  }
+  return '';
 }
 
 export function parseBundledTsText(raw: string): BundledCodeStoreData | null {
