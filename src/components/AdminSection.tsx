@@ -81,6 +81,7 @@ import {
   fetchCodeStoreStatus,
   saveAllToCodeStore,
   CodeStoreStatus,
+  SaveToCodeStoreResult,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
@@ -2268,30 +2269,70 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       if (active) setCodeStoreStatus(st);
     });
 
+    const handleCodeStoreSyncing = () => {
+      if (!active) return;
+      setIsSavingToCodeStore(true);
+      setCodeStoreMsg({
+        text: 'កំពុងរក្សាទុក និងបញ្ជូនការកែប្រែ Real-Time ទៅ GitHub / Code...',
+        success: true,
+      });
+    };
+
     const handleCodeStoreSynced = (e: Event) => {
-      const detail = (e as CustomEvent<{
-        ok?: boolean;
-        version?: number;
-        updatedAt?: string;
-        subjectsCount?: number;
-        questionsCount?: number;
-      }>).detail;
+      const detail = (e as CustomEvent<SaveToCodeStoreResult>).detail;
       if (!active || !detail?.ok) return;
+      setIsSavingToCodeStore(false);
       setCodeStoreStatus((prev) => ({
         version: detail.version ?? prev?.version ?? 0,
         updatedAt: detail.updatedAt ?? new Date().toISOString(),
         subjectsCount: detail.subjectsCount ?? prev?.subjectsCount ?? 0,
         questionsCount: detail.questionsCount ?? prev?.questionsCount ?? 0,
         writable: true,
+        githubConfigured: detail.githubConfigured ?? prev?.githubConfigured,
+        githubRepo: detail.githubRepo ?? prev?.githubRepo,
+        githubBranch: detail.githubBranch ?? prev?.githubBranch,
+        storageMode: detail.githubSynced ? 'github' : prev?.storageMode,
       }));
+      setCodeStoreMsg({
+        text: detail.githubSynced
+          ? `បានរក្សាទុក Real-Time ទៅ GitHub (${detail.githubRepo || 'Repo'}) រួចរាល់! សមាជិកលើ Vercel នឹងទទួលបានសំណួរថ្មី (${toKhmerNum(detail.questionsCount ?? questions.length)} សំណួរ) ស្វ័យប្រវត្តិ។`
+          : `បានរក្សាទុក Real-Time (${toKhmerNum(detail.subjectsCount ?? subjects.length)} មុខវិជ្ជា · ${toKhmerNum(detail.questionsCount ?? questions.length)} សំណួរ) ចូល Code ជោគជ័យ!`,
+        success: true,
+      });
     };
 
+    const handleCodeStoreError = (e: Event) => {
+      const detail = (e as CustomEvent<SaveToCodeStoreResult>).detail;
+      if (!active) return;
+      setIsSavingToCodeStore(false);
+      if (detail?.error) {
+        setCodeStoreMsg({
+          text: detail.error,
+          success: false,
+        });
+      }
+    };
+
+    const handleCodeStoreAuthNeeded = (e: Event) => {
+      const detail = (e as CustomEvent<SaveToCodeStoreResult | undefined>).detail;
+      if (!active) return;
+      setIsSavingToCodeStore(false);
+      setCodeStorePasscodeError(detail?.error || '');
+      setCodeStorePasscodeModalOpen(true);
+    };
+
+    window.addEventListener('mpq-code-store-syncing', handleCodeStoreSyncing);
     window.addEventListener('mpq-code-store-synced', handleCodeStoreSynced);
+    window.addEventListener('mpq-code-store-error', handleCodeStoreError);
+    window.addEventListener('mpq-code-store-auth-needed', handleCodeStoreAuthNeeded);
     return () => {
       active = false;
+      window.removeEventListener('mpq-code-store-syncing', handleCodeStoreSyncing);
       window.removeEventListener('mpq-code-store-synced', handleCodeStoreSynced);
+      window.removeEventListener('mpq-code-store-error', handleCodeStoreError);
+      window.removeEventListener('mpq-code-store-auth-needed', handleCodeStoreAuthNeeded);
     };
-  }, []);
+  }, [questions.length, subjects.length]);
 
   const handleDownloadBundledTs = () => {
     setCodeStoreMsg(null);
@@ -2343,28 +2384,36 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       setCodeStorePasscodeInput('');
 
       if (res.ok) {
-        setCodeStoreStatus({
+        setCodeStoreStatus((prev) => ({
           version: res.version || Date.now(),
           updatedAt: res.updatedAt || new Date().toISOString(),
           subjectsCount: res.subjectsCount ?? subjects.length,
           questionsCount: res.questionsCount ?? questions.length,
           writable: true,
-        });
+          githubConfigured: res.githubConfigured ?? prev?.githubConfigured,
+          githubRepo: res.githubRepo ?? prev?.githubRepo,
+          githubBranch: res.githubBranch ?? prev?.githubBranch,
+          storageMode: res.githubSynced ? 'github' : prev?.storageMode,
+        }));
         setCodeStoreMsg({
-          text: `បានរក្សាទុក ${toKhmerNum(res.subjectsCount ?? subjects.length)} មុខវិជ្ជា និង ${toKhmerNum(res.questionsCount ?? questions.length)} សំណួរ ចូលក្នុង Code កម្មវិធី (src/data/bundledQuestions.ts) ជោគជ័យ!`,
+          text: res.githubSynced
+            ? `បានរក្សាទុក Real-Time ទៅ GitHub (${res.githubRepo || ''}) ចំនួន ${toKhmerNum(res.subjectsCount ?? subjects.length)} មុខវិជ្ជា និង ${toKhmerNum(res.questionsCount ?? questions.length)} សំណួរ ជោគជ័យ! សមាជិកគ្រប់រូបនឹងឃើញភ្លាមៗ។`
+            : `បានរក្សាទុក ${toKhmerNum(res.subjectsCount ?? subjects.length)} មុខវិជ្ជា និង ${toKhmerNum(res.questionsCount ?? questions.length)} សំណួរ ចូលក្នុង Code កម្មវិធី (src/data/bundledQuestions.ts) ជោគជ័យ!`,
           success: true,
         });
         return;
       }
 
       if (res.readOnly) {
-        const tsContent = generateBundledQuestionsTsContent(questions, subjects);
-        downloadTypeScriptFile(tsContent, 'bundledQuestions.ts');
+        if (!res.githubRequired) {
+          const tsContent = generateBundledQuestionsTsContent(questions, subjects);
+          downloadTypeScriptFile(tsContent, 'bundledQuestions.ts');
+        }
         setCodeStoreMsg({
           text:
             res.error ||
             `បានទាញយកឯកសារ bundledQuestions.ts (${toKhmerNum(questions.length)} សំណួរ) ដោយស្វ័យប្រវត្តិ (Hosting មិនអនុញ្ញាតឱ្យកែផ្ទាល់)។`,
-          success: true,
+          success: !res.githubRequired,
         });
         return;
       }
@@ -2385,14 +2434,22 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       codeStoreStatus !== null &&
       codeQCount === questions.length &&
       codeSCount === subjects.length;
+    const isGithubLive = Boolean(codeStoreStatus?.githubConfigured);
+    const isVercelReadOnly = codeStoreStatus !== null && !codeStoreStatus.writable;
 
     return (
       <div className="app-card rounded-2xl p-5 sm:p-6 shadow-sm border border-emerald-500/30">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="space-y-1.5">
-            <h2 className="font-moul text-sm sm:text-base app-text-primary flex items-center gap-2">
+            <h2 className="font-moul text-sm sm:text-base app-text-primary flex flex-wrap items-center gap-2">
               <FileCode2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-              <span>រក្សាទុកសំណួរ-ចម្លើយក្នុង Code កម្មវិធី (Built-in Code Store)</span>
+              <span>រក្សាទុកសំណួរ-ចម្លើយក្នុង Code កម្មវិធី (GitHub + Vercel Real-Time)</span>
+              {isGithubLive && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-sans font-bold bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-200 border border-emerald-400/50">
+                  <Radio className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                  <span>GitHub Live Sync{codeStoreStatus?.githubRepo ? `: ${codeStoreStatus.githubRepo}` : ''}</span>
+                </span>
+              )}
             </h2>
             <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
               ទិន្នន័យបច្ចុប្បន្នក្នុងកម្មវិធី៖{' '}
@@ -2412,7 +2469,11 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               </strong>
             </p>
             <p className="text-xs app-text-secondary">
-              រាល់សំណួរដែលរក្សាទុកក្នុង Code នឹងផ្ទុកមកជាមួយកម្មវិធីភ្លាមៗទាំង Online និង Offline ដោយមិនពឹងផ្អែកលើ Database ខាងក្រៅឡើយ។
+              {isGithubLive
+                ? `រាល់ពេល Admin បន្ថែម លុប ឬកែប្រែសំណួរ-ចម្លើយ ប្រព័ន្ធនឹង Commit ទៅ GitHub (${codeStoreStatus?.githubRepo || 'Repo'} · ${codeStoreStatus?.githubBranch || 'main'}) និងបញ្ជូន Real-Time ដល់សមាជិកគ្រប់គ្នាលើ Vercel ភ្លាមៗ!`
+                : isVercelReadOnly
+                  ? 'ដើម្បីឱ្យរក្សាទុក និង Update Real-Time លើ GitHub + Vercel បាន សូមបន្ថែម GITHUB_TOKEN (Contents: Read & Write) ក្នុង Vercel Environment Variables រួច Redeploy។'
+                  : 'រាល់សំណួរដែលរក្សាទុកក្នុង Code នឹងផ្ទុកមកជាមួយកម្មវិធីភ្លាមៗទាំង Online និង Offline ដោយមិនពឹងផ្អែកលើ Database ខាងក្រៅឡើយ។'}
             </p>
           </div>
 
@@ -2430,8 +2491,10 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
               )}
               <span>
                 {isSavingToCodeStore
-                  ? 'កំពុងរក្សាទុកចូល Code...'
-                  : 'រក្សាទុកទាំងអស់ចូល Code'}
+                  ? 'កំពុងបញ្ជូន Real-Time...'
+                  : isGithubLive
+                    ? 'រក្សាទុក & Update Real-Time'
+                    : 'រក្សាទុកទាំងអស់ចូល Code'}
               </span>
             </button>
 

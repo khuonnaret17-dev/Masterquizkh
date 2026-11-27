@@ -722,20 +722,22 @@ function adjustGlobalStat(field: keyof Omit<GlobalStats, 'updatedAt'>, delta: nu
  * Fetches questions, subjects, notifications, and bot_commands from Node server RAM cache first
  * (0 Firestore reads for 99.9% of users), with IndexedDB + Firestore limit(20) fallback.
  */
-async function syncCoreFromServer(force = false): Promise<boolean> {
+async function syncCoreFromServer(force = false, bypassFreshCheck = false): Promise<boolean> {
   await hydrateCacheFromIdb();
 
   if (
     !force &&
+    !bypassFreshCheck &&
     hasNonEmptyCoreArrays() &&
     (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
   ) {
     return true;
   }
 
-  return runDeduplicated(`core_server:${force ? 'force' : 'ttl'}`, async () => {
+  return runDeduplicated(`core_server:${force ? 'force' : bypassFreshCheck ? 'poll' : 'ttl'}`, async () => {
     if (
       !force &&
+      !bypassFreshCheck &&
       hasNonEmptyCoreArrays() &&
       (isQuotaCooldownActive(false) || isCacheFresh('CORE_CHECK'))
     ) {
@@ -1588,27 +1590,60 @@ function sanitizeData<T extends Record<string, any>>(obj: T): T {
 }
 
 let autoSyncCodeStoreTimer: ReturnType<typeof setTimeout> | null = null;
+let isCodeStoreSaveRunning = false;
+let codeStoreDirtyWhileSaving = false;
 
-function scheduleAutoSyncCodeStore() {
+async function flushAutoSyncCodeStore() {
   if (typeof window === 'undefined') return;
-  if (!inMemoryAdminToken && !auth.currentUser) return;
+  if (isCodeStoreSaveRunning) {
+    codeStoreDirtyWhileSaving = true;
+    return;
+  }
+  const latestQuestions = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
+  const latestSubjects = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
+  if (latestQuestions.length === 0) return;
+
+  if (!inMemoryAdminToken && !auth.currentUser) {
+    window.dispatchEvent(new CustomEvent('mpq-code-store-auth-needed'));
+    return;
+  }
+
+  isCodeStoreSaveRunning = true;
+  window.dispatchEvent(new CustomEvent('mpq-code-store-syncing'));
+  try {
+    const res = await saveAllToCodeStore({
+      questions: latestQuestions,
+      subjects: latestSubjects,
+    });
+    if (res.ok) {
+      window.dispatchEvent(new CustomEvent('mpq-code-store-synced', { detail: res }));
+    } else if (res.requiresPasscode) {
+      window.dispatchEvent(new CustomEvent('mpq-code-store-auth-needed', { detail: res }));
+    } else {
+      window.dispatchEvent(new CustomEvent('mpq-code-store-error', { detail: res }));
+    }
+  } finally {
+    isCodeStoreSaveRunning = false;
+    if (codeStoreDirtyWhileSaving) {
+      codeStoreDirtyWhileSaving = false;
+      scheduleAutoSyncCodeStore(450);
+    }
+  }
+}
+
+function scheduleAutoSyncCodeStore(delayMs = 1500) {
+  if (typeof window === 'undefined') return;
+  if (!inMemoryAdminToken && !auth.currentUser) {
+    window.dispatchEvent(new CustomEvent('mpq-code-store-auth-needed'));
+    return;
+  }
   if (autoSyncCodeStoreTimer) {
     clearTimeout(autoSyncCodeStoreTimer);
   }
   autoSyncCodeStoreTimer = setTimeout(() => {
     autoSyncCodeStoreTimer = null;
-    const latestQuestions = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
-    const latestSubjects = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
-    if (latestQuestions.length === 0) return;
-    void saveAllToCodeStore({
-      questions: latestQuestions,
-      subjects: latestSubjects,
-    }).then((res) => {
-      if (res.ok) {
-        window.dispatchEvent(new CustomEvent('mpq-code-store-synced', { detail: res }));
-      }
-    });
-  }, 1200);
+    void flushAutoSyncCodeStore();
+  }, delayMs);
 }
 
 export async function addQuestion(q: Omit<Question, 'id'>) {
@@ -2481,12 +2516,15 @@ export async function saveBotCommandConfig(config: BotCommandConfig) {
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
 
-  try {
-    await setDoc(doc(db, 'bot_commands', docId), payload);
-    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
-    throw err;
+  syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
+
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await setDoc(doc(db, 'bot_commands', docId), payload);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.WRITE, `bot_commands/${docId}`);
+    }
   }
 
   await syncTelegramBotTemplates(next);
@@ -2501,12 +2539,15 @@ export async function resetBotCommandConfig(command: string) {
   setLocal(STORAGE_KEYS.BOT_COMMANDS, next);
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: next }));
+  syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
 
-  try {
-    await deleteDoc(doc(db, 'bot_commands', docId));
-    syncMutationToServerCache('bot_commands', { replace: next, authoritative: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await deleteDoc(doc(db, 'bot_commands', docId));
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, `bot_commands/${docId}`);
+    }
   }
 
   await syncTelegramBotTemplates(next);
@@ -2516,19 +2557,22 @@ export async function resetAllBotCommands(commands: string[]) {
   setLocal(STORAGE_KEYS.BOT_COMMANDS, {});
   setSyncTimestamp('BOT_COMMANDS');
   window.dispatchEvent(new CustomEvent('mpq-bot-commands-changed', { detail: {} }));
+  syncMutationToServerCache('bot_commands', { replace: {}, authoritative: true });
 
-  try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
-        batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < commands.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const cmd of commands.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'bot_commands', getBotCommandDocId(cmd)));
+        }
+        await batch.commit();
       }
-      await batch.commit();
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
     }
-    syncMutationToServerCache('bot_commands', { replace: {}, authoritative: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'bot_commands');
   }
 
   await syncTelegramBotTemplates({});
@@ -2586,12 +2630,23 @@ function mergeByIdWithAction<T extends { id?: string }>(
 function applyRealtimeDeltaEvent(evt: RealtimeDeltaEvent) {
   if (!evt || typeof evt.scope !== 'string') return;
 
+  const isCoreScope =
+    evt.scope === 'questions' ||
+    evt.scope === 'subjects' ||
+    evt.scope === 'notifications' ||
+    evt.scope === 'bot_commands';
+
   if (typeof evt.version === 'number' && evt.version > 0 && !(evt.scope === 'core' && evt.action === 'refresh')) {
     const prevVersion = getLocal<number>(STORAGE_KEYS.CORE_SERVER_VERSION, 0);
     if (evt.version > prevVersion) {
-      setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, evt.version);
-      if (hasNonEmptyCoreArrays()) {
-        setSyncTimestamp('CORE_CHECK');
+      if (isCoreScope) {
+        setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, evt.version);
+        if (hasNonEmptyCoreArrays()) {
+          setSyncTimestamp('CORE_CHECK');
+        }
+      } else if (evt.sourceClientId !== REALTIME_CLIENT_ID) {
+        // Server core version advanced while this client wasn't synced — catch up immediately
+        void syncCoreFromServer(true);
       }
     }
   }
@@ -2755,10 +2810,37 @@ export function startCoreRealtimeSync(options?: {
   let disposed = false;
   let eventSource: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let usePollingMode = false;
+  let sseFailureCount = 0;
   const firestoreUnsubs: Array<() => void> = [];
 
+  const startLivePolling = (immediate = true) => {
+    if (disposed) return;
+    usePollingMode = true;
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (immediate && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      void syncCoreFromServer(false, true);
+    }
+    if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        if (disposed) return;
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+        void syncCoreFromServer(false, true);
+      }, 8000);
+    }
+  };
+
   const connectSse = () => {
-    if (disposed || typeof EventSource === 'undefined') return;
+    if (disposed || usePollingMode || typeof EventSource === 'undefined') return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
     if (eventSource && eventSource.readyState !== EventSource.CLOSED) {
@@ -2775,6 +2857,7 @@ export function startCoreRealtimeSync(options?: {
 
       es.addEventListener('connected', (event: MessageEvent) => {
         if (disposed) return;
+        sseFailureCount = 0;
         try {
           const data = JSON.parse(event.data || '{}') as {
             version?: number;
@@ -2810,6 +2893,12 @@ export function startCoreRealtimeSync(options?: {
 
       es.onerror = () => {
         if (disposed) return;
+        sseFailureCount += 1;
+        if (sseFailureCount >= 2) {
+          // Serverless environment (e.g. Vercel) without persistent SSE — switch cleanly to ETag polling
+          startLivePolling(true);
+          return;
+        }
         if (es.readyState === EventSource.CLOSED && !reconnectTimer) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
@@ -2818,11 +2907,30 @@ export function startCoreRealtimeSync(options?: {
         }
       };
     } catch {
-      // Ignore EventSource initialization failure in restricted browsers
+      startLivePolling(true);
     }
   };
 
-  connectSse();
+  // Detect whether backend supports persistent SSE (Node/Express) or Serverless ETag Polling (Vercel)
+  void fetch('/api/health', { cache: 'no-store' })
+    .then(async (res) => {
+      if (disposed) return;
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        startLivePolling(true);
+        return;
+      }
+      const health = await res.json().catch(() => null);
+      if (disposed) return;
+      if (health?.realtimeMode === 'poll') {
+        startLivePolling(true);
+      } else {
+        connectSse();
+      }
+    })
+    .catch(() => {
+      if (!disposed) startLivePolling(false);
+    });
 
   // Same-browser multi-tab instant synchronization via BroadcastChannel
   const channel = getRealtimeBroadcastChannel();
@@ -2838,14 +2946,18 @@ export function startCoreRealtimeSync(options?: {
   const handleResume = () => {
     if (disposed) return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
-      connectSse();
+    if (usePollingMode) {
+      void syncCoreFromServer(false, true);
+    } else {
+      if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+        connectSse();
+      }
+      if (!isCacheFresh('CORE_CHECK') || !hasNonEmptyCoreArrays()) {
+        void syncCoreFromServer(false);
+      }
     }
     if (options?.username && options?.role) {
       void updatePresenceHeartbeat(options.username, options.role, false);
-    }
-    if (!isCacheFresh('CORE_CHECK') || !hasNonEmptyCoreArrays()) {
-      void syncCoreFromServer(false);
     }
   };
   const handleVisibilityChange = () => {
@@ -2854,7 +2966,23 @@ export function startCoreRealtimeSync(options?: {
     }
   };
   window.addEventListener('online', handleResume);
+  window.addEventListener('focus', handleResume);
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  const watchdogTimer = setInterval(() => {
+    if (disposed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    if (usePollingMode) {
+      if (!pollTimer) startLivePolling(true);
+      return;
+    }
+    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+      connectSse();
+    }
+    if (!isCacheFresh('CORE_CHECK') || !hasNonEmptyCoreArrays()) {
+      void syncCoreFromServer(false);
+    }
+  }, 60000);
 
   // Targeted, quota-safe Firestore real-time listeners (strictly limit <= 20)
   const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
@@ -3000,6 +3128,10 @@ export function startCoreRealtimeSync(options?: {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
     if (eventSource) {
       eventSource.close();
       eventSource = null;
@@ -3007,7 +3139,9 @@ export function startCoreRealtimeSync(options?: {
     if (channel) {
       channel.removeEventListener('message', handleChannelMessage);
     }
+    clearInterval(watchdogTimer);
     window.removeEventListener('online', handleResume);
+    window.removeEventListener('focus', handleResume);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     for (const unsub of firestoreUnsubs) {
       try {
@@ -3027,12 +3161,24 @@ export interface CodeStoreStatus {
   subjectsCount: number;
   questionsCount: number;
   writable: boolean;
+  githubConfigured?: boolean;
+  githubRepo?: string | null;
+  githubBranch?: string | null;
+  storageMode?: 'github' | 'disk' | 'hybrid' | 'readonly';
 }
 
 export interface SaveToCodeStoreResult {
   ok: boolean;
   readOnly?: boolean;
   requiresPasscode?: boolean;
+  githubRequired?: boolean;
+  githubConfigured?: boolean;
+  githubSynced?: boolean;
+  diskSaved?: boolean;
+  githubRepo?: string | null;
+  githubBranch?: string | null;
+  commitUrl?: string;
+  commitSha?: string;
   version?: number;
   updatedAt?: string;
   subjectsCount?: number;
@@ -3053,6 +3199,10 @@ export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
           subjectsCount: Number(data.subjectsCount ?? INITIAL_SUBJECTS.length),
           questionsCount: Number(data.questionsCount ?? INITIAL_QUESTIONS.length),
           writable: Boolean(data.writable),
+          githubConfigured: Boolean(data.githubConfigured),
+          githubRepo: data.githubRepo || null,
+          githubBranch: data.githubBranch || null,
+          storageMode: data.storageMode,
         };
       }
     }
@@ -3065,6 +3215,8 @@ export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
     subjectsCount: INITIAL_SUBJECTS.length,
     questionsCount: INITIAL_QUESTIONS.length,
     writable: false,
+    githubConfigured: false,
+    storageMode: 'readonly',
   };
 }
 
@@ -3094,6 +3246,7 @@ export async function saveAllToCodeStore(params: {
       body: JSON.stringify({
         questions: params.questions,
         subjects: params.subjects,
+        clientId: REALTIME_CLIENT_ID,
       }),
     });
 

@@ -5,6 +5,11 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import {
+  getGitHubStoreConfig,
+  renderBundledQuestionsTsContent,
+  saveBundledStoreToGitHub,
+} from './api/_lib/githubCodeStore.ts';
 
 dotenv.config();
 
@@ -2365,7 +2370,13 @@ const adminVerifyAttempts = new Map<string, number[]>();
 
 const DEFAULT_ADMIN_CODE = '168';
 const ADMIN_SESSION_SECRET =
-  (process.env.ADMIN_SESSION_SECRET || '').trim() || crypto.randomBytes(32).toString('hex');
+  (process.env.ADMIN_SESSION_SECRET || '').trim() ||
+  ((process.env.GITHUB_TOKEN || '').trim()
+    ? crypto
+        .createHmac('sha256', 'mpq-vercel-admin-session-v1')
+        .update(process.env.GITHUB_TOKEN!.trim())
+        .digest('hex')
+    : crypto.randomBytes(32).toString('hex'));
 const ADMIN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 function signAdminSessionToken(): string {
@@ -2532,12 +2543,13 @@ app.post('/api/admin/verify-passcode', (req, res) => {
 app.get('/api/code-store/status', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const bundled = loadBundledCodeStoreFromDisk();
-  let writable = false;
+  const ghCfg = getGitHubStoreConfig();
+  let diskWritable = false;
   try {
     fs.accessSync(BUNDLED_CODE_STORE_PATH, fs.constants.W_OK);
-    writable = true;
+    diskWritable = true;
   } catch {
-    writable = false;
+    diskWritable = false;
   }
   res.json({
     ok: true,
@@ -2545,7 +2557,11 @@ app.get('/api/code-store/status', (_req, res) => {
     updatedAt: bundled?.updatedAt || null,
     subjectsCount: bundled?.subjects.length || 0,
     questionsCount: bundled?.questions.length || 0,
-    writable,
+    writable: diskWritable || ghCfg.configured,
+    githubConfigured: ghCfg.configured,
+    githubRepo: ghCfg.fullRepo || null,
+    githubBranch: ghCfg.branch || null,
+    storageMode: ghCfg.configured ? (diskWritable ? 'hybrid' : 'github') : diskWritable ? 'disk' : 'readonly',
   });
 });
 
@@ -2700,33 +2716,20 @@ app.post('/api/code-store/save', async (req, res) => {
     questions: sanitizedQuestions,
   };
 
-  const fileContent = `import type { Question, Subject } from '../types';
-
-interface BundledStorePayload {
-  version: number;
-  updatedAt: string;
-  subjects: Subject[];
-  questions: Question[];
-}
-
-${BUNDLED_JSON_START_MARKER}
-const BUNDLED_DATA: BundledStorePayload = ${JSON.stringify(payload, null, 2)};
-${BUNDLED_JSON_END_MARKER}
-
-export const BUNDLED_VERSION: number = BUNDLED_DATA.version;
-export const BUNDLED_UPDATED_AT: string = BUNDLED_DATA.updatedAt;
-export const BUNDLED_SUBJECTS: Subject[] = BUNDLED_DATA.subjects;
-export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
-`;
+  const fileContent = renderBundledQuestionsTsContent(payload, true);
 
   const resolvedTarget = path.resolve(BUNDLED_CODE_STORE_PATH);
   if (!resolvedTarget.startsWith(BUNDLED_CODE_BASE_DIR + path.sep)) {
     return res.status(500).json({ ok: false, error: 'Invalid code store path' });
   }
 
+  let diskSaved = false;
+  let diskReadOnly = false;
+  let diskError = '';
   try {
     fs.mkdirSync(BUNDLED_CODE_BASE_DIR, { recursive: true });
     fs.writeFileSync(resolvedTarget, fileContent, 'utf8');
+    diskSaved = true;
     if (activeViteServer?.moduleGraph) {
       const modsToInvalidate = [
         activeViteServer.moduleGraph.getModuleById(resolvedTarget),
@@ -2738,14 +2741,37 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
     }
   } catch (err: any) {
     const code = err?.code || '';
-    const isReadOnly = code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
+    diskReadOnly = code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
+    diskError = err?.message || '';
+  }
+
+  const ghCfg = getGitHubStoreConfig();
+  let githubSynced = false;
+  let commitUrl: string | undefined;
+  let commitSha: string | undefined;
+  let ghError: string | undefined;
+
+  if (ghCfg.configured) {
+    const ghRes = await saveBundledStoreToGitHub(payload);
+    githubSynced = ghRes.ok;
+    commitUrl = ghRes.commitUrl;
+    commitSha = ghRes.commitSha;
+    ghError = ghRes.error;
+  }
+
+  if (!diskSaved && !githubSynced) {
     return res.json({
       ok: false,
-      readOnly: isReadOnly,
+      readOnly: diskReadOnly && !ghCfg.configured,
+      githubConfigured: ghCfg.configured,
+      githubRepo: ghCfg.fullRepo || null,
+      githubBranch: ghCfg.branch || null,
       ...(authResult.adminToken ? { adminToken: authResult.adminToken } : {}),
-      error: isReadOnly
-        ? 'បរិយាកាស Hosting នេះមិនអនុញ្ញាតឱ្យសរសេរផ្ទាល់លើ Code ទេ — សូមទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ!'
-        : err?.message || 'មិនអាចសរសេរចូលឯកសារ Code បានទេ!',
+      error:
+        ghError ||
+        (diskReadOnly
+          ? 'បរិយាកាស Hosting នេះមិនអនុញ្ញាតឱ្យសរសេរផ្ទាល់លើ Code ទេ — សូមកំណត់ GITHUB_TOKEN ឬទាញយកឯកសារ bundledQuestions.ts!'
+          : diskError || 'មិនអាចសរសេរចូលឯកសារ Code បានទេ!'),
     });
   }
 
@@ -2755,11 +2781,17 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
   serverCoreCache.questions = { data: sanitizedQuestions, fetchedAt: version };
   schedulePersistServerCoreCache();
 
+  const sourceClientId =
+    typeof req.body?.clientId === 'string' && req.body.clientId.trim()
+      ? req.body.clientId.trim().slice(0, 80)
+      : undefined;
+
   broadcastRealtimeEvent({
     scope: 'subjects',
     action: 'replace',
     replace: sanitizedSubjects,
     authoritative: true,
+    ...(sourceClientId ? { sourceClientId } : {}),
     version,
     ts: version,
   });
@@ -2768,12 +2800,19 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
     action: 'replace',
     replace: sanitizedQuestions,
     authoritative: true,
+    ...(sourceClientId ? { sourceClientId } : {}),
     version,
     ts: version,
   });
 
   res.json({
     ok: true,
+    diskSaved,
+    githubSynced,
+    githubConfigured: ghCfg.configured,
+    ...(ghCfg.fullRepo ? { githubRepo: ghCfg.fullRepo, githubBranch: ghCfg.branch } : {}),
+    ...(commitUrl ? { commitUrl } : {}),
+    ...(commitSha ? { commitSha } : {}),
     version,
     updatedAt,
     subjectsCount: sanitizedSubjects.length,
@@ -2785,8 +2824,17 @@ export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
 let activeViteServer: any = null;
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', app: 'Master Quiz KH' });
+app.get('/api/health', (_req, res) => {
+  const ghCfg = getGitHubStoreConfig();
+  res.json({
+    status: 'ok',
+    app: 'Master Quiz KH',
+    realtimeMode: 'sse',
+    version: serverCoreCache.version,
+    githubConfigured: ghCfg.configured,
+    githubRepo: ghCfg.fullRepo || null,
+    githubBranch: ghCfg.branch,
+  });
 });
 
 // Mount Vite or static dist in production
