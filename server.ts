@@ -1549,9 +1549,50 @@ const SERVER_CACHE_TTLS = {
 
 const SERVER_DISK_CACHE_PRIMARY = path.resolve(__dirname, '.mpq_server_core_cache.json');
 const SERVER_DISK_CACHE_FALLBACK = path.join(os.tmpdir(), 'mpq-server-core-cache-v1.json');
+const BUNDLED_CODE_BASE_DIR = path.resolve(__dirname, 'src', 'data');
+const BUNDLED_CODE_STORE_PATH = path.resolve(BUNDLED_CODE_BASE_DIR, 'bundledQuestions.ts');
+const BUNDLED_JSON_START_MARKER = '// <BUNDLED_JSON_START>';
+const BUNDLED_JSON_END_MARKER = '// <BUNDLED_JSON_END>';
+
+interface BundledCodeStoreData {
+  version: number;
+  updatedAt: string;
+  subjects: any[];
+  questions: any[];
+}
+
+function loadBundledCodeStoreFromDisk(): BundledCodeStoreData | null {
+  try {
+    if (!fs.existsSync(BUNDLED_CODE_STORE_PATH)) return null;
+    const raw = fs.readFileSync(BUNDLED_CODE_STORE_PATH, 'utf8');
+    const startMarkerIdx = raw.indexOf(BUNDLED_JSON_START_MARKER);
+    const endMarkerIdx = raw.indexOf(BUNDLED_JSON_END_MARKER);
+    if (startMarkerIdx === -1 || endMarkerIdx === -1 || endMarkerIdx <= startMarkerIdx) {
+      return null;
+    }
+    const section = raw.slice(startMarkerIdx + BUNDLED_JSON_START_MARKER.length, endMarkerIdx);
+    const braceStart = section.indexOf('{');
+    const braceEnd = section.lastIndexOf('}');
+    if (braceStart === -1 || braceEnd === -1 || braceEnd <= braceStart) {
+      return null;
+    }
+    const parsed = JSON.parse(section.slice(braceStart, braceEnd + 1));
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      version: typeof parsed.version === 'number' ? parsed.version : Date.now(),
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date().toISOString(),
+      subjects: Array.isArray(parsed.subjects) ? parsed.subjects : [],
+      questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+    };
+  } catch (err) {
+    console.warn('Could not load bundledQuestions.ts code store:', err);
+    return null;
+  }
+}
 
 interface ServerCoreCacheState {
   version: number;
+  bundledVersion: number;
   lastForceAt: number;
   quotaCooldownUntil: number;
   questions: { data: any[]; fetchedAt: number } | null;
@@ -1562,12 +1603,20 @@ interface ServerCoreCacheState {
 }
 
 function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
+  const bundled = loadBundledCodeStoreFromDisk();
   const empty: ServerCoreCacheState = {
-    version: Date.now(),
+    version: bundled?.version || Date.now(),
+    bundledVersion: bundled?.version || 0,
     lastForceAt: 0,
     quotaCooldownUntil: 0,
-    questions: null,
-    subjects: null,
+    questions:
+      bundled && bundled.questions.length > 0
+        ? { data: bundled.questions, fetchedAt: Date.now() }
+        : null,
+    subjects:
+      bundled && bundled.subjects.length > 0
+        ? { data: bundled.subjects, fetchedAt: Date.now() }
+        : null,
     notifications: null,
     bot_commands: null,
     onlineCount: null,
@@ -1578,17 +1627,36 @@ function loadServerCoreCacheFromDisk(): ServerCoreCacheState {
       const raw = fs.readFileSync(cachePath, 'utf8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
+        const diskBundledVer = typeof parsed.bundledVersion === 'number' ? parsed.bundledVersion : 0;
+        const shouldPreferNewBundled =
+          Boolean(bundled && bundled.questions.length > 0) &&
+          (bundled!.version > diskBundledVer || !Array.isArray(parsed.questions?.data) || parsed.questions.data.length === 0);
+
+        const diskQuestions =
+          Array.isArray(parsed.questions?.data) && parsed.questions.data.length > 0
+            ? parsed.questions
+            : empty.questions;
+        const diskSubjects =
+          Array.isArray(parsed.subjects?.data) && parsed.subjects.data.length > 0
+            ? parsed.subjects
+            : empty.subjects;
+
         return {
           ...empty,
-          version: typeof parsed.version === 'number' ? parsed.version : Date.now(),
+          version: shouldPreferNewBundled
+            ? bundled!.version
+            : typeof parsed.version === 'number'
+              ? parsed.version
+              : empty.version,
+          bundledVersion: bundled?.version || diskBundledVer,
           questions:
-            Array.isArray(parsed.questions?.data) && parsed.questions.data.length > 0
-              ? parsed.questions
-              : null,
+            shouldPreferNewBundled && bundled && bundled.questions.length >= (parsed.questions?.data?.length || 0)
+              ? { data: bundled.questions, fetchedAt: Date.now() }
+              : diskQuestions,
           subjects:
-            Array.isArray(parsed.subjects?.data) && parsed.subjects.data.length > 0
-              ? parsed.subjects
-              : null,
+            shouldPreferNewBundled && bundled && bundled.subjects.length >= (parsed.subjects?.data?.length || 0)
+              ? { data: bundled.subjects, fetchedAt: Date.now() }
+              : diskSubjects,
           notifications: Array.isArray(parsed.notifications?.data) ? parsed.notifications : null,
           bot_commands:
             parsed.bot_commands?.data && typeof parsed.bot_commands.data === 'object'
@@ -1613,6 +1681,7 @@ function schedulePersistServerCoreCache() {
     persistCacheTimer = null;
     const serialized = JSON.stringify({
       version: serverCoreCache.version,
+      bundledVersion: serverCoreCache.bundledVersion,
       questions: serverCoreCache.questions,
       subjects: serverCoreCache.subjects,
       notifications: serverCoreCache.notifications,
@@ -1634,7 +1703,11 @@ function schedulePersistServerCoreCache() {
 const serverCacheInFlight = new Map<string, Promise<any>>();
 
 function markQuotaCooldownIfNeeded(err: any) {
-  if (err?.status === 429 || String(err?.message || '').includes('429')) {
+  if (
+    err?.status === 429 ||
+    err?.status === 403 ||
+    String(err?.message || '').includes('429')
+  ) {
     serverCoreCache.quotaCooldownUntil = Date.now() + 5 * 60 * 1000; // 5-min backoff
   }
 }
@@ -1651,6 +1724,14 @@ async function getServerCachedQuestions(force = false, authHeader?: string): Pro
     return serverCoreCache.questions.data;
   }
   if (now < serverCoreCache.quotaCooldownUntil) {
+    if (serverCoreCache.questions?.data?.length) {
+      return serverCoreCache.questions.data;
+    }
+    const bundled = loadBundledCodeStoreFromDisk();
+    if (bundled && bundled.questions.length > 0) {
+      serverCoreCache.questions = { data: bundled.questions, fetchedAt: now };
+      return bundled.questions;
+    }
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -1668,8 +1749,14 @@ async function getServerCachedQuestions(force = false, authHeader?: string): Pro
       return raw;
     } catch (err: any) {
       markQuotaCooldownIfNeeded(err);
-      if (serverCoreCache.questions) {
+      if (serverCoreCache.questions && serverCoreCache.questions.data.length > 0) {
+        serverCoreCache.questions.fetchedAt = Date.now();
         return serverCoreCache.questions.data;
+      }
+      const bundled = loadBundledCodeStoreFromDisk();
+      if (bundled && bundled.questions.length > 0) {
+        serverCoreCache.questions = { data: bundled.questions, fetchedAt: Date.now() };
+        return bundled.questions;
       }
       throw err;
     }
@@ -1691,6 +1778,14 @@ async function getServerCachedSubjects(force = false, authHeader?: string): Prom
     return serverCoreCache.subjects.data;
   }
   if (now < serverCoreCache.quotaCooldownUntil) {
+    if (serverCoreCache.subjects?.data?.length) {
+      return serverCoreCache.subjects.data;
+    }
+    const bundled = loadBundledCodeStoreFromDisk();
+    if (bundled && bundled.subjects.length > 0) {
+      serverCoreCache.subjects = { data: bundled.subjects, fetchedAt: now };
+      return bundled.subjects;
+    }
     const err: any = new Error('Firestore quota cooldown active');
     err.status = 429;
     throw err;
@@ -1708,8 +1803,14 @@ async function getServerCachedSubjects(force = false, authHeader?: string): Prom
       return raw;
     } catch (err: any) {
       markQuotaCooldownIfNeeded(err);
-      if (serverCoreCache.subjects) {
+      if (serverCoreCache.subjects && serverCoreCache.subjects.data.length > 0) {
+        serverCoreCache.subjects.fetchedAt = Date.now();
         return serverCoreCache.subjects.data;
+      }
+      const bundled = loadBundledCodeStoreFromDisk();
+      if (bundled && bundled.subjects.length > 0) {
+        serverCoreCache.subjects = { data: bundled.subjects, fetchedAt: Date.now() };
+        return bundled.subjects;
       }
       throw err;
     }
@@ -2108,16 +2209,20 @@ app.post('/api/cache/mutate', (req, res) => {
 
   if (scope === 'questions' || scope === 'subjects') {
     const typedScope: 'questions' | 'subjects' = scope;
-    const existing = serverCoreCache[typedScope]?.data;
-    if (authoritative && Array.isArray(replace) && replace.length > 0) {
+    let existing = serverCoreCache[typedScope]?.data;
+    if (!Array.isArray(existing)) {
+      const bundled = loadBundledCodeStoreFromDisk();
+      existing = bundled ? bundled[typedScope] : [];
+    }
+    if (authoritative && Array.isArray(replace)) {
       serverCoreCache[typedScope] = { data: sortByOrder(replace), fetchedAt: now };
       updated = true;
-    } else if (action === 'upsert' && item?.id && Array.isArray(existing)) {
+    } else if (action === 'upsert' && item?.id) {
       const map = new Map(existing.map((x: any) => [x.id, x]));
       map.set(item.id, { ...(map.get(item.id) || {}), ...item });
       serverCoreCache[typedScope] = { data: sortByOrder(Array.from(map.values())), fetchedAt: now };
       updated = true;
-    } else if (action === 'upsertMany' && Array.isArray(items) && Array.isArray(existing)) {
+    } else if (action === 'upsertMany' && Array.isArray(items)) {
       const map = new Map(existing.map((x: any) => [x.id, x]));
       for (const entry of items) {
         if (entry?.id) {
@@ -2126,13 +2231,13 @@ app.post('/api/cache/mutate', (req, res) => {
       }
       serverCoreCache[typedScope] = { data: sortByOrder(Array.from(map.values())), fetchedAt: now };
       updated = true;
-    } else if (action === 'delete' && id && Array.isArray(existing)) {
+    } else if (action === 'delete' && id) {
       serverCoreCache[typedScope] = {
         data: existing.filter((x: any) => x.id !== id),
         fetchedAt: now,
       };
       updated = true;
-    } else if (action === 'deleteMany' && Array.isArray(ids) && ids.length > 0 && Array.isArray(existing)) {
+    } else if (action === 'deleteMany' && Array.isArray(ids) && ids.length > 0) {
       const idSet = new Set<string>(ids.filter((x: unknown): x is string => typeof x === 'string' && Boolean(x)));
       serverCoreCache[typedScope] = {
         data: existing.filter((x: any) => !idSet.has(x.id)),
@@ -2240,6 +2345,63 @@ app.post('/api/cache/invalidate', (req, res) => {
 const adminVerifyAttempts = new Map<string, number[]>();
 
 const DEFAULT_ADMIN_CODE = '168';
+const ADMIN_SESSION_SECRET =
+  (process.env.ADMIN_SESSION_SECRET || '').trim() || crypto.randomBytes(32).toString('hex');
+const ADMIN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+function signAdminSessionToken(): string {
+  const payload = Buffer.from(
+    JSON.stringify({ role: 'admin', exp: Date.now() + ADMIN_TOKEN_TTL_MS }),
+    'utf8'
+  ).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', ADMIN_SESSION_SECRET)
+    .update(payload)
+    .digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyAdminSessionToken(token: string): boolean {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return false;
+    const [payloadB64, sigB64] = parts;
+    if (!payloadB64 || !sigB64) return false;
+    const expectedSig = crypto
+      .createHmac('sha256', ADMIN_SESSION_SECRET)
+      .update(payloadB64)
+      .digest('base64url');
+    if (!timingSafeCompareStrings(expectedSig, sigB64)) return false;
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    return parsed?.role === 'admin' && typeof parsed?.exp === 'number' && parsed.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+async function verifyFirebaseAdminBearerToken(idToken: string): Promise<boolean> {
+  if (!serverFbConfig?.apiKey || !idToken || idToken.length > 8192) return false;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(serverFbConfig.apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      }
+    );
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    const user = Array.isArray(data?.users) ? data.users[0] : null;
+    return (
+      typeof user?.email === 'string' &&
+      user.email.toLowerCase() === 'reaksmey8114@gmail.com' &&
+      user.emailVerified === true
+    );
+  } catch {
+    return false;
+  }
+}
 
 function getConfiguredAdminCodes(): string[] {
   const envCode = (process.env.ADMIN_MASTER_CODE || process.env.ADMIN_PASSCODE || '').trim();
@@ -2268,6 +2430,50 @@ function recordAdminFailedAttempt(ipKey: string) {
   const recent = (adminVerifyAttempts.get(ipKey) || []).filter((ts) => now - ts < windowMs);
   recent.push(now);
   adminVerifyAttempts.set(ipKey, recent);
+}
+
+async function authorizeAdminRequest(req: express.Request): Promise<{
+  ok: boolean;
+  rateLimited?: boolean;
+  adminToken?: string;
+}> {
+  const headerToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : '';
+  if (headerToken && verifyAdminSessionToken(headerToken)) {
+    return { ok: true };
+  }
+
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization.trim() : '';
+  if (authHeader.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer && verifyAdminSessionToken(bearer)) {
+      return { ok: true };
+    }
+    if (bearer && (await verifyFirebaseAdminBearerToken(bearer))) {
+      return { ok: true, adminToken: signAdminSessionToken() };
+    }
+  }
+
+  const headerPasscode =
+    typeof req.headers['x-admin-passcode'] === 'string'
+      ? req.headers['x-admin-passcode'].trim()
+      : typeof req.body?.passcode === 'string'
+        ? req.body.passcode.trim()
+        : '';
+
+  if (headerPasscode) {
+    const ipKey = req.ip || 'unknown';
+    if (isAdminRateLimited(ipKey)) {
+      return { ok: false, rateLimited: true };
+    }
+    const isValid = getConfiguredAdminCodes().some((code) => timingSafeCompareStrings(code, headerPasscode));
+    if (isValid) {
+      adminVerifyAttempts.delete(ipKey);
+      return { ok: true, adminToken: signAdminSessionToken() };
+    }
+    recordAdminFailedAttempt(ipKey);
+  }
+
+  return { ok: false };
 }
 
 app.post('/api/admin/verify-passcode', (req, res) => {
@@ -2300,7 +2506,252 @@ app.post('/api/admin/verify-passcode', (req, res) => {
   }
 
   adminVerifyAttempts.delete(ipKey);
-  res.json({ success: true });
+  const adminToken = signAdminSessionToken();
+  res.json({ success: true, adminToken });
+});
+
+app.get('/api/code-store/status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const bundled = loadBundledCodeStoreFromDisk();
+  let writable = false;
+  try {
+    fs.accessSync(BUNDLED_CODE_STORE_PATH, fs.constants.W_OK);
+    writable = true;
+  } catch {
+    writable = false;
+  }
+  res.json({
+    ok: true,
+    version: bundled?.version || 0,
+    updatedAt: bundled?.updatedAt || null,
+    subjectsCount: bundled?.subjects.length || 0,
+    questionsCount: bundled?.questions.length || 0,
+    writable,
+  });
+});
+
+app.post('/api/code-store/save', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const authResult = await authorizeAdminRequest(req);
+  if (authResult.rateLimited) {
+    return res.status(429).json({
+      ok: false,
+      error: 'សាកល្បងខុសច្រើនដងពេក! សូមរង់ចាំ ១០ នាទីសិន។',
+    });
+  }
+  if (!authResult.ok) {
+    return res.status(401).json({
+      ok: false,
+      requiresPasscode: true,
+      error: 'សូមបញ្ជាក់លេខកូដ Admin ដើម្បីរក្សាទុកសំណួរចូលក្នុង Code។',
+    });
+  }
+
+  const rawQuestions = req.body?.questions;
+  const rawSubjects = req.body?.subjects;
+  const allowEmpty = req.body?.allowEmpty === true;
+
+  if (!Array.isArray(rawQuestions) || !Array.isArray(rawSubjects)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'ទម្រង់ទិន្នន័យ questions និង subjects មិនត្រឹមត្រូវទេ!',
+    });
+  }
+  if (rawQuestions.length > 25000 || rawSubjects.length > 1000) {
+    return res.status(400).json({
+      ok: false,
+      error: 'ចំនួនសំណួរ ឬមុខវិជ្ជាលើសកម្រិតកំណត់!',
+    });
+  }
+  if (rawQuestions.length === 0 && !allowEmpty) {
+    return res.status(400).json({
+      ok: false,
+      error: 'មិនមានសំណួរសម្រាប់រក្សាទុកចូលក្នុង Code ទេ!',
+    });
+  }
+
+  const sanitizedSubjects: any[] = [];
+  const seenSubjectNames = new Set<string>();
+  const seenSubjectIds = new Set<string>();
+
+  for (let i = 0; i < rawSubjects.length; i++) {
+    const s = rawSubjects[i];
+    if (!s || typeof s !== 'object') continue;
+    const name = typeof s.name === 'string' ? s.name.trim().slice(0, 300) : '';
+    if (!name) continue;
+    const normName = name.toLowerCase();
+    if (seenSubjectNames.has(normName)) continue;
+    seenSubjectNames.add(normName);
+
+    let id = typeof s.id === 'string' && s.id.trim() ? s.id.trim().slice(0, 120) : `sub-bundled-${sanitizedSubjects.length + 1}`;
+    if (seenSubjectIds.has(id)) {
+      id = `sub-bundled-${sanitizedSubjects.length + 1}-${i}`;
+    }
+    seenSubjectIds.add(id);
+
+    const type = s.type === 'short' || s.type === 'explanation' ? s.type : 'mcq';
+    sanitizedSubjects.push({
+      id,
+      name,
+      type,
+      isActive: s.isActive !== false,
+      order: typeof s.order === 'number' && Number.isFinite(s.order) ? s.order : sanitizedSubjects.length,
+      ...(typeof s.icon === 'string' && s.icon.trim() ? { icon: s.icon.trim().slice(0, 40) } : {}),
+    });
+  }
+
+  const sanitizedQuestions: any[] = [];
+  const seenQuestionIds = new Set<string>();
+
+  for (let i = 0; i < rawQuestions.length; i++) {
+    const q = rawQuestions[i];
+    if (!q || typeof q !== 'object') continue;
+    const questionText = typeof q.question === 'string' ? q.question.trim().slice(0, 8000) : '';
+    if (!questionText) continue;
+
+    const subjectName =
+      typeof q.subject === 'string' && q.subject.trim()
+        ? q.subject.trim().slice(0, 300)
+        : 'ចំណេះដឹងទូទៅ';
+    const normSubject = subjectName.toLowerCase();
+    const type = q.type === 'short' || q.type === 'explanation' ? q.type : 'mcq';
+
+    if (!seenSubjectNames.has(normSubject)) {
+      seenSubjectNames.add(normSubject);
+      const autoId = `sub-bundled-${sanitizedSubjects.length + 1}`;
+      seenSubjectIds.add(autoId);
+      sanitizedSubjects.push({
+        id: autoId,
+        name: subjectName,
+        type,
+        isActive: true,
+        order: sanitizedSubjects.length,
+      });
+    }
+
+    let id = typeof q.id === 'string' && q.id.trim() ? q.id.trim().slice(0, 120) : `q-bundled-${sanitizedQuestions.length + 1}`;
+    if (seenQuestionIds.has(id)) {
+      id = `q-bundled-${sanitizedQuestions.length + 1}-${i}`;
+    }
+    seenQuestionIds.add(id);
+
+    const item: Record<string, any> = {
+      id,
+      subject: subjectName,
+      type,
+      question: questionText,
+      isActive: q.isActive !== false,
+      order:
+        typeof q.order === 'number' && Number.isFinite(q.order)
+          ? q.order
+          : sanitizedQuestions.length + 1,
+    };
+
+    if (type === 'mcq' && Array.isArray(q.options) && q.options.length > 0) {
+      item.options = q.options.slice(0, 8).map((opt: unknown) => String(opt ?? '').trim().slice(0, 2000));
+      item.correct =
+        typeof q.correct === 'number' &&
+        Number.isFinite(q.correct) &&
+        q.correct >= 0 &&
+        q.correct < item.options.length
+          ? Math.trunc(q.correct)
+          : 0;
+    }
+
+    if (typeof q.answer === 'string' && q.answer.trim()) {
+      item.answer = q.answer.trim().slice(0, 12000);
+    }
+
+    if (typeof q.createdAt === 'string' && q.createdAt.trim()) {
+      item.createdAt = q.createdAt.trim().slice(0, 64);
+    }
+
+    sanitizedQuestions.push(item);
+  }
+
+  sanitizedSubjects.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  sanitizedQuestions.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  const version = Date.now();
+  const updatedAt = new Date(version).toISOString();
+  const payload: BundledCodeStoreData = {
+    version,
+    updatedAt,
+    subjects: sanitizedSubjects,
+    questions: sanitizedQuestions,
+  };
+
+  const fileContent = `import type { Question, Subject } from '../types';
+
+interface BundledStorePayload {
+  version: number;
+  updatedAt: string;
+  subjects: Subject[];
+  questions: Question[];
+}
+
+${BUNDLED_JSON_START_MARKER}
+const BUNDLED_DATA: BundledStorePayload = ${JSON.stringify(payload, null, 2)};
+${BUNDLED_JSON_END_MARKER}
+
+export const BUNDLED_VERSION: number = BUNDLED_DATA.version;
+export const BUNDLED_UPDATED_AT: string = BUNDLED_DATA.updatedAt;
+export const BUNDLED_SUBJECTS: Subject[] = BUNDLED_DATA.subjects;
+export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
+`;
+
+  const resolvedTarget = path.resolve(BUNDLED_CODE_STORE_PATH);
+  if (!resolvedTarget.startsWith(BUNDLED_CODE_BASE_DIR + path.sep)) {
+    return res.status(500).json({ ok: false, error: 'Invalid code store path' });
+  }
+
+  try {
+    fs.mkdirSync(BUNDLED_CODE_BASE_DIR, { recursive: true });
+    fs.writeFileSync(resolvedTarget, fileContent, 'utf8');
+  } catch (err: any) {
+    const code = err?.code || '';
+    const isReadOnly = code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
+    return res.json({
+      ok: false,
+      readOnly: isReadOnly,
+      ...(authResult.adminToken ? { adminToken: authResult.adminToken } : {}),
+      error: isReadOnly
+        ? 'បរិយាកាស Hosting នេះមិនអនុញ្ញាតឱ្យសរសេរផ្ទាល់លើ Code ទេ — សូមទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ!'
+        : err?.message || 'មិនអាចសរសេរចូលឯកសារ Code បានទេ!',
+    });
+  }
+
+  serverCoreCache.bundledVersion = version;
+  serverCoreCache.version = version;
+  serverCoreCache.subjects = { data: sanitizedSubjects, fetchedAt: version };
+  serverCoreCache.questions = { data: sanitizedQuestions, fetchedAt: version };
+  schedulePersistServerCoreCache();
+
+  broadcastRealtimeEvent({
+    scope: 'subjects',
+    action: 'replace',
+    replace: sanitizedSubjects,
+    authoritative: true,
+    version,
+    ts: version,
+  });
+  broadcastRealtimeEvent({
+    scope: 'questions',
+    action: 'replace',
+    replace: sanitizedQuestions,
+    authoritative: true,
+    version,
+    ts: version,
+  });
+
+  res.json({
+    ok: true,
+    version,
+    updatedAt,
+    subjectsCount: sanitizedSubjects.length,
+    questionsCount: sanitizedQuestions.length,
+    ...(authResult.adminToken ? { adminToken: authResult.adminToken } : {}),
+  });
 });
 
 // Health check endpoint

@@ -40,6 +40,8 @@ import {
   FileJson,
   Upload,
   Cloud,
+  FileCode2,
+  Lock,
 } from 'lucide-react';
 import { Question, Subject, LoginRecord, PresenceRecord, Feedback, QuestionType, AppNotification, BotCommandConfig, BotActionButton, GlobalStats } from '../types';
 import { toKhmerNum, getOptionLabel, shuffleArray } from '../utils/khmer';
@@ -76,12 +78,17 @@ import {
   refreshCoreData,
   refreshAdminMonitoringData,
   signInWithGoogle,
+  fetchCodeStoreStatus,
+  saveAllToCodeStore,
+  CodeStoreStatus,
 } from '../services/firebase';
 import {
   SAMPLE_EXPORT_JSON_STRING,
   buildExportJsonPayload,
   downloadJsonFile,
   parseQuestionsJsonInput,
+  generateBundledQuestionsTsContent,
+  downloadTypeScriptFile,
 } from '../services/jsonQuestions';
 import {
   testTelegramBot,
@@ -2247,6 +2254,198 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
   const [isSyncingMonitoring, setIsSyncingMonitoring] = useState(false);
   const [isConnectingGoogle, setIsConnectingGoogle] = useState(false);
 
+  // Built-in Code Store State & Handlers (src/data/bundledQuestions.ts)
+  const [codeStoreStatus, setCodeStoreStatus] = useState<CodeStoreStatus | null>(null);
+  const [isSavingToCodeStore, setIsSavingToCodeStore] = useState(false);
+  const [codeStoreMsg, setCodeStoreMsg] = useState<{ text: string; success: boolean } | null>(null);
+  const [codeStorePasscodeModalOpen, setCodeStorePasscodeModalOpen] = useState(false);
+  const [codeStorePasscodeInput, setCodeStorePasscodeInput] = useState('');
+  const [codeStorePasscodeError, setCodeStorePasscodeError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    void fetchCodeStoreStatus().then((st) => {
+      if (active) setCodeStoreStatus(st);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleDownloadBundledTs = () => {
+    setCodeStoreMsg(null);
+    if (questions.length === 0) {
+      setCodeStoreMsg({
+        text: 'មិនទាន់មានសំណួរសម្រាប់ទាញយកជាឯកសារ Code (.ts) នៅឡើយទេ!',
+        success: false,
+      });
+      return;
+    }
+    const tsContent = generateBundledQuestionsTsContent(questions, subjects);
+    downloadTypeScriptFile(tsContent, 'bundledQuestions.ts');
+    setCodeStoreMsg({
+      text: `បានទាញយកឯកសារ bundledQuestions.ts (${toKhmerNum(subjects.length)} មុខវិជ្ជា · ${toKhmerNum(questions.length)} សំណួរ) ជោគជ័យ!`,
+      success: true,
+    });
+  };
+
+  const handleSaveAllToCodeStore = async (passcodeOverride?: string) => {
+    if (isSavingToCodeStore) return;
+    setCodeStoreMsg(null);
+    setCodeStorePasscodeError('');
+
+    if (questions.length === 0) {
+      setCodeStoreMsg({
+        text: 'មិនទាន់មានសំណួរសម្រាប់រក្សាទុកចូលក្នុង Code នៅឡើយទេ! សូមបន្ថែម ឬ Import ជាមុនសិន។',
+        success: false,
+      });
+      return;
+    }
+
+    setIsSavingToCodeStore(true);
+    try {
+      const res = await saveAllToCodeStore({
+        questions,
+        subjects,
+        passcode: passcodeOverride,
+      });
+
+      if (res.requiresPasscode) {
+        setCodeStorePasscodeModalOpen(true);
+        if (passcodeOverride) {
+          setCodeStorePasscodeError(res.error || 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ!');
+        }
+        return;
+      }
+
+      setCodeStorePasscodeModalOpen(false);
+      setCodeStorePasscodeInput('');
+
+      if (res.ok) {
+        setCodeStoreStatus({
+          version: res.version || Date.now(),
+          updatedAt: res.updatedAt || new Date().toISOString(),
+          subjectsCount: res.subjectsCount ?? subjects.length,
+          questionsCount: res.questionsCount ?? questions.length,
+          writable: true,
+        });
+        setCodeStoreMsg({
+          text: `បានរក្សាទុក ${toKhmerNum(res.subjectsCount ?? subjects.length)} មុខវិជ្ជា និង ${toKhmerNum(res.questionsCount ?? questions.length)} សំណួរ ចូលក្នុង Code កម្មវិធី (src/data/bundledQuestions.ts) ជោគជ័យ!`,
+          success: true,
+        });
+        return;
+      }
+
+      if (res.readOnly) {
+        const tsContent = generateBundledQuestionsTsContent(questions, subjects);
+        downloadTypeScriptFile(tsContent, 'bundledQuestions.ts');
+        setCodeStoreMsg({
+          text:
+            res.error ||
+            `បានទាញយកឯកសារ bundledQuestions.ts (${toKhmerNum(questions.length)} សំណួរ) ដោយស្វ័យប្រវត្តិ (Hosting មិនអនុញ្ញាតឱ្យកែផ្ទាល់)។`,
+          success: true,
+        });
+        return;
+      }
+
+      setCodeStoreMsg({
+        text: res.error || 'បរាជ័យក្នុងការរក្សាទុកចូលក្នុង Code!',
+        success: false,
+      });
+    } finally {
+      setIsSavingToCodeStore(false);
+    }
+  };
+
+  const renderCodeStoreCard = () => {
+    const codeQCount = codeStoreStatus?.questionsCount ?? 0;
+    const codeSCount = codeStoreStatus?.subjectsCount ?? 0;
+    const isSyncedWithCode =
+      codeStoreStatus !== null &&
+      codeQCount === questions.length &&
+      codeSCount === subjects.length;
+
+    return (
+      <div className="app-card rounded-2xl p-5 sm:p-6 shadow-sm border border-emerald-500/30">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="space-y-1.5">
+            <h2 className="font-moul text-sm sm:text-base app-text-primary flex items-center gap-2">
+              <FileCode2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+              <span>រក្សាទុកសំណួរ-ចម្លើយក្នុង Code កម្មវិធី (Built-in Code Store)</span>
+            </h2>
+            <p className="text-xs sm:text-sm app-text-secondary leading-relaxed">
+              ទិន្នន័យបច្ចុប្បន្នក្នុងកម្មវិធី៖{' '}
+              <strong className="app-text-primary">
+                {toKhmerNum(subjects.length)} មុខវិជ្ជា · {toKhmerNum(questions.length)} សំណួរ
+              </strong>{' '}
+              · រក្សាទុកក្នុង Code (
+              <span className="font-mono text-xs">src/data/bundledQuestions.ts</span>)៖{' '}
+              <strong
+                className={
+                  isSyncedWithCode
+                    ? 'text-emerald-700 dark:text-emerald-300'
+                    : 'text-amber-700 dark:text-amber-300'
+                }
+              >
+                {toKhmerNum(codeSCount)} មុខវិជ្ជា · {toKhmerNum(codeQCount)} សំណួរ
+              </strong>
+            </p>
+            <p className="text-xs app-text-secondary">
+              រាល់សំណួរដែលរក្សាទុកក្នុង Code នឹងផ្ទុកមកជាមួយកម្មវិធីភ្លាមៗទាំង Online និង Offline ដោយមិនពឹងផ្អែកលើ Database ខាងក្រៅឡើយ។
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              disabled={isSavingToCodeStore || questions.length === 0}
+              onClick={() => void handleSaveAllToCodeStore()}
+              className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-xs sm:text-sm flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed shadow-sm"
+            >
+              {isSavingToCodeStore ? (
+                <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+              ) : (
+                <Save className="w-4 h-4 shrink-0" />
+              )}
+              <span>
+                {isSavingToCodeStore
+                  ? 'កំពុងរក្សាទុកចូល Code...'
+                  : 'រក្សាទុកទាំងអស់ចូល Code'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={questions.length === 0}
+              onClick={handleDownloadBundledTs}
+              className="px-3.5 py-2.5 rounded-xl app-subcard hover:opacity-85 disabled:opacity-50 app-text-primary border app-border font-bold text-xs sm:text-sm flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
+            >
+              <Download className="w-4 h-4 shrink-0" />
+              <span>ទាញយកឯកសារ .ts</span>
+            </button>
+          </div>
+        </div>
+
+        {codeStoreMsg && (
+          <div
+            className={`mt-4 p-3.5 rounded-xl text-xs sm:text-sm flex items-center gap-2 border ${
+              codeStoreMsg.success
+                ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 dark:border-emerald-700 text-emerald-900 dark:text-emerald-200'
+                : 'bg-red-50 dark:bg-red-950/60 border-red-400 dark:border-red-700 text-red-900 dark:text-red-200'
+            }`}
+          >
+            {codeStoreMsg.success ? (
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 shrink-0" />
+            )}
+            <span>{codeStoreMsg.text}</span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const handleConnectGoogleAdmin = async () => {
     if (isConnectingGoogle) return;
     setIsConnectingGoogle(true);
@@ -2315,6 +2514,24 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          <button
+            type="button"
+            disabled={isSavingToCodeStore || questions.length === 0}
+            onClick={() => void handleSaveAllToCodeStore()}
+            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed shadow-sm"
+            title="រក្សាទុកសំណួរ និងមុខវិជ្ជាទាំងអស់ចូលក្នុង Code (src/data/bundledQuestions.ts)"
+          >
+            {isSavingToCodeStore ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+            ) : (
+              <FileCode2 className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span>
+              {isSavingToCodeStore
+                ? 'កំពុងរក្សាទុក...'
+                : `រក្សាទុកចូល Code (${toKhmerNum(questions.length)})`}
+            </span>
+          </button>
           {!firebaseUserEmail ? (
             <button
               type="button"
@@ -2353,6 +2570,23 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
           </div>
         </div>
       </div>
+
+      {codeStoreMsg && activeSubTab !== 'bulk_ai' && activeSubTab !== 'manage' && (
+        <div
+          className={`mb-5 p-3.5 rounded-xl text-xs sm:text-sm flex items-center gap-2 border ${
+            codeStoreMsg.success
+              ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-400 dark:border-emerald-700 text-emerald-900 dark:text-emerald-200'
+              : 'bg-red-50 dark:bg-red-950/60 border-red-400 dark:border-red-700 text-red-900 dark:text-red-200'
+          }`}
+        >
+          {codeStoreMsg.success ? (
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+          ) : (
+            <AlertCircle className="w-4 h-4 shrink-0" />
+          )}
+          <span>{codeStoreMsg.text}</span>
+        </div>
+      )}
 
       {/* Admin Tabs */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 mb-6 sm:mb-8 app-subcard p-1.5 rounded-2xl">
@@ -2549,6 +2783,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       {/* 2. BULK IMPORT (TEXT & EXPORT JSON) */}
       {activeSubTab === 'bulk_ai' && (
         <div className="space-y-8 max-w-4xl mx-auto">
+          {renderCodeStoreCard()}
           <div className="app-card rounded-2xl p-6 sm:p-8 shadow-sm">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-5">
               <div className="flex items-center gap-3">
@@ -3035,6 +3270,7 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
       {/* 3. MANAGE SUBJECTS & QUESTIONS */}
       {activeSubTab === 'manage' && (
         <div className="space-y-8 max-w-5xl mx-auto">
+          {renderCodeStoreCard()}
           {/* Add New Subject Panel */}
           <div className="app-card rounded-2xl p-6 shadow-sm">
             <div className="flex items-center gap-3 mb-4">
@@ -6722,6 +6958,83 @@ export const AdminSection: React.FC<AdminSectionProps> = ({
                 <span>យល់ព្រមលុប</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ADMIN PASSCODE CONFIRM MODAL FOR CODE STORE WRITE */}
+      {codeStorePasscodeModalOpen && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="app-card w-full max-w-sm rounded-2xl p-6 shadow-2xl relative">
+            <button
+              type="button"
+              onClick={() => {
+                setCodeStorePasscodeModalOpen(false);
+                setCodeStorePasscodeError('');
+              }}
+              className="absolute top-3.5 right-3.5 p-1.5 rounded-lg app-text-muted hover:opacity-80 cursor-pointer"
+              aria-label="បិទ"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                <Lock className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-moul text-sm sm:text-base app-text-primary">
+                  បញ្ជាក់លេខកូដ Admin
+                </h3>
+                <p className="text-xs app-text-secondary">
+                  ដើម្បីរក្សាទុកសំណួរចូលក្នុង Code កម្មវិធី
+                </p>
+              </div>
+            </div>
+
+            {codeStorePasscodeError && (
+              <div className="mb-3 p-2.5 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-300 dark:border-red-700 text-red-800 dark:text-red-200 text-xs flex items-center gap-1.5">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{codeStorePasscodeError}</span>
+              </div>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void handleSaveAllToCodeStore(codeStorePasscodeInput.trim());
+              }}
+              className="space-y-3"
+            >
+              <input
+                type="password"
+                autoFocus
+                value={codeStorePasscodeInput}
+                onChange={(e) => setCodeStorePasscodeInput(e.target.value)}
+                placeholder="បញ្ចូលលេខកូដ Admin..."
+                className="w-full px-3.5 py-2.5 rounded-xl app-input text-sm"
+                required
+              />
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCodeStorePasscodeModalOpen(false);
+                    setCodeStorePasscodeError('');
+                  }}
+                  className="flex-1 py-2.5 rounded-xl app-subcard app-text-primary text-xs sm:text-sm font-semibold cursor-pointer"
+                >
+                  បោះបង់
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingToCodeStore || !codeStorePasscodeInput.trim()}
+                  className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs sm:text-sm font-bold cursor-pointer"
+                >
+                  {isSavingToCodeStore ? 'កំពុងរក្សាទុក...' : 'បញ្ជាក់ & រក្សាទុក'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

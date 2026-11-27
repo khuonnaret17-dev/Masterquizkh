@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, UserCheck, Lock, Send, AlertCircle, ArrowRight, X, Palette, Bot, QrCode, CheckCircle2, Eye, EyeOff } from 'lucide-react';
-import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid } from '../services/firebase';
+import { recordLogin, subscribeBotCommands, signInWithGoogle, checkIsUserPaid, setAdminSessionToken } from '../services/firebase';
 import { UserSession, AppThemeId, BotCommandConfig } from '../types';
 import { getStoredTheme, APP_THEMES } from '../services/theme';
 import { getTelegramMiniAppUser, setTelegramBackButton } from '../services/telegramWebApp';
@@ -166,6 +166,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
         if (res.ok && data?.success) {
           verified = true;
+          if (typeof data.adminToken === 'string' && data.adminToken) {
+            setAdminSessionToken(data.adminToken);
+          }
         } else if (data && typeof data.success === 'boolean' && res.status < 500) {
           if (res.status === 429) {
             serverError = data.error || 'សាកល្បងខុសច្រើនដងពេក! សូមរង់ចាំ ១០ នាទីសិន។';

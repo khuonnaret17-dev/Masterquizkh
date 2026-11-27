@@ -50,7 +50,12 @@ import {
   BotCommandConfig,
   GlobalStats,
 } from '../types';
-import { INITIAL_NOTIFICATIONS } from './initialData';
+import {
+  INITIAL_BUNDLED_VERSION,
+  INITIAL_SUBJECTS,
+  INITIAL_QUESTIONS,
+  INITIAL_NOTIFICATIONS,
+} from './initialData';
 import { syncTelegramBotTemplates } from './telegram';
 import {
   hydrateCacheFromIdb,
@@ -58,6 +63,16 @@ import {
   hasCachedValue,
   setCachedValue,
 } from './localCacheDb';
+
+let inMemoryAdminToken: string | null = null;
+
+export function setAdminSessionToken(token: string | null) {
+  inMemoryAdminToken = token && token.trim() ? token.trim() : null;
+}
+
+export function getAdminSessionToken(): string | null {
+  return inMemoryAdminToken;
+}
 
 // Strict maximum items per single Firestore list query (aligned with firestore.rules limit <= 20)
 export const MAX_QUERY_LIMIT = 20;
@@ -255,6 +270,7 @@ const STORAGE_KEYS = {
   BOT_COMMANDS: 'mpq_cached_bot_commands',
   GLOBAL_STATS: 'mpq_cached_global_stats_v1',
   SYNC_META: 'mpq_sync_meta_v2',
+  BUNDLED_REVISION: 'mpq_bundled_version_v1',
   CORE_SERVER_VERSION: 'mpq_core_server_version_v1',
   ONLINE_COUNT: 'mpq_cached_online_count_v1',
   LAST_PRESENCE_PING: 'mpq_last_presence_ping_v1',
@@ -321,7 +337,13 @@ function isQuotaCooldownActive(force = false): boolean {
 
 function markClientQuotaCooldownIfNeeded(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err || '');
-  if (msg.includes('resource-exhausted') || msg.includes('Quota') || msg.includes('429')) {
+  if (
+    msg.includes('resource-exhausted') ||
+    msg.includes('Quota') ||
+    msg.includes('429') ||
+    msg.includes('requires billing') ||
+    msg.includes('billing to be enabled')
+  ) {
     clientQuotaCooldownUntil = Date.now() + 5 * 60 * 1000;
   }
 }
@@ -356,6 +378,76 @@ const sortQuestions = (list: Question[]) =>
 
 const sortSubjects = (list: Subject[]) =>
   dedupeById(list).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+const normTextKey = (val?: string) => String(val || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+let lastHydratedBundledVer = 0;
+
+function ensureBundledCodeDataHydrated() {
+  const savedVer = getLocal<number>(STORAGE_KEYS.BUNDLED_REVISION, 0);
+  const currentQuestions = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
+  const currentSubjects = getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
+
+  const needsInitialQ =
+    INITIAL_QUESTIONS.length > 0 && (!hasCachedValue(STORAGE_KEYS.QUESTIONS) || currentQuestions.length === 0);
+  const needsInitialS =
+    INITIAL_SUBJECTS.length > 0 && (!hasCachedValue(STORAGE_KEYS.SUBJECTS) || currentSubjects.length === 0);
+  const hasNewBundledVersion =
+    INITIAL_BUNDLED_VERSION > 0 &&
+    INITIAL_BUNDLED_VERSION > savedVer &&
+    INITIAL_BUNDLED_VERSION > lastHydratedBundledVer;
+
+  if (!needsInitialQ && !needsInitialS && !hasNewBundledVersion) {
+    return;
+  }
+
+  if (needsInitialS) {
+    const sortedS = sortSubjects([...INITIAL_SUBJECTS]);
+    setLocal(STORAGE_KEYS.SUBJECTS, sortedS);
+    setSyncTimestamp('SUBJECTS');
+    window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: sortedS }));
+  } else if (hasNewBundledVersion && INITIAL_SUBJECTS.length > 0) {
+    const existingIds = new Set(currentSubjects.map((s) => s.id));
+    const existingNames = new Set(currentSubjects.map((s) => normTextKey(s.name)));
+    const additions = INITIAL_SUBJECTS.filter(
+      (s) => !existingIds.has(s.id) && !existingNames.has(normTextKey(s.name))
+    );
+    if (additions.length > 0) {
+      const mergedS = sortSubjects([...currentSubjects, ...additions]);
+      setLocal(STORAGE_KEYS.SUBJECTS, mergedS);
+      setSyncTimestamp('SUBJECTS');
+      window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: mergedS }));
+    }
+  }
+
+  if (needsInitialQ) {
+    const sortedQ = sortQuestions([...INITIAL_QUESTIONS]);
+    setLocal(STORAGE_KEYS.QUESTIONS, sortedQ);
+    setSyncTimestamp('QUESTIONS');
+    window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: sortedQ }));
+  } else if (hasNewBundledVersion && INITIAL_QUESTIONS.length > 0) {
+    const existingIds = new Set(currentQuestions.map((q) => q.id).filter(Boolean));
+    const existingKeys = new Set(
+      currentQuestions.map((q) => `${normTextKey(q.subject)}|||${normTextKey(q.question)}`)
+    );
+    const additions = INITIAL_QUESTIONS.filter((q) => {
+      if (q.id && existingIds.has(q.id)) return false;
+      const key = `${normTextKey(q.subject)}|||${normTextKey(q.question)}`;
+      return !existingKeys.has(key);
+    });
+    if (additions.length > 0) {
+      const mergedQ = sortQuestions([...currentQuestions, ...additions]);
+      setLocal(STORAGE_KEYS.QUESTIONS, mergedQ);
+      setSyncTimestamp('QUESTIONS');
+      window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: mergedQ }));
+    }
+  }
+
+  if (INITIAL_BUNDLED_VERSION > 0) {
+    lastHydratedBundledVer = INITIAL_BUNDLED_VERSION;
+    setLocal(STORAGE_KEYS.BUNDLED_REVISION, INITIAL_BUNDLED_VERSION);
+  }
+}
 
 type ServerCacheMutationPayload =
   | { action: 'upsert'; item: unknown }
@@ -776,6 +868,7 @@ async function syncCoreFromServer(force = false): Promise<boolean> {
 
 export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   await hydrateCacheFromIdb();
+  ensureBundledCodeDataHydrated();
 
   if (
     !force &&
@@ -786,6 +879,7 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
   }
 
   const syncedFromServer = await syncCoreFromServer(force);
+  ensureBundledCodeDataHydrated();
   const afterServer = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   if (syncedFromServer && afterServer.length > 0) {
     return afterServer;
@@ -801,7 +895,7 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
     }
     try {
       const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
-      if (!isOffline && !isQuotaCooldownActive(force)) {
+      if (!isOffline && !isQuotaCooldownActive(force) && auth.currentUser) {
         const questions = await fetchAllPagesWithLimit20<Question>(
           'questions',
           [],
@@ -835,19 +929,24 @@ export async function fetchQuestionsCached(force = false): Promise<Question[]> {
         }
       }
 
+      ensureBundledCodeDataHydrated();
       return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
       handleFirestoreError(err, OperationType.LIST, 'questions');
+      ensureBundledCodeDataHydrated();
       return sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     }
   });
 }
 
 export function subscribeQuestions(callback: (questions: Question[]) => void) {
+  ensureBundledCodeDataHydrated();
   const cached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
   if (cached.length > 0) {
     callback(cached);
+  } else if (INITIAL_QUESTIONS.length > 0) {
+    callback(sortQuestions([...INITIAL_QUESTIONS]));
   }
 
   const handleLocalChange = (e: Event) => {
@@ -861,6 +960,7 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
   let active = true;
   void hydrateCacheFromIdb().then(() => {
     if (!active) return;
+    ensureBundledCodeDataHydrated();
     const idbCached = sortQuestions(getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []));
     if (idbCached.length > 0 || hasCachedValue(STORAGE_KEYS.QUESTIONS)) {
       callback(idbCached);
@@ -878,6 +978,7 @@ export function subscribeQuestions(callback: (questions: Question[]) => void) {
 
 export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   await hydrateCacheFromIdb();
+  ensureBundledCodeDataHydrated();
 
   if (
     !force &&
@@ -888,6 +989,7 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
   }
 
   const syncedFromServer = await syncCoreFromServer(force);
+  ensureBundledCodeDataHydrated();
   const afterServer = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   if (syncedFromServer && afterServer.length > 0) {
     return afterServer;
@@ -903,7 +1005,7 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
     }
     try {
       const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
-      if (!isOffline && !isQuotaCooldownActive(force)) {
+      if (!isOffline && !isQuotaCooldownActive(force) && auth.currentUser) {
         const subs = await fetchAllPagesWithLimit20<Subject>(
           'subjects',
           [],
@@ -936,19 +1038,24 @@ export async function fetchSubjectsCached(force = false): Promise<Subject[]> {
         }
       }
 
+      ensureBundledCodeDataHydrated();
       return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     } catch (err) {
       markClientQuotaCooldownIfNeeded(err);
       handleFirestoreError(err, OperationType.LIST, 'subjects');
+      ensureBundledCodeDataHydrated();
       return sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     }
   });
 }
 
 export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
+  ensureBundledCodeDataHydrated();
   const cached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
   if (cached.length > 0) {
     callback(cached);
+  } else if (INITIAL_SUBJECTS.length > 0) {
+    callback(sortSubjects([...INITIAL_SUBJECTS]));
   }
 
   const handleLocalChange = (e: Event) => {
@@ -962,6 +1069,7 @@ export function subscribeSubjects(callback: (subjects: Subject[]) => void) {
   let active = true;
   void hydrateCacheFromIdb().then(() => {
     if (!active) return;
+    ensureBundledCodeDataHydrated();
     const idbCached = sortSubjects(getLocal<Subject[]>(STORAGE_KEYS.SUBJECTS, []));
     if (idbCached.length > 0 || hasCachedValue(STORAGE_KEYS.SUBJECTS)) {
       callback(idbCached);
@@ -1481,13 +1589,16 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   setLocal(STORAGE_KEYS.QUESTIONS, next);
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+  syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
+  adjustGlobalStat('questionsCount', 1);
 
-  try {
-    await setDoc(doc(db, 'questions', id), newQuestion);
-    syncMutationToServerCache('questions', { action: 'upsert', item: newQuestion });
-    adjustGlobalStat('questionsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'questions');
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await setDoc(doc(db, 'questions', id), newQuestion);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.WRITE, 'questions');
+    }
   }
   return newQuestion;
 }
@@ -1507,23 +1618,26 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   setLocal(STORAGE_KEYS.QUESTIONS, next);
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+  syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
+  adjustGlobalStat('questionsCount', created.length);
 
-  try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < created.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      const chunk = created.slice(i, i + CHUNK_SIZE);
-      for (const q of chunk) {
-        if (q.id) {
-          batch.set(doc(db, 'questions', q.id), q);
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < created.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = created.slice(i, i + CHUNK_SIZE);
+        for (const q of chunk) {
+          if (q.id) {
+            batch.set(doc(db, 'questions', q.id), q);
+          }
         }
+        await batch.commit();
       }
-      await batch.commit();
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.WRITE, 'questions');
     }
-    syncMutationToServerCache('questions', { action: 'upsertMany', items: created });
-    adjustGlobalStat('questionsCount', created.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'questions');
   }
 
   return created;
@@ -1537,15 +1651,18 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
   setLocal(STORAGE_KEYS.QUESTIONS, next);
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+  const updatedItem = next.find((q) => q.id === id);
+  if (updatedItem) {
+    syncMutationToServerCache('questions', { action: 'upsert', item: updatedItem });
+  }
 
-  try {
-    await updateDoc(doc(db, 'questions', id), cleanUpdates);
-    const updatedItem = next.find((q) => q.id === id);
-    if (updatedItem) {
-      syncMutationToServerCache('questions', { action: 'upsert', item: updatedItem });
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await updateDoc(doc(db, 'questions', id), cleanUpdates);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `questions/${id}`);
   }
 }
 
@@ -1555,34 +1672,22 @@ export async function deleteQuestion(id: string) {
   setLocal(STORAGE_KEYS.QUESTIONS, next);
   setSyncTimestamp('QUESTIONS');
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
+  syncMutationToServerCache('questions', { action: 'delete', id });
+  adjustGlobalStat('questionsCount', -1);
 
-  try {
-    await deleteDoc(doc(db, 'questions', id));
-    syncMutationToServerCache('questions', { action: 'delete', id });
-    adjustGlobalStat('questionsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await deleteDoc(doc(db, 'questions', id));
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, `questions/${id}`);
+    }
   }
 }
 
 export async function deleteQuestionsBatch(ids: string[]): Promise<number> {
   const uniqueIds = Array.from(new Set(ids.filter((id): id is string => Boolean(id))));
   if (uniqueIds.length === 0) return 0;
-
-  const CHUNK_SIZE = 450;
-  try {
-    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
-      for (const id of chunk) {
-        batch.delete(doc(db, 'questions', id));
-      }
-      await batch.commit();
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'questions');
-    throw err;
-  }
 
   const idSet = new Set(uniqueIds);
   const cached = getLocal<Question[]>(STORAGE_KEYS.QUESTIONS, []);
@@ -1592,6 +1697,24 @@ export async function deleteQuestionsBatch(ids: string[]): Promise<number> {
   window.dispatchEvent(new CustomEvent('mpq-questions-changed', { detail: next }));
   syncMutationToServerCache('questions', { action: 'deleteMany', ids: uniqueIds });
   adjustGlobalStat('questionsCount', -uniqueIds.length);
+
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    const CHUNK_SIZE = 450;
+    try {
+      for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+        for (const id of chunk) {
+          batch.delete(doc(db, 'questions', id));
+        }
+        await batch.commit();
+      }
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, 'questions');
+    }
+  }
+
   return uniqueIds.length;
 }
 
@@ -1641,13 +1764,16 @@ export async function addSubject(sub: Omit<Subject, 'id'>) {
   setLocal(STORAGE_KEYS.SUBJECTS, next);
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
+  syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
+  adjustGlobalStat('subjectsCount', 1);
 
-  try {
-    await setDoc(doc(db, 'subjects', id), newSub);
-    syncMutationToServerCache('subjects', { action: 'upsert', item: newSub });
-    adjustGlobalStat('subjectsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'subjects');
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await setDoc(doc(db, 'subjects', id), newSub);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.WRITE, 'subjects');
+    }
   }
   return newSub;
 }
@@ -1660,15 +1786,18 @@ export async function updateSubject(id: string, updates: Partial<Subject>) {
   setLocal(STORAGE_KEYS.SUBJECTS, next);
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
+  const updatedSub = next.find((s) => s.id === id);
+  if (updatedSub) {
+    syncMutationToServerCache('subjects', { action: 'upsert', item: updatedSub });
+  }
 
-  try {
-    await updateDoc(doc(db, 'subjects', id), cleanUpdates);
-    const updatedSub = next.find((s) => s.id === id);
-    if (updatedSub) {
-      syncMutationToServerCache('subjects', { action: 'upsert', item: updatedSub });
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await updateDoc(doc(db, 'subjects', id), cleanUpdates);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `subjects/${id}`);
   }
 }
 
@@ -1687,21 +1816,25 @@ export async function reorderSubjects(orderedSubjects: Subject[]): Promise<Subje
   const changed = normalized.filter((sub, idx) => orderedSubjects[idx]?.order !== idx);
   if (changed.length === 0) return normalized;
 
-  try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      const chunk = changed.slice(i, i + CHUNK_SIZE);
-      for (const sub of chunk) {
-        if (sub.id) {
-          batch.update(doc(db, 'subjects', sub.id), { order: sub.order });
+  syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
+
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = changed.slice(i, i + CHUNK_SIZE);
+        for (const sub of chunk) {
+          if (sub.id) {
+            batch.update(doc(db, 'subjects', sub.id), { order: sub.order });
+          }
         }
+        await batch.commit();
       }
-      await batch.commit();
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.UPDATE, 'subjects');
     }
-    syncMutationToServerCache('subjects', { action: 'upsertMany', items: normalized });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, 'subjects');
   }
 
   return normalized;
@@ -1756,13 +1889,16 @@ export async function deleteSubject(id: string) {
   setLocal(STORAGE_KEYS.SUBJECTS, next);
   setSyncTimestamp('SUBJECTS');
   window.dispatchEvent(new CustomEvent('mpq-subjects-changed', { detail: next }));
+  syncMutationToServerCache('subjects', { action: 'delete', id });
+  adjustGlobalStat('subjectsCount', -1);
 
-  try {
-    await deleteDoc(doc(db, 'subjects', id));
-    syncMutationToServerCache('subjects', { action: 'delete', id });
-    adjustGlobalStat('subjectsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await deleteDoc(doc(db, 'subjects', id));
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, `subjects/${id}`);
+    }
   }
 }
 
@@ -1915,13 +2051,16 @@ export async function broadcastNotification(message: string, type: 'info' | 'suc
   setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
+  syncMutationToServerCache('notifications', { action: 'upsert', item });
+  adjustGlobalStat('notificationsCount', 1);
 
-  try {
-    await setDoc(doc(db, 'notifications', id), item);
-    syncMutationToServerCache('notifications', { action: 'upsert', item });
-    adjustGlobalStat('notificationsCount', 1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, 'notifications');
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await setDoc(doc(db, 'notifications', id), item);
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.WRITE, 'notifications');
+    }
   }
   return item;
 }
@@ -1937,13 +2076,16 @@ export async function deleteNotification(id: string) {
   setLocal(STORAGE_KEYS.NOTIFICATIONS, next);
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: next }));
+  syncMutationToServerCache('notifications', { action: 'delete', id });
+  adjustGlobalStat('notificationsCount', -1);
 
-  try {
-    await deleteDoc(doc(db, 'notifications', id));
-    syncMutationToServerCache('notifications', { action: 'delete', id });
-    adjustGlobalStat('notificationsCount', -1);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      await deleteDoc(doc(db, 'notifications', id));
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, `notifications/${id}`);
+    }
   }
 }
 
@@ -1956,20 +2098,23 @@ export async function deleteAllNotifications(ids: string[]) {
   setLocal(STORAGE_KEYS.NOTIFICATIONS, []);
   setSyncTimestamp('NOTIFICATIONS');
   window.dispatchEvent(new CustomEvent('mpq-notifications-changed', { detail: [] }));
+  syncMutationToServerCache('notifications', { action: 'clear' });
+  adjustGlobalStat('notificationsCount', -ids.length);
 
-  try {
-    const CHUNK_SIZE = 450;
-    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-      const batch = writeBatch(db);
-      for (const id of ids.slice(i, i + CHUNK_SIZE)) {
-        batch.delete(doc(db, 'notifications', id));
+  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+    try {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const id of ids.slice(i, i + CHUNK_SIZE)) {
+          batch.delete(doc(db, 'notifications', id));
+        }
+        await batch.commit();
       }
-      await batch.commit();
+    } catch (err) {
+      markClientQuotaCooldownIfNeeded(err);
+      handleFirestoreError(err, OperationType.DELETE, 'notifications');
     }
-    syncMutationToServerCache('notifications', { action: 'clear' });
-    adjustGlobalStat('notificationsCount', -ids.length);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, 'notifications');
   }
 }
 
@@ -2831,4 +2976,115 @@ export function startCoreRealtimeSync(options?: {
       }
     }
   };
+}
+
+// ---------------- Code Store Status & Save Helpers ----------------
+
+export interface CodeStoreStatus {
+  version: number;
+  updatedAt: string | null;
+  subjectsCount: number;
+  questionsCount: number;
+  writable: boolean;
+}
+
+export interface SaveToCodeStoreResult {
+  ok: boolean;
+  readOnly?: boolean;
+  requiresPasscode?: boolean;
+  version?: number;
+  updatedAt?: string;
+  subjectsCount?: number;
+  questionsCount?: number;
+  error?: string;
+}
+
+export async function fetchCodeStoreStatus(): Promise<CodeStoreStatus> {
+  try {
+    const res = await fetch('/api/code-store/status', { cache: 'no-store' });
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
+      const data = await res.json();
+      if (data?.ok) {
+        return {
+          version: Number(data.version || INITIAL_BUNDLED_VERSION),
+          updatedAt: data.updatedAt || null,
+          subjectsCount: Number(data.subjectsCount ?? INITIAL_SUBJECTS.length),
+          questionsCount: Number(data.questionsCount ?? INITIAL_QUESTIONS.length),
+          writable: Boolean(data.writable),
+        };
+      }
+    }
+  } catch {
+    // Static hosting / offline fallback
+  }
+  return {
+    version: INITIAL_BUNDLED_VERSION,
+    updatedAt: null,
+    subjectsCount: INITIAL_SUBJECTS.length,
+    questionsCount: INITIAL_QUESTIONS.length,
+    writable: false,
+  };
+}
+
+export async function saveAllToCodeStore(params: {
+  questions: Question[];
+  subjects: Subject[];
+  passcode?: string;
+}): Promise<SaveToCodeStoreResult> {
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (inMemoryAdminToken) {
+      headers['X-Admin-Token'] = inMemoryAdminToken;
+    }
+    const authHeader = await getAuthBearerHeader();
+    if (authHeader) {
+      headers['Authorization'] = authHeader;
+    }
+    if (params.passcode && params.passcode.trim()) {
+      headers['X-Admin-Passcode'] = params.passcode.trim();
+    }
+
+    const res = await fetch('/api/code-store/save', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        questions: params.questions,
+        subjects: params.subjects,
+      }),
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    const data = contentType.includes('application/json')
+      ? await res.json().catch(() => null)
+      : null;
+
+    if (!data) {
+      return {
+        ok: false,
+        readOnly: true,
+        error: 'បរិយាកាស Hosting នេះមិនគាំទ្រការសរសេរផ្ទាល់លើ Code ទេ — កម្មវិធីនឹងទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ។',
+      };
+    }
+
+    if (typeof data.adminToken === 'string' && data.adminToken) {
+      setAdminSessionToken(data.adminToken);
+    }
+
+    if (data.ok && typeof data.version === 'number') {
+      lastHydratedBundledVer = data.version;
+      setLocal(STORAGE_KEYS.BUNDLED_REVISION, data.version);
+      setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, data.version);
+    }
+
+    return data as SaveToCodeStoreResult;
+  } catch {
+    return {
+      ok: false,
+      readOnly: true,
+      error: 'មិនអាចតភ្ជាប់ទៅ Server ដើម្បីរក្សាទុកចូល Code បានទេ — សូមទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ។',
+    };
+  }
 }

@@ -1,8 +1,17 @@
 import { Question, Subject, AppNotification } from '../types';
+import {
+  BUNDLED_VERSION,
+  BUNDLED_UPDATED_AT,
+  BUNDLED_SUBJECTS,
+  BUNDLED_QUESTIONS,
+} from '../data/bundledQuestions';
 
-export const INITIAL_SUBJECTS: Subject[] = [];
+export const INITIAL_BUNDLED_VERSION: number = BUNDLED_VERSION;
+export const INITIAL_BUNDLED_UPDATED_AT: string = BUNDLED_UPDATED_AT;
 
-export const INITIAL_QUESTIONS: Question[] = [];
+export const INITIAL_SUBJECTS: Subject[] = BUNDLED_SUBJECTS;
+
+export const INITIAL_QUESTIONS: Question[] = BUNDLED_QUESTIONS;
 
 export const INITIAL_NOTIFICATIONS: AppNotification[] = [
   {

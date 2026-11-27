@@ -180,6 +180,166 @@ export function downloadJsonFile(data: unknown, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+export interface BundledStoreDataPayload {
+  version: number;
+  updatedAt: string;
+  subjects: Subject[];
+  questions: Question[];
+}
+
+export function normalizeBundledStorePayload(
+  rawQuestions: Question[],
+  rawSubjects: Subject[],
+  version = Date.now()
+): BundledStoreDataPayload {
+  const normalizedSubjects: Subject[] = [];
+  const seenSubjectNames = new Set<string>();
+  const seenSubjectIds = new Set<string>();
+
+  for (let i = 0; i < rawSubjects.length; i++) {
+    const sub = rawSubjects[i];
+    const name = String(sub?.name || '').trim();
+    if (!name) continue;
+    const normName = name.toLowerCase();
+    if (seenSubjectNames.has(normName)) continue;
+    seenSubjectNames.add(normName);
+
+    let id = String(sub?.id || '').trim() || `sub-bundled-${normalizedSubjects.length + 1}`;
+    if (seenSubjectIds.has(id)) {
+      id = `sub-bundled-${normalizedSubjects.length + 1}-${i}`;
+    }
+    seenSubjectIds.add(id);
+
+    const type: QuestionType =
+      sub?.type === 'short' || sub?.type === 'explanation' ? sub.type : 'mcq';
+
+    normalizedSubjects.push({
+      id,
+      name,
+      type,
+      isActive: sub?.isActive !== false,
+      order: typeof sub?.order === 'number' && Number.isFinite(sub.order) ? sub.order : normalizedSubjects.length,
+      ...(typeof sub?.icon === 'string' && sub.icon.trim() ? { icon: sub.icon.trim() } : {}),
+    });
+  }
+
+  const normalizedQuestions: Question[] = [];
+  const seenQuestionIds = new Set<string>();
+
+  for (let i = 0; i < rawQuestions.length; i++) {
+    const q = rawQuestions[i];
+    const questionText = String(q?.question || '').trim();
+    if (!questionText) continue;
+
+    const subjectName = String(q?.subject || '').trim() || 'ចំណេះដឹងទូទៅ';
+    const normSubject = subjectName.toLowerCase();
+    const type: QuestionType =
+      q?.type === 'short' || q?.type === 'explanation' ? q.type : 'mcq';
+
+    if (!seenSubjectNames.has(normSubject)) {
+      seenSubjectNames.add(normSubject);
+      const autoId = `sub-bundled-${normalizedSubjects.length + 1}`;
+      seenSubjectIds.add(autoId);
+      normalizedSubjects.push({
+        id: autoId,
+        name: subjectName,
+        type,
+        isActive: true,
+        order: normalizedSubjects.length,
+      });
+    }
+
+    let id = String(q?.id || '').trim() || `q-bundled-${normalizedQuestions.length + 1}`;
+    if (seenQuestionIds.has(id)) {
+      id = `q-bundled-${normalizedQuestions.length + 1}-${i}`;
+    }
+    seenQuestionIds.add(id);
+
+    const item: Question = {
+      id,
+      subject: subjectName,
+      type,
+      question: questionText,
+      isActive: q?.isActive !== false,
+      order:
+        typeof q?.order === 'number' && Number.isFinite(q.order)
+          ? q.order
+          : normalizedQuestions.length + 1,
+    };
+
+    if (type === 'mcq' && Array.isArray(q?.options) && q.options.length > 0) {
+      item.options = q.options.map((opt) => String(opt ?? '').trim());
+      item.correct =
+        typeof q.correct === 'number' &&
+        Number.isFinite(q.correct) &&
+        q.correct >= 0 &&
+        q.correct < item.options.length
+          ? Math.trunc(q.correct)
+          : 0;
+    }
+
+    if (typeof q?.answer === 'string' && q.answer.trim()) {
+      item.answer = q.answer.trim();
+    }
+
+    if (typeof q?.createdAt === 'string' && q.createdAt.trim()) {
+      item.createdAt = q.createdAt.trim();
+    }
+
+    normalizedQuestions.push(item);
+  }
+
+  normalizedSubjects.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  normalizedQuestions.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  return {
+    version,
+    updatedAt: new Date().toISOString(),
+    subjects: normalizedSubjects,
+    questions: normalizedQuestions,
+  };
+}
+
+export function generateBundledQuestionsTsContent(
+  rawQuestions: Question[],
+  rawSubjects: Subject[],
+  version = Date.now()
+): string {
+  const payload = normalizeBundledStorePayload(rawQuestions, rawSubjects, version);
+  const serialized = JSON.stringify(payload, null, 2);
+
+  return `import type { Question, Subject } from '../types';
+
+interface BundledStorePayload {
+  version: number;
+  updatedAt: string;
+  subjects: Subject[];
+  questions: Question[];
+}
+
+// <BUNDLED_JSON_START>
+const BUNDLED_DATA: BundledStorePayload = ${serialized};
+// <BUNDLED_JSON_END>
+
+export const BUNDLED_VERSION: number = BUNDLED_DATA.version;
+export const BUNDLED_UPDATED_AT: string = BUNDLED_DATA.updatedAt;
+export const BUNDLED_SUBJECTS: Subject[] = BUNDLED_DATA.subjects;
+export const BUNDLED_QUESTIONS: Question[] = BUNDLED_DATA.questions;
+`;
+}
+
+export function downloadTypeScriptFile(content: string, filename = 'bundledQuestions.ts') {
+  const blob = new Blob([content], { type: 'text/typescript;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename.endsWith('.ts') ? filename : `${filename}.ts`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function normalizeQuestionType(rawType: unknown, optionsCount: number, forcedType?: 'auto' | QuestionType): QuestionType {
   if (forcedType && forcedType !== 'auto') {
     return forcedType;
