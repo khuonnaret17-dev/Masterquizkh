@@ -391,7 +391,7 @@ export async function fetchLatestBundledStore(force = false): Promise<{
       }
 
       const url = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${cfg.filePath}?ref=${encodeURIComponent(cfg.branch)}`;
-      const res = await fetch(url, { headers, cache: 'no-store' });
+      const res = await fetch(url, { headers });
 
       if (res.status === 304 && remoteCache && remoteCache.cacheKey === cacheKey) {
         remoteCache.checkedAt = Date.now();
@@ -477,10 +477,9 @@ async function resolveDefaultBranchIfMissing(cfg: GitHubStoreConfig): Promise<st
         'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
         'X-GitHub-Api-Version': '2022-11-28',
       },
-      cache: 'no-store',
     });
     if (!res.ok) return null;
-    const data = await res.json().catch(() => null);
+    const data: any = await res.json().catch(() => null);
     return typeof data?.default_branch === 'string' && data.default_branch.trim()
       ? data.default_branch.trim()
       : null;
@@ -525,9 +524,8 @@ export async function testGitHubConnection(): Promise<{
         'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
         'X-GitHub-Api-Version': '2022-11-28',
       },
-      cache: 'no-store',
     });
-    const data = await res.json().catch(() => null);
+    const data: any = await res.json().catch(() => null);
     if (!res.ok) {
       const ghMsg = typeof data?.message === 'string' ? data.message : `HTTP ${res.status}`;
       let khError = `តភ្ជាប់ GitHub មិនជោគជ័យ (${ghMsg})`;
@@ -564,7 +562,6 @@ export async function testGitHubConnection(): Promise<{
           'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
           'X-GitHub-Api-Version': '2022-11-28',
         },
-        cache: 'no-store',
       }
     );
 
@@ -620,7 +617,6 @@ async function fetchGitHubFileSha(cfg: GitHubStoreConfig, branchOverride?: strin
       'User-Agent': 'Master-Quiz-KH-Vercel-Sync',
       'X-GitHub-Api-Version': '2022-11-28',
     },
-    cache: 'no-store',
   });
 
   if (res.status === 404) return undefined;
@@ -701,7 +697,7 @@ export async function saveBundledStoreToGitHub(payload: BundledCodeStoreData): P
         continue;
       }
 
-      const data = await res.json().catch(() => null);
+      const data: any = await res.json().catch(() => null);
       if (!res.ok) {
         const ghMsg =
           typeof data?.message === 'string' ? data.message : `GitHub HTTP ${res.status}`;

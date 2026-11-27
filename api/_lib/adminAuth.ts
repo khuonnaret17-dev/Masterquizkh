@@ -119,7 +119,7 @@ export async function verifyFirebaseAdminBearerToken(idToken: string): Promise<b
       }
     );
     if (!res.ok) return false;
-    const data = await res.json().catch(() => null);
+    const data: any = await res.json().catch(() => null);
     const user = Array.isArray(data?.users) ? data.users[0] : null;
     return (
       typeof user?.email === 'string' &&
