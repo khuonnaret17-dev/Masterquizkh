@@ -2237,88 +2237,10 @@ app.post('/api/cache/invalidate', (req, res) => {
   res.json({ ok: true, version: serverCoreCache.version });
 });
 
-interface ClaimedAdminPasscodeRecord {
-  algorithm: 'scrypt';
-  salt: string;
-  hash: string;
-  claimedAt: string;
-}
-
-const ADMIN_AUTH_FILE_PRIMARY = path.resolve(__dirname, '.mpq_admin_auth.json');
-const ADMIN_AUTH_FILE_FALLBACK = path.join(os.tmpdir(), 'mpq-admin-auth-v1.json');
-let claimedAdminPasscodeCache: ClaimedAdminPasscodeRecord | null | undefined;
-let adminSetupLock = false;
 const adminVerifyAttempts = new Map<string, number[]>();
 
-function getConfiguredEnvAdminCode(): string {
+function getConfiguredAdminCode(): string {
   return (process.env.ADMIN_MASTER_CODE || process.env.ADMIN_PASSCODE || '').trim();
-}
-
-function loadClaimedAdminPasscode(): ClaimedAdminPasscodeRecord | null {
-  if (claimedAdminPasscodeCache !== undefined) {
-    return claimedAdminPasscodeCache;
-  }
-  for (const filePath of [ADMIN_AUTH_FILE_PRIMARY, ADMIN_AUTH_FILE_FALLBACK]) {
-    try {
-      if (!fs.existsSync(filePath)) continue;
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (
-        parsed &&
-        parsed.algorithm === 'scrypt' &&
-        typeof parsed.salt === 'string' &&
-        parsed.salt.length >= 16 &&
-        typeof parsed.hash === 'string' &&
-        parsed.hash.length >= 64
-      ) {
-        claimedAdminPasscodeCache = parsed as ClaimedAdminPasscodeRecord;
-        return claimedAdminPasscodeCache;
-      }
-    } catch {
-      // Try fallback file
-    }
-  }
-  claimedAdminPasscodeCache = null;
-  return null;
-}
-
-function saveClaimedAdminPasscode(record: ClaimedAdminPasscodeRecord): boolean {
-  const serialized = JSON.stringify(record);
-  for (const filePath of [ADMIN_AUTH_FILE_PRIMARY, ADMIN_AUTH_FILE_FALLBACK]) {
-    try {
-      fs.writeFileSync(filePath, serialized, { mode: 0o600, flag: 'wx' });
-      claimedAdminPasscodeCache = record;
-      return true;
-    } catch (err: any) {
-      if (err?.code === 'EEXIST') {
-        return false;
-      }
-    }
-  }
-  claimedAdminPasscodeCache = record;
-  return true;
-}
-
-function hashPasscodeScrypt(passcode: string): ClaimedAdminPasscodeRecord {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(passcode, salt, 64).toString('hex');
-  return {
-    algorithm: 'scrypt',
-    salt,
-    hash,
-    claimedAt: new Date().toISOString(),
-  };
-}
-
-function verifyPasscodeScrypt(passcode: string, record: ClaimedAdminPasscodeRecord): boolean {
-  try {
-    const derived = crypto.scryptSync(passcode, record.salt, 64);
-    const expected = Buffer.from(record.hash, 'hex');
-    if (derived.length !== expected.length) return false;
-    return crypto.timingSafeEqual(derived, expected);
-  } catch {
-    return false;
-  }
 }
 
 function timingSafeCompareStrings(aStr: string, bStr: string): boolean {
@@ -2343,85 +2265,13 @@ function recordAdminFailedAttempt(ipKey: string) {
   adminVerifyAttempts.set(ipKey, recent);
 }
 
-app.get('/api/admin/auth-status', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const hasEnvPasscode = Boolean(getConfiguredEnvAdminCode());
-  const hasClaimedPasscode = Boolean(loadClaimedAdminPasscode());
-  res.json({
-    hasEnvPasscode,
-    hasClaimedPasscode,
-    needsSetup: !hasEnvPasscode && !hasClaimedPasscode,
-  });
-});
-
-app.post('/api/admin/setup-passcode', (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const ipKey = req.ip || 'unknown';
-  if (isAdminRateLimited(ipKey)) {
-    return res.status(429).json({
-      success: false,
-      error: 'សាកល្បងច្រើនដងពេក! សូមរង់ចាំប៉ុន្មាននាទីទៀត។',
-    });
-  }
-
-  if (adminSetupLock || getConfiguredEnvAdminCode() || loadClaimedAdminPasscode()) {
-    return res.status(409).json({
-      success: false,
-      alreadyConfigured: true,
-      error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ! សូមបញ្ចូលលេខកូដដើម្បីចូលប្រព័ន្ធ។',
-    });
-  }
-
-  const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
-  const confirmPasscode =
-    typeof req.body?.confirmPasscode === 'string' ? req.body.confirmPasscode.trim() : '';
-
-  if (passcode.length < 6 || passcode.length > 128) {
-    return res.status(400).json({
-      success: false,
-      error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវមានយ៉ាងតិច ៦ តួអក្សរ (អតិបរមា ១២៨ តួអក្សរ)!',
-    });
-  }
-
-  if (confirmPasscode && passcode !== confirmPasscode) {
-    return res.status(400).json({
-      success: false,
-      error: 'ការបញ្ជាក់លេខកូដមិនត្រូវគ្នាទេ! សូមពិនិត្យម្ដងទៀត។',
-    });
-  }
-
-  adminSetupLock = true;
-  try {
-    if (getConfiguredEnvAdminCode() || loadClaimedAdminPasscode()) {
-      return res.status(409).json({
-        success: false,
-        alreadyConfigured: true,
-        error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ!',
-      });
-    }
-    const record = hashPasscodeScrypt(passcode);
-    const saved = saveClaimedAdminPasscode(record);
-    if (!saved) {
-      return res.status(409).json({
-        success: false,
-        alreadyConfigured: true,
-        error: 'លេខកូដអ្នកគ្រប់គ្រងត្រូវបានកំណត់រួចហើយ!',
-      });
-    }
-    adminVerifyAttempts.delete(ipKey);
-    res.json({ success: true, mode: 'claimed' });
-  } finally {
-    adminSetupLock = false;
-  }
-});
-
 app.post('/api/admin/verify-passcode', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const ipKey = req.ip || 'unknown';
   if (isAdminRateLimited(ipKey)) {
     return res.status(429).json({
       success: false,
-      error: 'សាកល្បងខុសច្រើនដងពេក! សូមរង់ចាំ ១០ នាទី ឬភ្ជាប់គណនី Google Admin។',
+      error: 'សាកល្បងខុសច្រើនដងពេក! សូមរង់ចាំ ១០ នាទីសិន។',
     });
   }
 
@@ -2433,29 +2283,15 @@ app.post('/api/admin/verify-passcode', (req, res) => {
     });
   }
 
-  const configuredEnv = getConfiguredEnvAdminCode();
-  if (configuredEnv) {
-    if (!timingSafeCompareStrings(configuredEnv, submitted)) {
-      recordAdminFailedAttempt(ipKey);
-      return res.status(401).json({
-        success: false,
-        error: 'លេខកូដ Master Code មិនត្រឹមត្រូវទេ! សូមពិនិត្យលេខកូដម្ដងទៀត។',
-      });
-    }
-    adminVerifyAttempts.delete(ipKey);
-    return res.json({ success: true, mode: 'env' });
-  }
-
-  const claimed = loadClaimedAdminPasscode();
-  if (!claimed) {
-    return res.status(400).json({
+  const configuredCode = getConfiguredAdminCode();
+  if (!configuredCode) {
+    return res.status(503).json({
       success: false,
-      needsSetup: true,
-      error: 'មិនទាន់មានលេខកូដ Master Code នៅឡើយទេ! សូមបង្កើតលេខកូដដំបូង ឬភ្ជាប់គណនី Google Admin។',
+      error: 'មិនទាន់បានកំណត់ ADMIN_MASTER_CODE នៅលើ Server នៅឡើយទេ!',
     });
   }
 
-  if (!verifyPasscodeScrypt(submitted, claimed)) {
+  if (!timingSafeCompareStrings(configuredCode, submitted)) {
     recordAdminFailedAttempt(ipKey);
     return res.status(401).json({
       success: false,
@@ -2464,7 +2300,7 @@ app.post('/api/admin/verify-passcode', (req, res) => {
   }
 
   adminVerifyAttempts.delete(ipKey);
-  res.json({ success: true, mode: 'claimed' });
+  res.json({ success: true });
 });
 
 // Health check endpoint
