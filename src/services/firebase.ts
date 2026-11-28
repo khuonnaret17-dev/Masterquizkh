@@ -1660,7 +1660,7 @@ export async function addQuestion(q: Omit<Question, 'id'>) {
   adjustGlobalStat('questionsCount', 1);
   scheduleAutoSyncCodeStore();
 
-  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+  if (!isQuotaCooldownActive(false)) {
     try {
       await setDoc(doc(db, 'questions', id), newQuestion);
     } catch (err) {
@@ -1690,7 +1690,7 @@ export async function addQuestionsBatch(items: Omit<Question, 'id'>[]): Promise<
   adjustGlobalStat('questionsCount', created.length);
   scheduleAutoSyncCodeStore();
 
-  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+  if (!isQuotaCooldownActive(false)) {
     try {
       const CHUNK_SIZE = 450;
       for (let i = 0; i < created.length; i += CHUNK_SIZE) {
@@ -1726,7 +1726,7 @@ export async function updateQuestion(id: string, updates: Partial<Question>) {
   }
   scheduleAutoSyncCodeStore();
 
-  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+  if (!isQuotaCooldownActive(false)) {
     try {
       await updateDoc(doc(db, 'questions', id), cleanUpdates);
     } catch (err) {
@@ -1746,7 +1746,7 @@ export async function deleteQuestion(id: string) {
   adjustGlobalStat('questionsCount', -1);
   scheduleAutoSyncCodeStore();
 
-  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+  if (!isQuotaCooldownActive(false)) {
     try {
       await deleteDoc(doc(db, 'questions', id));
     } catch (err) {
@@ -1770,7 +1770,7 @@ export async function deleteQuestionsBatch(ids: string[]): Promise<number> {
   adjustGlobalStat('questionsCount', -uniqueIds.length);
   scheduleAutoSyncCodeStore();
 
-  if (auth.currentUser && !isQuotaCooldownActive(false)) {
+  if (!isQuotaCooldownActive(false)) {
     const CHUNK_SIZE = 450;
     try {
       for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
@@ -3313,6 +3313,69 @@ export async function saveAllToCodeStore(params: {
       ? await res.json().catch(() => null)
       : null;
 
+    if (data?.ok) {
+      if (typeof data.adminToken === 'string' && data.adminToken) {
+        setAdminSessionToken(data.adminToken);
+      }
+      if (typeof data.version === 'number') {
+        lastHydratedBundledVer = data.version;
+        setLocal(STORAGE_KEYS.BUNDLED_REVISION, data.version);
+        setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, data.version);
+      }
+      return data as SaveToCodeStoreResult;
+    }
+
+    // Fallback: If GitHub code store is not configured or server write is read-only,
+    // sync questions and subjects directly to Firebase Firestore for instant real-time sync!
+    if (data?.githubRequired || data?.readOnly || !res.ok) {
+      try {
+        const CHUNK_SIZE = 450;
+        // Save questions in batches
+        for (let i = 0; i < params.questions.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = params.questions.slice(i, i + CHUNK_SIZE);
+          for (const q of chunk) {
+            if (q.id) {
+              batch.set(doc(db, 'questions', q.id), q);
+            }
+          }
+          await batch.commit();
+        }
+        // Save subjects in batches
+        for (let i = 0; i < params.subjects.length; i += CHUNK_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = params.subjects.slice(i, i + CHUNK_SIZE);
+          for (const s of chunk) {
+            if (s.id) {
+              batch.set(doc(db, 'subjects', s.id), s);
+            }
+          }
+          await batch.commit();
+        }
+
+        const version = Date.now();
+        const updatedAt = new Date(version).toISOString();
+        if (data?.adminToken) {
+          setAdminSessionToken(data.adminToken);
+        }
+        setLocal(STORAGE_KEYS.BUNDLED_REVISION, version);
+        setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, version);
+
+        return {
+          ok: true,
+          githubSynced: false,
+          diskSaved: true,
+          version,
+          updatedAt,
+          subjectsCount: params.subjects.length,
+          questionsCount: params.questions.length,
+          error: 'បានរក្សាទុក Real-Time ចូល Firestore ជោគជ័យ! សមាជិកគ្រប់រូបនឹងទទួលបានទិន្នន័យថ្មីភ្លាមៗ។',
+        };
+      } catch (firestoreErr: any) {
+        console.warn('Firestore fallback save error:', firestoreErr);
+      }
+    }
+
     if (!data) {
       if (res.status === 413) {
         return {
@@ -3336,16 +3399,6 @@ export async function saveAllToCodeStore(params: {
         readOnly: true,
         error: 'បរិយាកាស Hosting នេះមិនគាំទ្រការសរសេរផ្ទាល់លើ Code ទេ — កម្មវិធីនឹងទាញយកឯកសារ bundledQuestions.ts ជំនួសវិញ។',
       };
-    }
-
-    if (typeof data.adminToken === 'string' && data.adminToken) {
-      setAdminSessionToken(data.adminToken);
-    }
-
-    if (data.ok && typeof data.version === 'number') {
-      lastHydratedBundledVer = data.version;
-      setLocal(STORAGE_KEYS.BUNDLED_REVISION, data.version);
-      setLocal(STORAGE_KEYS.CORE_SERVER_VERSION, data.version);
     }
 
     return data as SaveToCodeStoreResult;
